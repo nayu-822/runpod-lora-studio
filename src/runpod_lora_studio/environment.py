@@ -5,6 +5,7 @@ import platform
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ class EnvironmentReport:
     torch_version: str | None
     torch_cuda_version: str | None
     torch_cuda_available: bool
+    bf16_supported: bool | None = None
     gpus: list[GPUInfo] = field(default_factory=list)
     disk_free_bytes: int | None = None
     disk_total_bytes: int | None = None
@@ -61,10 +63,6 @@ class EnvironmentReport:
         values = [gpu.vram_mb for gpu in self.gpus if gpu.vram_mb is not None]
         return sum(values) if values else None
 
-    @property
-    def bf16_supported(self) -> bool | None:
-        return None
-
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["gpus"] = [asdict(gpu) for gpu in self.gpus]
@@ -76,9 +74,23 @@ class EnvironmentReport:
 
 
 def _is_writable_path(path: Path) -> bool:
-    if path.exists():
-        return os.access(path, os.W_OK)
-    return path.parent.exists() and os.access(path.parent, os.W_OK)
+    candidate = path
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate.exists() and os.access(candidate, os.W_OK)
+
+
+def _query_bf16_support(torch_module: Any) -> bool | None:
+    try:
+        if not torch_module.cuda.is_available():
+            return None
+        checker = getattr(torch_module.cuda, "is_bf16_supported", None)
+        if checker is None:
+            return None
+        return bool(checker())
+    except Exception:
+        # Driver-specific failures are reported as unknown, not as environment failures.
+        return None
 
 
 def _command_status(command_name: str, *, required: bool) -> CommandStatus:
@@ -135,6 +147,7 @@ def _query_torch_gpus(torch_module: Any) -> tuple[list[GPUInfo], bool]:
 
 def collect_environment_report(
     settings: AppSettings | None = None,
+    writable_check: Callable[[Path], bool] | None = None,
 ) -> EnvironmentReport:
     runtime_settings = settings or get_settings()
     workspace = runtime_settings.workspace_root
@@ -152,6 +165,7 @@ def collect_environment_report(
     torch_version: str | None = None
     torch_cuda_version: str | None = None
     torch_cuda_available = False
+    bf16_supported: bool | None = None
     gpus: list[GPUInfo] = []
     try:
         import torch
@@ -161,6 +175,7 @@ def collect_environment_report(
         torch_version = torch.__version__
         torch_cuda_version = torch.version.cuda
         gpus, torch_cuda_available = _query_torch_gpus(torch)
+        bf16_supported = _query_bf16_support(torch)
         if not torch_cuda_available:
             warnings.append("CUDA が利用できません。CPU環境として扱います。")
 
@@ -172,12 +187,13 @@ def collect_environment_report(
         warnings.append("RUNPOD_POD_ID が未設定です。RunPod 外の実行とみなします。")
     is_runpod = bool(runtime_settings.runpod_pod_id)
 
+    check_writable = writable_check or _is_writable_path
     workspace_exists = workspace.exists()
-    workspace_writable = _is_writable_path(workspace)
+    workspace_writable = check_writable(workspace)
     if not workspace_exists:
         warnings.append(f"作業ディレクトリが存在しません: {workspace}")
     if not workspace_writable:
-        warnings.append(f"作業ディレクトリへ書き込みできません: {workspace}")
+        errors.append(f"作業ディレクトリへ書き込みできません: {workspace}")
 
     try:
         disk = shutil.disk_usage(workspace if workspace.exists() else workspace.parent)
@@ -202,13 +218,14 @@ def collect_environment_report(
         torch_version=torch_version,
         torch_cuda_version=torch_cuda_version,
         torch_cuda_available=torch_cuda_available,
+        bf16_supported=bf16_supported,
         gpus=gpus,
         disk_free_bytes=disk_free_bytes,
         disk_total_bytes=disk_total_bytes,
         workspace_exists=workspace_exists,
         workspace_writable=workspace_writable,
         runtime_dir=str(runtime_settings.workspace_root),
-        runtime_dir_parent_writable=_is_writable_path(runtime_settings.workspace_root),
+        runtime_dir_parent_writable=workspace_writable,
         commands=commands,
         warnings=warnings,
         errors=errors,

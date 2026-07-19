@@ -54,6 +54,18 @@ def test_build_status_markdown_contains_multiple_gpu_summary(
     assert "GPU B" in markdown
 
 
+def test_build_status_markdown_requires_attention_for_environment_error(
+    test_workspace: Path,
+) -> None:
+    settings = AppSettings(workspace_root=test_workspace)
+    report = _cpu_report(test_workspace)
+    report.errors.append("作業ディレクトリへ書き込みできません")
+
+    markdown = build_status_markdown(settings, report)
+
+    assert "状態: **要確認**" in markdown
+
+
 def test_create_app_accepts_cpu_report_without_real_gpu(test_workspace: Path) -> None:
     settings = AppSettings(workspace_root=test_workspace)
 

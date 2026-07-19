@@ -28,6 +28,7 @@ def build_status_markdown(settings: AppSettings, report: EnvironmentReport) -> s
         disk_summary = f"空き {free_gib} GiB / 総容量 {total_gib} GiB"
     status = "正常稼働中" if not report.errors else "要確認"
     environment = "RunPod" if report.is_runpod else "ローカル"
+    bf16 = {True: "対応", False: "非対応", None: "不明"}[report.bf16_supported]
     return "\n".join(
         [
             "## Runtime Status",
@@ -38,6 +39,7 @@ def build_status_markdown(settings: AppSettings, report: EnvironmentReport) -> s
             f"- 実行環境: `{environment}`",
             f"- GPU認識状況: `{'認識済み' if report.gpus else '未認識'}`",
             f"- GPU概要: `{gpu_summary}`",
+            f"- bf16対応: `{bf16}`",
             f"- データ保存先: `{settings.workspace_root}`",
             f"- ディスク容量: `{disk_summary}`",
             "- Server bind: "

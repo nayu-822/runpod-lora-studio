@@ -37,9 +37,15 @@ def main(
         print(f"Python: {report.python_version} ({support})")
         print(f"作業ディレクトリ: {report.runtime_dir}")
         print(f"GPU: {', '.join(gpu.name for gpu in report.gpus) or '未認識'}")
-        free = report.disk_free_bytes or "不明"
-        total = report.disk_total_bytes or "不明"
-        print(f"ディスク: {free} bytes free / {total} bytes total")
+        bf16 = {True: "対応", False: "非対応", None: "不明"}[report.bf16_supported]
+        print(f"bf16: {bf16}")
+        if report.disk_free_bytes is None or report.disk_total_bytes is None:
+            print("ディスク: 空き 不明 / 総容量 不明")
+        else:
+            gib = 1024**3
+            free = report.disk_free_bytes / gib
+            total = report.disk_total_bytes / gib
+            print(f"ディスク: 空き {free:.1f} GiB / 総容量 {total:.1f} GiB")
         for warning in report.warnings:
             print(f"警告: {warning}")
         for error in report.errors:

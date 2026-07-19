@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from runpod_lora_studio.config.settings import AppSettings
 from runpod_lora_studio.environment import (
     GPUInfo,
+    _query_bf16_support,
     _query_nvidia_smi,
     _query_torch_gpus,
     collect_environment_report,
@@ -57,6 +58,85 @@ def test_multiple_gpu_information_is_collected() -> None:
 
     assert available is True
     assert gpus == [GPUInfo(0, "GPU A", 8), GPUInfo(1, "GPU B", 12)]
+
+
+def test_bf16_support_is_reported_when_available() -> None:
+    cuda = SimpleNamespace(is_available=lambda: True, is_bf16_supported=lambda: True)
+
+    assert _query_bf16_support(SimpleNamespace(cuda=cuda)) is True
+
+
+def test_bf16_support_is_reported_when_unavailable() -> None:
+    cuda = SimpleNamespace(is_available=lambda: True, is_bf16_supported=lambda: False)
+
+    assert _query_bf16_support(SimpleNamespace(cuda=cuda)) is False
+
+
+def test_bf16_support_is_unknown_without_cuda_or_api() -> None:
+    no_cuda = SimpleNamespace(is_available=lambda: False)
+    no_api = SimpleNamespace(is_available=lambda: True)
+
+    assert _query_bf16_support(SimpleNamespace(cuda=no_cuda)) is None
+    assert _query_bf16_support(SimpleNamespace(cuda=no_api)) is None
+
+
+def test_bf16_support_is_unknown_when_detection_raises() -> None:
+    def raise_runtime_error() -> bool:
+        raise RuntimeError("unsupported")
+
+    cuda = SimpleNamespace(
+        is_available=lambda: True, is_bf16_supported=raise_runtime_error
+    )
+
+    assert _query_bf16_support(SimpleNamespace(cuda=cuda)) is None
+
+
+def test_existing_writable_workspace_is_accepted(test_workspace: Path) -> None:
+    report = collect_environment_report(
+        AppSettings(workspace_root=test_workspace), writable_check=lambda _: True
+    )
+
+    assert report.workspace_exists is True
+    assert report.workspace_writable is True
+    assert report.errors == []
+
+
+def test_uncreated_workspace_with_writable_parent_is_accepted(
+    test_workspace: Path,
+) -> None:
+    workspace = test_workspace / "not-created"
+    report = collect_environment_report(
+        AppSettings(workspace_root=workspace), writable_check=lambda _: True
+    )
+
+    assert report.workspace_exists is False
+    assert report.workspace_writable is True
+    assert report.errors == []
+    assert not workspace.exists()
+
+
+def test_existing_unwritable_workspace_is_an_error(test_workspace: Path) -> None:
+    report = collect_environment_report(
+        AppSettings(workspace_root=test_workspace), writable_check=lambda _: False
+    )
+
+    assert report.workspace_exists is True
+    assert report.workspace_writable is False
+    assert any("書き込みできません" in error for error in report.errors)
+
+
+def test_uncreated_workspace_with_unwritable_parent_is_an_error(
+    test_workspace: Path,
+) -> None:
+    workspace = test_workspace / "not-created"
+    report = collect_environment_report(
+        AppSettings(workspace_root=workspace), writable_check=lambda _: False
+    )
+
+    assert report.workspace_exists is False
+    assert report.workspace_writable is False
+    assert any("書き込みできません" in error for error in report.errors)
+    assert not workspace.exists()
 
 
 def test_missing_required_command_is_an_error(

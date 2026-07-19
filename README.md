@@ -63,7 +63,7 @@ python scripts/verify_environment.py --json
 
 - Python / OS 情報
 - `RUNPOD_POD_ID` の有無
-- PyTorch / CUDA 情報
+- PyTorch / CUDA / bf16 対応情報
 - 複数GPUのインデックス、名前、VRAM
 - 設定された作業ディレクトリの書き込み可能性とディスク容量
 - `git` / `rclone` / `nvidia-smi` の有無（`git`は必須、その他は警告）
