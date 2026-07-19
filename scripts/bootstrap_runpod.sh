@@ -16,9 +16,11 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
 fi
 
 echo "Using Python executable: $PYTHON_BIN"
+"$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'
 "$PYTHON_BIN" --version
 "$PYTHON_BIN" -m pip install --upgrade pip
 "$PYTHON_BIN" -m pip install -e ".[dev]"
+"$PYTHON_BIN" -c 'from runpod_lora_studio.config.settings import ensure_runtime_directories, get_settings; ensure_runtime_directories(get_settings())'
 "$PYTHON_BIN" scripts/verify_environment.py
 
 cat <<'EOF'

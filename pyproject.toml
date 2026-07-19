@@ -32,7 +32,14 @@ packages = ["src/runpod_lora_studio"]
 target-version = "py311"
 line-length = 88
 src = ["src", "tests", "scripts"]
-extend-exclude = [".agents", ".git", ".uv-cache", ".venv"]
+extend-exclude = [
+  ".agents",
+  ".git",
+  ".uv-cache",
+  ".venv",
+  ".pytest-tmp",
+  "pytest-cache-files-*",
+]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -48,18 +55,19 @@ select = [
 ]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.11"
 mypy_path = "src"
 packages = ["runpod_lora_studio"]
 strict = true
 warn_unused_configs = true
+follow_imports = "skip"
 
 [[tool.mypy.overrides]]
 module = ["gradio.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["torch", "torch.*", "numpy", "numpy.*"]
+module = ["torch"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

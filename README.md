@@ -53,16 +53,23 @@ RunPod 側では HTTP Proxy 経由で 7860 番ポートに接続する想定で�
 python scripts/verify_environment.py
 ```
 
+人間向けの要約を標準出力へ表示し、機械処理が必要な場合だけ次のようにJSON形式を指定します。
+
+```bash
+python scripts/verify_environment.py --json
+```
+
 このスクリプトは次を表示します。
 
 - Python / OS 情報
 - `RUNPOD_POD_ID` の有無
-- PyTorch / CUDA / bf16 情報
-- GPU 検出結果
-- `/workspace` とランタイムディレクトリの書き込み可能性
-- `git` / `rclone` / `nvidia-smi` の有無
+- PyTorch / CUDA 情報
+- 複数GPUのインデックス、名前、VRAM
+- 設定された作業ディレクトリの書き込み可能性とディスク容量
+- `git` / `rclone` / `nvidia-smi` の有無（`git`は必須、その他は警告）
 
 ローカル CPU 環境では、未検出項目を警告として表示します。
+必須条件に失敗した場合だけ終了コード1になります。APIキーなどの秘密情報は表示しません。
 
 ## テストと静的チェック
 
