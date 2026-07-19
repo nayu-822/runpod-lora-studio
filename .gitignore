@@ -1,0 +1,57 @@
+# Environment and secrets
+.env
+.venv/
+venv/
+.uv-cache/
+rclone.conf
+*.pem
+*.key
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs and local runtime data
+logs/
+outputs/
+workspace/
+runtime/
+projects/
+cache/
+*.log
+*.sqlite3
+
+# Training artifacts
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.npz
+*.jsonl
+
+# LoRA state and caches
+state/
+latent_cache/
+text_encoder_cache/
+
+# IDE files
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Keep templates and fixtures tracked
+!.env.example
+!tests/fixtures/.gitkeep

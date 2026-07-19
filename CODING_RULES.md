@@ -249,13 +249,15 @@ Codexは変更後、可能な範囲ですべて実行する。実行できない
 
 Conventional Commits形式を基本とする。
 
+コミットメッセージのsubjectと本文は日本語で記述する。typeとscopeはConventional Commitsの形式に従い、英語の固定語を使用する。
+
 ```text
-feat(scope): 新しい機能を追加
-fix(scope): 不具合を修正
-refactor(scope): 動作を変えずに構造を改善
-test(scope): テストを追加または更新
-docs(scope): ドキュメントを更新
-chore(scope): 開発環境や保守用ファイルを更新
+feat(scope): 新しい機能を追加する
+fix(scope): 不具合を修正する
+refactor(scope): 動作を変えずに構造を改善する
+test(scope): テストを追加または更新する
+docs(scope): ドキュメントを更新する
+chore(scope): 開発環境や保守用ファイルを更新する
 ```
 
 1コミットは1つの論理的変更にする。生成物、大容量ファイル、秘密情報をコミットしない。

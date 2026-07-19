@@ -391,21 +391,22 @@ Codexは実装・修正後、必ず以下を報告する。
 8. **推奨Gitコミットメッセージ**
 
 コミットメッセージはConventional Commits形式を基本とする。
+typeとscopeは英語の固定語を使用し、subjectと本文は日本語で記述する。
 
 例:
 
 ```text
-feat(tagging): add frequency-sorted tag retention controls
+feat(tagging): 出現回数順のタグ保持チェック機能を追加する
 ```
 
 必要に応じて本文も提示する。
 
 ```text
-feat(storage): sync completed training artifacts to Google Drive
+feat(storage): 完成した学習成果物をGoogle Driveへ同期する
 
-- copy final LoRA, captions, images, configs, and logs with rclone
-- verify copied artifacts before marking the run complete
-- prevent automatic Pod termination when synchronization fails
+- 完成LoRA、キャプション、画像、設定、ログをrcloneでコピーする
+- Runを完了扱いにする前にコピー済み成果物を検証する
+- 同期に失敗した場合はPodを自動Terminateしない
 ```
 
 ## 8. Definition of Done

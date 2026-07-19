@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "runpod-lora-studio"
+version = "0.1.0"
+description = "RunPod-hosted Gradio app for SDXL LoRA dataset and training workflows."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [
+  { name = "nayu-822" },
+]
+dependencies = [
+  "gradio>=5.0.0,<6.0.0",
+  "pydantic>=2.9.0,<3.0.0",
+  "pydantic-settings>=2.5.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.11.0,<2.0.0",
+  "pytest>=8.3.0,<9.0.0",
+  "ruff>=0.6.0,<1.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/runpod_lora_studio"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+src = ["src", "tests", "scripts"]
+extend-exclude = [".agents", ".git", ".uv-cache", ".venv"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ruff.lint]
+select = [
+  "E",
+  "F",
+  "I",
+  "B",
+  "UP",
+]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+packages = ["runpod_lora_studio"]
+strict = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["gradio.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["torch", "torch.*", "numpy", "numpy.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-p no:cacheprovider"
