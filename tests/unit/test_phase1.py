@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import warnings
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from PIL import Image
@@ -335,6 +336,37 @@ def test_thumbnail_failure_cleans_only_failed_upload_and_keeps_next(
     assert len(result.failures) == 1
     assert result.failures[0].reason == "サムネイル生成に失敗しました。"
     assert len(list((projects.project_root(project.id) / "originals").iterdir())) == 1
+
+
+def test_thumbnail_cleanup_failure_preserves_safe_error_and_logs_warning(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = phase1_settings(test_workspace)
+    service = ImageService(settings)
+    source = test_workspace / "source.png"
+    destination = test_workspace / "thumbnail.png"
+    Image.new("RGB", (10, 10), "white").save(source)
+
+    monkeypatch.setattr(
+        Image.Image,
+        "save",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("save failed")),
+    )
+    monkeypatch.setattr(
+        Path,
+        "unlink",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unlink failed")),
+    )
+    warning = Mock()
+    monkeypatch.setattr(
+        "runpod_lora_studio.services.image_service.logger.warning", warning
+    )
+    with pytest.raises(UserFacingError, match="サムネイル生成に失敗しました"):
+        service._create_thumbnail(source, destination)
+
+    warning.assert_called_once()
+    assert warning.call_args.args[0] == "image_cleanup_failed filename=%s"
 
 
 def test_decompression_bomb_error_is_safe_and_warning_does_not_change_policy(

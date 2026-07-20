@@ -204,7 +204,7 @@ class ImageService:
                 image.save(temporary, format="PNG")
             os.replace(temporary, destination)
         except Exception as exc:
-            temporary.unlink(missing_ok=True)
+            self._cleanup_paths((temporary,))
             raise UserFacingError("サムネイル生成に失敗しました。") from exc
 
     def list_images(

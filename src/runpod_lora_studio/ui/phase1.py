@@ -315,7 +315,7 @@ def build_image_tab(
             choices=list(STATE_LABELS.values()), value="すべて", label="状態フィルター"
         )
         search = gr.Textbox(label="ファイル名検索")
-        page = gr.Number(value=1, minimum=1, precision=0, label="ページ")
+        page = gr.Number(value=1, minimum=0, precision=0, label="ページ")
         page_size = gr.Number(
             value=30, minimum=1, maximum=100, precision=0, label="件数"
         )

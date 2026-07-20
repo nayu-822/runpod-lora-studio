@@ -59,6 +59,21 @@ def _port_available(settings: AppSettings) -> bool:
     return True
 
 
+def _check_git() -> Check:
+    try:
+        result = subprocess.run(
+            ["git", "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return Check("Git", True, False, "Git未導入またはPATH上にありません")
+    detail = (result.stdout or result.stderr).strip().splitlines()
+    message = detail[0][:120] if detail else "Gitコマンドが失敗しました"
+    return Check("Git", True, result.returncode == 0, message)
+
+
 def _check_migration(settings: AppSettings) -> Check:
     try:
         config = Config(str(ROOT_DIR / "alembic.ini"))
@@ -146,18 +161,16 @@ def collect_checks(
     checks.append(_check_migration(settings))
 
     checks.extend([_module_check("PIL"), _module_check("gradio")])
+    checks.append(_check_git())
+    port_available = _port_available(settings)
     checks.append(
         Check(
-            "Git",
+            f"{settings.gradio_server_port}番ポート",
             True,
-            subprocess.run(
-                ["git", "--version"], check=False, capture_output=True
-            ).returncode
-            == 0,
-            "確認",
+            port_available,
+            "使用可能" if port_available else "使用中または利用不可",
         )
     )
-    checks.append(Check("7860番ポート", True, _port_available(settings), "使用可能"))
 
     try:
         torch = importlib.import_module("torch")

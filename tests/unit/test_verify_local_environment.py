@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import socket
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from alembic import command
 from alembic.config import Config
@@ -194,3 +196,72 @@ def test_rclone_execution_failure_is_optional_warning(test_workspace: Path) -> N
     rclone = next(check for check in checks if check.name == "rclone")
     assert not rclone.ok
     assert all(check.required is False or check.ok for check in checks)
+
+
+def test_git_check_handles_success_nonzero_and_missing_git(
+    monkeypatch,
+) -> None:
+    success = SimpleNamespace(returncode=0, stdout="git version 2.0\n", stderr="")
+    monkeypatch.setattr(_module.subprocess, "run", lambda *_args, **_kwargs: success)
+    assert _module._check_git().ok
+
+    failed = SimpleNamespace(returncode=1, stdout="", stderr="git failed\n")
+    monkeypatch.setattr(_module.subprocess, "run", lambda *_args, **_kwargs: failed)
+    failed_check = _module._check_git()
+    assert not failed_check.ok
+    assert "git failed" in failed_check.detail
+
+    def missing_git(*_args, **_kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(_module.subprocess, "run", missing_git)
+    missing_check = _module._check_git()
+    assert not missing_check.ok
+    assert "未導入" in missing_check.detail
+
+
+def test_git_failure_does_not_stop_other_checks_and_is_required(
+    test_workspace: Path, monkeypatch
+) -> None:
+    settings = migrated_settings(test_workspace)
+
+    def fail_git(*_args, **_kwargs):
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr(_module.subprocess, "run", fail_git)
+    checks = collect_checks(settings, FakeRclone())
+
+    names = {check.name for check in checks}
+    git_check = next(check for check in checks if check.name == "Git")
+    assert not git_check.ok and git_check.required
+    assert {"SQLite", "Alembic", "rclone"}.issubset(names)
+    assert any(check.required and not check.ok for check in checks)
+
+
+def test_git_failure_makes_script_exit_nonzero(monkeypatch) -> None:
+    settings = SimpleNamespace(app_env="local")
+    checks = [
+        _module.Check("Git", True, False, "Git未導入"),
+        _module.Check("SQLite", True, True, "OK"),
+    ]
+    monkeypatch.setattr(_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(_module, "collect_checks", lambda _settings: checks)
+
+    assert _module.main() == 1
+
+
+def test_port_check_uses_configured_port_and_detects_in_use_port(
+    test_workspace: Path,
+) -> None:
+    settings = migrated_settings(test_workspace).model_copy(
+        update={"gradio_server_port": 18765}
+    )
+    available = collect_checks(settings, FakeRclone())
+    port_check = next(check for check in available if check.name == "18765番ポート")
+    assert port_check.ok
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind((settings.gradio_server_name, settings.gradio_server_port))
+        occupied = collect_checks(settings, FakeRclone())
+    occupied_check = next(check for check in occupied if check.name == "18765番ポート")
+    assert not occupied_check.ok

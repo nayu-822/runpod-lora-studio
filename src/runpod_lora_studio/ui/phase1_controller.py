@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
 from uuid import UUID
 
 from runpod_lora_studio.domain.models import (
@@ -26,10 +25,6 @@ CONCEPT_LABELS = {
 }
 
 
-class ProjectLister(Protocol):
-    def list_projects(self) -> list[Project]: ...
-
-
 @dataclass(frozen=True, slots=True)
 class ProjectSelectionView:
     rows: list[list[str | int]]
@@ -49,6 +44,7 @@ class ImagePageView:
     images: list[ImageAsset]
     total: int
     page: PageState
+    gallery_ids: list[str]
 
 
 class ProjectController:
@@ -111,23 +107,38 @@ class ImageController:
         page: int,
         page_size: int,
     ) -> ImagePageView:
+        safe_page_size = max(page_size, 1)
         images, total = self.service.list_images(
             project_id,
             state=state,
             search=search,
             page=page,
-            page_size=page_size,
+            page_size=safe_page_size,
         )
-        page_state = normalize_page(total, page, page_size)
+        page_state = normalize_page(total, page, safe_page_size)
         if page_state.page != page and total > 0:
             images, _ = self.service.list_images(
                 project_id,
                 state=state,
                 search=search,
                 page=page_state.page,
-                page_size=page_size,
+                page_size=safe_page_size,
             )
-        return ImagePageView(images, total, page_state)
+        gallery_ids = [
+            str(image.id) for image in images if image.thumbnail_path.is_file()
+        ]
+        return ImagePageView(images, total, page_state, gallery_ids)
+
+    def refresh_after_change(
+        self,
+        project_id: UUID,
+        state: SelectionState | None,
+        search: str,
+        page: int,
+        page_size: int,
+    ) -> tuple[ImagePageView, list[str]]:
+        view = self.list_page(project_id, state, search, page, page_size)
+        return view, []
 
     def register(self, project_id: UUID, files: list[str]) -> UploadResult:
         return self.service.register_uploads(project_id, files)
