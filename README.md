@@ -102,3 +102,25 @@ Phase 1 では、以下はまだ実装していません。
 - `.env` や API キーはコミットしないでください
 - `RUNPOD_API_KEY` は将来の機能用で、現段階では利用しません
 - `rclone.conf` や学習成果物は Git 管理対象外です
+
+## ローカル Phase 1 確認
+
+Windows ネイティブ、WSL2、Linux のいずれでも、Python 3.11 以上の仮想環境で確認できます。
+
+```powershell
+Copy-Item .env.local.example .env.local
+& .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+$env:RUNPOD_LORA_STUDIO_ENV_FILE = ".env.local"
+& .\.venv\Scripts\alembic.exe upgrade head
+& .\.venv\Scripts\python.exe scripts\verify_local_environment.py
+& .\.venv\Scripts\python.exe -m runpod_lora_studio.app
+```
+
+Linux または WSL2 では、仮想環境を有効化した後に `cp .env.local.example .env.local`、
+`RUNPOD_LORA_STUDIO_ENV_FILE=.env.local alembic upgrade head`、
+`RUNPOD_LORA_STUDIO_ENV_FILE=.env.local python scripts/verify_local_environment.py` を実行します。
+UI は `127.0.0.1:7860` から確認します。JPEG、PNG、WebP を登録でき、再起動後も SQLite のプロジェクトと画像状態が復元されます。
+
+PyTorch は Phase 1 の必須依存ではありません。未導入または CPU 版でもローカル確認は成立し、`torch.cuda.is_available()` が `False` であることは正常です。
+GPU と CUDA の確認は RunPod 上で行います。rclone も任意で、必要な場合だけ `rclone version`、`rclone listremotes`、`rclone lsd <remote>:<path>` で設定を確認します。
+Phase 1 では同期処理を実行せず、認証情報や `rclone.conf` を Git に保存しません。

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -100,4 +101,5 @@ def ensure_runtime_directories(settings: AppSettings) -> None:
 
 @lru_cache(maxsize=1)
 def get_settings() -> AppSettings:
-    return AppSettings()
+    env_file = os.environ.get("RUNPOD_LORA_STUDIO_ENV_FILE", ".env")
+    return AppSettings(_env_file=env_file)

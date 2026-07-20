@@ -97,9 +97,9 @@ def create_app(
                         row_count=len(path_rows),
                     )
         with gr.Tab("プロジェクト"):
-            selected_project = build_project_tab(projects)
+            selected_project, project_table = build_project_tab(projects)
         with gr.Tab("画像"):
-            build_image_tab(images, selected_project)
+            build_image_tab(images, selected_project, project_table)
         gr.Markdown(
             "Phase 2以降の重複判定・品質評価・タグ付け・学習機能は"
             "まだ実装されていません。"
