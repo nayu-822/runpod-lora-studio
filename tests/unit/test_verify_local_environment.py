@@ -102,6 +102,41 @@ def test_sqlite_write_check_uses_temporary_database(test_workspace: Path) -> Non
     assert list(settings.temp_dir.glob("verify-*.sqlite3")) == []
 
 
+def test_sqlite_write_check_reports_temporary_database_creation_failure(
+    test_workspace: Path, monkeypatch
+) -> None:
+    settings = migrated_settings(test_workspace)
+
+    def fail_tempfile(**_kwargs):
+        raise OSError("temporary database unavailable")
+
+    monkeypatch.setattr(_module.tempfile, "NamedTemporaryFile", fail_tempfile)
+    checks = _check_sqlite(settings)
+
+    write_check = next(check for check in checks if check.name == "SQLite一時書き込み")
+    assert not write_check.ok
+    assert "書き込めません" in write_check.detail
+
+
+def test_sqlite_cleanup_failure_does_not_hide_success(
+    test_workspace: Path, monkeypatch
+) -> None:
+    settings = migrated_settings(test_workspace)
+    original_unlink = Path.unlink
+
+    def fail_unlink(_path: Path, missing_ok: bool = False) -> None:
+        raise OSError("cleanup unavailable")
+
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    checks = _check_sqlite(settings)
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+    for path in settings.temp_dir.glob("verify-*.sqlite3"):
+        original_unlink(path, missing_ok=True)
+
+    write_check = next(check for check in checks if check.name == "SQLite一時書き込み")
+    assert write_check.ok
+
+
 def test_migration_check_requires_current_to_equal_head(test_workspace: Path) -> None:
     settings = migrated_settings(test_workspace)
 
@@ -118,6 +153,26 @@ def test_migration_check_rejects_unmigrated_database(test_workspace: Path) -> No
 
     assert not check.ok
     assert "未適用" in check.detail
+
+
+def test_migration_check_rejects_multiple_heads(
+    test_workspace: Path, monkeypatch
+) -> None:
+    settings = migrated_settings(test_workspace)
+
+    class MultipleHeads:
+        def get_heads(self) -> list[str]:
+            return ["head-a", "head-b"]
+
+    monkeypatch.setattr(
+        _module.ScriptDirectory,
+        "from_config",
+        lambda _config: MultipleHeads(),
+    )
+    check = _check_migration(settings)
+
+    assert not check.ok
+    assert "複数" in check.detail
 
 
 def test_rclone_is_optional_and_remote_names_are_only_reported(

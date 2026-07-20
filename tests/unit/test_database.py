@@ -9,6 +9,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
+from PIL import Image
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 
@@ -17,8 +18,11 @@ from runpod_lora_studio.config.settings import (
     ensure_runtime_directories,
     get_settings,
 )
+from runpod_lora_studio.domain.models import SelectionState
 from runpod_lora_studio.persistence.database import create_engine_for_settings
 from runpod_lora_studio.persistence.models import ImageAssetRecord, ProjectRecord
+from runpod_lora_studio.services.image_service import ImageService
+from runpod_lora_studio.services.project_service import ProjectInput, ProjectService
 
 
 def migrate(test_workspace: Path, revision: str = "head") -> AppSettings:
@@ -154,3 +158,32 @@ def test_project_and_image_registration_succeeds(test_workspace: Path) -> None:
             )
         )
         session.commit()
+
+
+def test_phase1_services_work_on_alembic_database(test_workspace: Path) -> None:
+    settings = migrate(test_workspace)
+    source = test_workspace / "service.png"
+    Image.new("RGB", (16, 16), "purple").save(source)
+    projects = ProjectService(settings)
+    project = projects.create(ProjectInput("Service integration"))
+    images = ImageService(settings, projects)
+
+    result = images.register_uploads(project.id, [source])
+    assert len(result.successes) == 1
+    assert (
+        images.change_state(
+            project.id, [result.successes[0].id], SelectionState.ACCEPTED
+        )
+        == 1
+    )
+
+    restored = ImageService(settings, ProjectService(settings))
+    listed, total = restored.list_images(project.id, state=SelectionState.ACCEPTED)
+    assert total == 1
+    assert listed[0].selection_state is SelectionState.ACCEPTED
+    assert "ix_image_assets_project_state" in {
+        item["name"]
+        for item in inspect(create_engine_for_settings(settings)).get_indexes(
+            "image_assets"
+        )
+    }

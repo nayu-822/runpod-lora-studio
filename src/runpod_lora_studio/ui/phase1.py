@@ -7,25 +7,22 @@ from uuid import UUID
 import gradio as gr
 
 from runpod_lora_studio.domain.models import (
-    ConceptType,
     ImageAsset,
     Project,
     SelectionState,
 )
 from runpod_lora_studio.services.image_service import ImageService, UploadResult
 from runpod_lora_studio.services.project_service import (
-    ProjectInput,
     ProjectService,
     UserFacingError,
 )
+from runpod_lora_studio.ui.phase1_controller import (
+    CONCEPT_LABELS,
+    ImageController,
+    ProjectController,
+    project_table_rows,
+)
 
-CONCEPT_LABELS = {
-    ConceptType.CHARACTER.value: "キャラクター",
-    ConceptType.STYLE.value: "画風",
-    ConceptType.COSTUME.value: "衣装",
-    ConceptType.OBJECT.value: "物体",
-    ConceptType.OTHER.value: "その他",
-}
 STATE_LABELS = {
     "all": "すべて",
     SelectionState.ACCEPTED.value: "採用",
@@ -35,20 +32,7 @@ STATE_LABELS = {
 
 
 def project_rows(projects: list[Project]) -> list[list[str | int]]:
-    return [
-        [
-            str(project.id),
-            project.name,
-            CONCEPT_LABELS[project.concept_type.value],
-            project.status.value,
-            project.image_counts.get(SelectionState.ACCEPTED, 0),
-            project.image_counts.get(SelectionState.PENDING, 0),
-            project.image_counts.get(SelectionState.EXCLUDED, 0),
-            project.created_at.isoformat(),
-            project.updated_at.isoformat(),
-        ]
-        for project in projects
-    ]
+    return project_table_rows(projects)
 
 
 def image_rows(images: list[ImageAsset]) -> list[list[str]]:
@@ -103,15 +87,8 @@ def selected_gallery_ids(index: int | tuple[int, ...], ids: list[str]) -> list[s
     return [ids[selected]]
 
 
-def _parse_trigger_words(value: str) -> tuple[str, ...]:
-    return tuple(part.strip() for part in value.split(","))
-
-
-def _project_choices(projects: list[Project]) -> list[tuple[str, str]]:
-    return [(project.name, str(project.id)) for project in projects]
-
-
 def build_project_tab(projects: ProjectService) -> tuple[gr.State, gr.Dataframe]:
+    controller = ProjectController(projects)
     with gr.Row():
         with gr.Column():
             gr.Markdown("### 新規プロジェクト")
@@ -152,37 +129,24 @@ def build_project_tab(projects: ProjectService) -> tuple[gr.State, gr.Dataframe]
         edit_button = gr.Button("編集内容を保存")
     edit_message = gr.Markdown()
 
-    def reload() -> tuple[list[list[str | int]], object, object]:
-        values = projects.list_projects()
-        choices = _project_choices(values)
+    def reload(current_id: str | None) -> tuple[list[list[str | int]], object, object]:
+        view = controller.reload(current_id)
         return (
-            project_rows(values),
-            gr.update(choices=choices),
-            choices[0][1] if choices else None,
+            view.rows,
+            gr.update(choices=view.choices, value=view.selected_id),
+            view.selected_id,
         )
 
     def create(
         name: str, description: str, concept: str, triggers: str
     ) -> tuple[object, object, str | None, str, str, object, str, str]:
         try:
-            concept_type = next(
-                key for key, label in CONCEPT_LABELS.items() if label == concept
-            )
-            created = projects.create(
-                ProjectInput(
-                    name,
-                    description,
-                    ConceptType(concept_type),
-                    _parse_trigger_words(triggers),
-                )
-            )
-            rows = project_rows(projects.list_projects())
-            choices = _project_choices(projects.list_projects())
+            created, view = controller.create(name, description, concept, triggers)
             project_id = str(created.id)
             return (
-                rows,
-                gr.update(choices=choices, value=project_id),
-                project_id,
+                view.rows,
+                gr.update(choices=view.choices, value=view.selected_id),
+                view.selected_id,
                 created.name,
                 created.description,
                 gr.update(value=CONCEPT_LABELS[created.concept_type.value]),
@@ -248,24 +212,13 @@ def build_project_tab(projects: ProjectService) -> tuple[gr.State, gr.Dataframe]
                 "エラー: プロジェクトを選択してください。",
             )
         try:
-            concept_value = next(
-                key for key, label in CONCEPT_LABELS.items() if label == concept
+            updated, view = controller.update(
+                project_id, name, description, concept, triggers
             )
-            updated = projects.update(
-                UUID(project_id),
-                ProjectInput(
-                    name,
-                    description,
-                    ConceptType(concept_value),
-                    _parse_trigger_words(triggers),
-                ),
-            )
-            rows = project_rows(projects.list_projects())
-            choices = _project_choices(projects.list_projects())
             return (
-                rows,
-                gr.update(choices=choices, value=project_id),
-                project_id,
+                view.rows,
+                gr.update(choices=view.choices, value=view.selected_id),
+                view.selected_id,
                 updated.name,
                 updated.description,
                 gr.update(value=CONCEPT_LABELS[updated.concept_type.value]),
@@ -284,7 +237,21 @@ def build_project_tab(projects: ProjectService) -> tuple[gr.State, gr.Dataframe]
                 f"エラー: {exc}",
             )
 
-    project_reload.click(reload, outputs=[project_table, project_selector, selected_id])
+    project_reload.click(
+        reload,
+        inputs=[selected_id],
+        outputs=[project_table, project_selector, selected_id],
+    ).then(
+        select,
+        inputs=[selected_id],
+        outputs=[
+            edit_name,
+            edit_description,
+            edit_concept,
+            edit_trigger_words,
+            edit_message,
+        ],
+    )
     create_button.click(
         create,
         inputs=[new_name, new_description, new_concept, new_trigger_words],
@@ -336,6 +303,7 @@ def build_project_tab(projects: ProjectService) -> tuple[gr.State, gr.Dataframe]
 def build_image_tab(
     images: ImageService, selected_id: gr.State, project_table: gr.Dataframe
 ) -> None:
+    controller = ImageController(images)
     project_label = gr.Markdown("プロジェクト未選択")
     upload = gr.File(
         file_count="multiple", type="filepath", label="画像（JPEG / PNG / WebP）"
@@ -415,7 +383,7 @@ def build_image_tab(
                 [],
                 [],
                 gr.update(choices=[]),
-                1,
+                0,
                 "0 / 0ページ、全0件",
                 "プロジェクトを選択してください。",
             )
@@ -430,22 +398,15 @@ def build_image_tab(
                 None,
             )
         page_size_value = max(1, min(100, int(size)))
-        _, total = images.list_images(
+        page_view = controller.list_page(
             UUID(project_id),
             state=state,
             search=query,
-            page=1,
+            page=int(page_value),
             page_size=page_size_value,
         )
-        total_pages = max(1, (total + page_size_value - 1) // page_size_value)
-        current_page = min(max(1, int(page_value)), total_pages)
-        values, _ = images.list_images(
-            UUID(project_id),
-            state=state,
-            search=query,
-            page=current_page,
-            page_size=page_size_value,
-        )
+        values = page_view.images
+        total = page_view.total
         choices = [
             (f"{value.original_filename} ({str(value.id)[:8]})", str(value.id))
             for value in values
@@ -457,8 +418,8 @@ def build_image_tab(
             gallery_items(values),
             gallery_image_ids(values),
             gr.update(choices=choices, value=[]),
-            current_page,
-            f"{current_page} / {total_pages}ページ、全{total}件",
+            page_view.page.page,
+            page_view.page.label,
             "",
         )
 
@@ -468,7 +429,7 @@ def build_image_tab(
         if not files:
             return "登録する画像を選択してください。"
         try:
-            result = images.register_uploads(UUID(project_id), files)
+            result = controller.register(UUID(project_id), files)
             return format_upload_result(result)
         except UserFacingError as exc:
             return f"エラー: {exc}"
@@ -479,8 +440,8 @@ def build_image_tab(
         if not project_id or not ids:
             return "エラー: プロジェクトと画像を選択してください。"
         try:
-            count = images.change_state(
-                UUID(project_id), (UUID(value) for value in ids), state
+            count = controller.change_state(
+                UUID(project_id), [UUID(value) for value in ids], state
             )
             return f"{count}件を{STATE_LABELS[state.value]}へ変更しました。"
         except UserFacingError as exc:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import warnings
 from pathlib import Path
 
 import pytest
@@ -265,6 +266,112 @@ def test_same_sha_is_not_deleted_or_excluded(test_workspace: Path) -> None:
     assert result.duplicate_warning_count == 1
     assert total == 2
     assert all(image.selection_state is SelectionState.PENDING for image in listed)
+
+
+@pytest.mark.parametrize("failure_point", ["add", "commit", "touch"])
+def test_registration_failure_cleans_files_and_db(
+    test_workspace: Path, monkeypatch: pytest.MonkeyPatch, failure_point: str
+) -> None:
+    settings = phase1_settings(test_workspace)
+    projects = ProjectService(settings)
+    project = projects.create(ProjectInput("Cleanup"))
+    source = test_workspace / "cleanup.png"
+    Image.new("RGB", (10, 10), "white").save(source)
+    service = ImageService(settings, projects)
+
+    if failure_point == "add":
+        monkeypatch.setattr(
+            "runpod_lora_studio.persistence.repositories.ImageRepository.add",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("db add")),
+        )
+    elif failure_point == "commit":
+        monkeypatch.setattr(
+            "sqlalchemy.orm.Session.commit",
+            lambda _session: (_ for _ in ()).throw(RuntimeError("db commit")),
+        )
+    else:
+        monkeypatch.setattr(
+            "runpod_lora_studio.persistence.repositories.ProjectRepository.touch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("db touch")),
+        )
+
+    result = service.register_uploads(project.id, [source])
+    root = projects.project_root(project.id)
+
+    assert result.successes == ()
+    assert len(result.failures) == 1
+    assert list((root / "originals").iterdir()) == []
+    assert list((root / "thumbnails").iterdir()) == []
+    assert not list(settings.temp_dir.glob("*"))
+    assert service.list_images(project.id)[1] == 0
+
+
+def test_thumbnail_failure_cleans_only_failed_upload_and_keeps_next(
+    test_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = phase1_settings(test_workspace)
+    projects = ProjectService(settings)
+    project = projects.create(ProjectInput("Thumbnail"))
+    first = test_workspace / "first.png"
+    second = test_workspace / "second.png"
+    Image.new("RGB", (10, 10), "white").save(first)
+    Image.new("RGB", (10, 10), "black").save(second)
+    original = ImageService._create_thumbnail
+    calls = 0
+
+    def fail_once(service: ImageService, source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise UserFacingError("サムネイル生成に失敗しました。")
+        original(service, source, destination)
+
+    monkeypatch.setattr(ImageService, "_create_thumbnail", fail_once)
+    result = ImageService(settings, projects).register_uploads(
+        project.id, [first, second]
+    )
+
+    assert len(result.successes) == 1
+    assert len(result.failures) == 1
+    assert result.failures[0].reason == "サムネイル生成に失敗しました。"
+    assert len(list((projects.project_root(project.id) / "originals").iterdir())) == 1
+
+
+def test_decompression_bomb_error_is_safe_and_warning_does_not_change_policy(
+    test_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = phase1_settings(test_workspace)
+    projects = ProjectService(settings)
+    project = projects.create(ProjectInput("Bomb"))
+    source = test_workspace / "bomb.png"
+    Image.new("RGB", (10, 10), "white").save(source)
+    original_load = Image.Image.load
+
+    def raise_bomb(image: Image.Image):
+        raise Image.DecompressionBombError("internal bomb detail")
+
+    monkeypatch.setattr(Image.Image, "load", raise_bomb)
+    rejected = ImageService(settings, projects).register_uploads(project.id, [source])
+    assert "ピクセル数上限" in rejected.failures[0].reason
+    assert service_count(ImageService(settings, projects), project.id) == 0
+
+    monkeypatch.setattr(Image.Image, "load", original_load)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 50)
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        rejected_warning = ImageService(settings, projects).register_uploads(
+            project.id, [source]
+        )
+    assert "ピクセル数上限" in rejected_warning.failures[0].reason
+
+    normal = test_workspace / "normal.png"
+    Image.new("RGB", (2, 2), "white").save(normal)
+    accepted = ImageService(settings, projects).register_uploads(project.id, [normal])
+    assert len(accepted.successes) == 1
+
+
+def service_count(service: ImageService, project_id) -> int:
+    return service.list_images(project_id)[1]
 
 
 def test_upload_result_format_is_safe_and_human_readable() -> None:

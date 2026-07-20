@@ -4,6 +4,7 @@ import hashlib
 import logging
 import os
 import shutil
+import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -161,14 +162,18 @@ class ImageService:
 
     def _inspect_image(self, path: Path) -> tuple[str, int, int]:
         try:
-            with Image.open(path) as image:
-                image.verify()
-            with Image.open(path) as image:
-                image_format = (image.format or "").upper()
-                width, height = image.size
-                if width * height > self.settings.max_image_pixels:
-                    raise UserFacingError("画像のピクセル数上限を超えています。")
-                image.load()
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(path) as image:
+                    image.verify()
+                with Image.open(path) as image:
+                    image_format = (image.format or "").upper()
+                    width, height = image.size
+                    if width * height > self.settings.max_image_pixels:
+                        raise UserFacingError("画像のピクセル数上限を超えています。")
+                    image.load()
+        except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+            raise UserFacingError("画像のピクセル数上限を超えています。") from exc
         except UserFacingError:
             raise
         except Exception as exc:
