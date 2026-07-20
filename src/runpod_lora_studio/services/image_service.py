@@ -25,6 +25,11 @@ logger = logging.getLogger("runpod_lora_studio.images")
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 
 
+def upload_path_name(upload: str | Path) -> str:
+    """Return only the user-facing filename, never an absolute upload path."""
+    return Path(upload).name
+
+
 @dataclass(frozen=True, slots=True)
 class UploadFailure:
     filename: str
@@ -64,13 +69,21 @@ class ImageService:
                 image, is_duplicate = self._register_one(project_id, Path(upload))
                 successes.append(image)
                 duplicate_warnings += int(is_duplicate)
-            except (OSError, UserFacingError, ValueError) as exc:
+            except UserFacingError as exc:
                 failures.append(UploadFailure(Path(upload).name, str(exc)))
+            except (OSError, ValueError):
+                failures.append(
+                    UploadFailure(
+                        upload_path_name(upload),
+                        "画像を読み込めないか、破損しています。",
+                    )
+                )
             except Exception:
                 logger.exception("image_registration_failed project_id=%s", project_id)
                 failures.append(
                     UploadFailure(
-                        Path(upload).name, "画像登録中に内部エラーが発生しました。"
+                        upload_path_name(upload),
+                        "画像登録中に内部エラーが発生しました。",
                     )
                 )
         return UploadResult(tuple(successes), tuple(failures), duplicate_warnings)
@@ -133,10 +146,18 @@ class ImageService:
             )
             return image, duplicate
         except Exception:
-            for path in (temporary, original_path, thumbnail_path):
-                if path is not None:
-                    path.unlink(missing_ok=True)
+            self._cleanup_paths((temporary, original_path, thumbnail_path))
             raise
+
+    @staticmethod
+    def _cleanup_paths(paths: Iterable[Path | None]) -> None:
+        for path in paths:
+            if path is None:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("image_cleanup_failed filename=%s", path.name)
 
     def _inspect_image(self, path: Path) -> tuple[str, int, int]:
         try:

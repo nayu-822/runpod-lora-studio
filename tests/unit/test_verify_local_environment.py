@@ -1,0 +1,141 @@
+from __future__ import annotations
+
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import create_engine, text
+
+from runpod_lora_studio.config.settings import (
+    AppSettings,
+    ensure_runtime_directories,
+    get_settings,
+)
+
+_spec = importlib.util.spec_from_file_location(
+    "verify_local_environment",
+    Path(__file__).parents[2] / "scripts" / "verify_local_environment.py",
+)
+assert _spec is not None and _spec.loader is not None
+_module = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _module
+_spec.loader.exec_module(_module)
+_check_migration = _module._check_migration
+_check_sqlite = _module._check_sqlite
+collect_checks = _module.collect_checks
+
+
+def local_settings(test_workspace: Path) -> AppSettings:
+    runtime = test_workspace / "runtime"
+    settings = AppSettings(
+        workspace_root=runtime,
+        projects_dir=runtime / "projects",
+        models_dir=runtime / "models",
+        outputs_dir=runtime / "outputs",
+        logs_dir=runtime / "logs",
+        temp_dir=runtime / "tmp",
+        database_path=runtime / "database" / "studio.sqlite3",
+    )
+    ensure_runtime_directories(settings)
+    return settings
+
+
+def migrated_settings(test_workspace: Path, revision: str = "head") -> AppSettings:
+    settings = local_settings(test_workspace)
+    old_path = os.environ.get("RUNPOD_LORA_STUDIO_DATABASE_PATH")
+    os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = str(settings.database_path)
+    get_settings.cache_clear()
+    try:
+        command.upgrade(Config(str(Path("alembic.ini").resolve())), revision)
+    finally:
+        get_settings.cache_clear()
+        if old_path is None:
+            os.environ.pop("RUNPOD_LORA_STUDIO_DATABASE_PATH", None)
+        else:
+            os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
+    return settings
+
+
+class FakeRclone:
+    def __init__(self, returncode: int = 0, remotes: str = "") -> None:
+        self.returncode = returncode
+        self.remotes = remotes
+
+    def version(self):
+        from runpod_lora_studio.external.rclone import CommandResult
+
+        return CommandResult(self.returncode, "rclone v1", "")
+
+    def list_remotes(self):
+        from runpod_lora_studio.external.rclone import CommandResult
+
+        return CommandResult(0, self.remotes, "")
+
+
+def test_sqlite_check_does_not_remove_existing_local_verify_table(
+    test_workspace: Path,
+) -> None:
+    settings = migrated_settings(test_workspace)
+    from runpod_lora_studio.persistence.database import create_engine_for_settings
+
+    engine = create_engine_for_settings(settings)
+    with engine.begin() as connection:
+        connection.exec_driver_sql("CREATE TABLE _local_verify (id INTEGER)")
+        connection.exec_driver_sql("INSERT INTO _local_verify VALUES (7)")
+
+    checks = _check_sqlite(settings)
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT id FROM _local_verify")) == 7
+    assert all(check.ok for check in checks)
+    assert list(settings.temp_dir.glob("verify-*.sqlite3")) == []
+
+
+def test_sqlite_write_check_uses_temporary_database(test_workspace: Path) -> None:
+    settings = migrated_settings(test_workspace)
+
+    checks = _check_sqlite(settings)
+
+    assert any(check.name == "SQLite一時書き込み" and check.ok for check in checks)
+    assert list(settings.temp_dir.glob("verify-*.sqlite3")) == []
+
+
+def test_migration_check_requires_current_to_equal_head(test_workspace: Path) -> None:
+    settings = migrated_settings(test_workspace)
+
+    check = _check_migration(settings)
+
+    assert check.ok
+    assert "current=0002_phase1_indexes" in check.detail
+
+
+def test_migration_check_rejects_unmigrated_database(test_workspace: Path) -> None:
+    settings = local_settings(test_workspace)
+    create_engine(f"sqlite:///{settings.database_path.as_posix()}").dispose()
+    check = _check_migration(settings)
+
+    assert not check.ok
+    assert "未適用" in check.detail
+
+
+def test_rclone_is_optional_and_remote_names_are_only_reported(
+    test_workspace: Path,
+) -> None:
+    settings = migrated_settings(test_workspace)
+    checks = collect_checks(settings, FakeRclone(remotes="drive:\n"))
+
+    rclone = next(check for check in checks if check.name == "rclone")
+    assert rclone.ok
+    assert "drive:" in rclone.detail
+    assert "secret" not in rclone.detail
+
+
+def test_rclone_execution_failure_is_optional_warning(test_workspace: Path) -> None:
+    settings = migrated_settings(test_workspace)
+    checks = collect_checks(settings, FakeRclone(returncode=1))
+
+    rclone = next(check for check in checks if check.name == "rclone")
+    assert not rclone.ok
+    assert all(check.required is False or check.ok for check in checks)

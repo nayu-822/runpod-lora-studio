@@ -205,6 +205,8 @@ class ImageRepository:
         page: int = 1,
         page_size: int = 30,
     ) -> tuple[list[ImageAsset], int]:
+        page = max(page, 1)
+        page_size = max(page_size, 1)
         query = select(ImageAssetRecord).where(
             ImageAssetRecord.project_id == str(project_id)
         )

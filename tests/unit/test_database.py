@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 
@@ -57,8 +58,11 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     assert "ix_image_assets_project_state" in image_indexes
     assert "ix_image_assets_project_id" not in image_indexes
 
-    config = Config(str(Path("alembic.ini").resolve()))
-    command.upgrade(config, "head")
+    migrate(test_workspace, "head")
+    with engine.connect() as connection:
+        assert MigrationContext.configure(connection).get_current_revision() == (
+            "0002_phase1_indexes"
+        )
 
 
 def test_existing_0001_database_upgrades_to_head(test_workspace: Path) -> None:

@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import socket
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
+from sqlalchemy import create_engine, text
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT_DIR / "src"
@@ -21,6 +28,8 @@ from runpod_lora_studio.external.rclone import RcloneRunner  # noqa: E402
 from runpod_lora_studio.persistence.database import (  # noqa: E402
     create_engine_for_settings,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,37 +59,91 @@ def _port_available(settings: AppSettings) -> bool:
     return True
 
 
-def collect_checks(settings: AppSettings) -> list[Check]:
+def _check_migration(settings: AppSettings) -> Check:
+    try:
+        config = Config(str(ROOT_DIR / "alembic.ini"))
+        heads = ScriptDirectory.from_config(config).get_heads()
+        if len(heads) != 1:
+            return Check("Alembic", True, False, "複数のheadがあります")
+        if not settings.database_path.is_file():
+            return Check("Alembic", True, False, "DB未作成（マイグレーション未適用）")
+        engine = create_engine_for_settings(settings)
+        with engine.connect() as connection:
+            current = MigrationContext.configure(connection).get_current_revision()
+        engine.dispose()
+        if current != heads[0]:
+            detail = f"更新が必要（current={current or 'なし'}, head={heads[0]}）"
+            return Check("Alembic", True, False, detail)
+        return Check("Alembic", True, True, f"current={current}, head={heads[0]}")
+    except Exception:
+        return Check("Alembic", True, False, "current/headの確認に失敗")
+
+
+def _check_sqlite(settings: AppSettings) -> list[Check]:
+    checks: list[Check] = []
+    if not settings.database_path.is_file():
+        checks.append(
+            Check("SQLite", True, False, "DB未作成（マイグレーション未適用）")
+        )
+    else:
+        try:
+            engine = create_engine_for_settings(settings)
+            with engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+            engine.dispose()
+            checks.append(
+                Check("SQLite", True, True, "接続可能（既存DBは変更していません）")
+            )
+        except Exception:
+            checks.append(Check("SQLite", True, False, "既存DBへ接続できません"))
+
+    temporary_path: Path | None = None
+    temporary_engine = None
+    try:
+        settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=settings.temp_dir, prefix="verify-", suffix=".sqlite3", delete=False
+        ) as handle:
+            temporary_path = Path(handle.name)
+        temporary_engine = create_engine(f"sqlite:///{temporary_path.as_posix()}")
+        with temporary_engine.begin() as connection:
+            connection.exec_driver_sql("CREATE TABLE verify (id INTEGER)")
+            connection.exec_driver_sql("INSERT INTO verify VALUES (1)")
+            if connection.scalar(text("SELECT id FROM verify")) != 1:
+                raise RuntimeError(
+                    "temporary SQLite write check returned an unexpected value"
+                )
+        checks.append(Check("SQLite一時書き込み", True, True, "一時DBで確認済み"))
+    except Exception:
+        checks.append(
+            Check("SQLite一時書き込み", True, False, "一時DBへ書き込めません")
+        )
+    finally:
+        if temporary_engine is not None:
+            temporary_engine.dispose()
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "temporary SQLite cleanup failed: %s", temporary_path.name
+                )
+    return checks
+
+
+def collect_checks(
+    settings: AppSettings, rclone_runner: RcloneRunner | None = None
+) -> list[Check]:
     checks = [
         Check("Python", True, sys.version_info >= (3, 11), sys.version.split()[0]),
         Check("設定", True, bool(settings.app_env), settings.app_env),
     ]
     try:
         ensure_runtime_directories(settings)
-        engine = create_engine_for_settings(settings)
-        with engine.connect() as connection:
-            connection.exec_driver_sql(
-                "CREATE TABLE IF NOT EXISTS _local_verify (id INTEGER)"
-            )
-            connection.exec_driver_sql("DROP TABLE _local_verify")
-            connection.commit()
-        engine.dispose()
-        checks.append(Check("SQLite", True, True, "接続・書き込み可能"))
-    except Exception:
-        checks.append(Check("SQLite", True, False, "接続または書き込みに失敗"))
-
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "alembic", "current"],
-            cwd=ROOT_DIR,
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-        checks.append(Check("Alembic", True, result.returncode == 0, "current確認"))
-    except (OSError, subprocess.SubprocessError):
-        checks.append(Check("Alembic", True, False, "実行できません"))
+        checks.extend(_check_sqlite(settings))
+    except OSError:
+        checks.append(Check("SQLite", True, False, "作業ディレクトリを準備できません"))
+    checks.append(_check_migration(settings))
 
     checks.extend([_module_check("PIL"), _module_check("gradio")])
     checks.append(
@@ -109,11 +172,22 @@ def collect_checks(settings: AppSettings) -> list[Check]:
             ]
         )
 
-    runner = RcloneRunner()
+    runner = rclone_runner or RcloneRunner()
     try:
         result = runner.version()
-        detail = result.stdout.splitlines()[0] if result.stdout else "実行失敗"
-        checks.append(Check("rclone", False, result.returncode == 0, detail))
+        if result.returncode != 0:
+            checks.append(Check("rclone", False, False, "導入済みですが実行に失敗"))
+        else:
+            remotes = runner.list_remotes()
+            remote_names = [
+                line for line in remotes.stdout.splitlines() if line.strip()
+            ]
+            detail = (
+                "設定リモート: " + ", ".join(remote_names)
+                if remote_names
+                else "未設定（任意）"
+            )
+            checks.append(Check("rclone", False, True, detail))
     except (OSError, subprocess.SubprocessError):
         checks.append(Check("rclone", False, True, "未導入（任意）"))
     return checks

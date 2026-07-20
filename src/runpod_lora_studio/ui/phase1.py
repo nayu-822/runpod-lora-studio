@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -11,7 +12,7 @@ from runpod_lora_studio.domain.models import (
     Project,
     SelectionState,
 )
-from runpod_lora_studio.services.image_service import ImageService
+from runpod_lora_studio.services.image_service import ImageService, UploadResult
 from runpod_lora_studio.services.project_service import (
     ProjectInput,
     ProjectService,
@@ -73,6 +74,33 @@ def gallery_items(images: list[ImageAsset]) -> list[tuple[str, str]]:
         for image in images
         if image.thumbnail_path.is_file()
     ]
+
+
+def gallery_image_ids(images: list[ImageAsset]) -> list[str]:
+    return [str(image.id) for image in images if image.thumbnail_path.is_file()]
+
+
+def format_upload_result(result: UploadResult) -> str:
+    lines = [
+        f"成功: {len(result.successes)}件",
+        f"失敗: {len(result.failures)}件",
+        f"同一内容の可能性がある画像: {result.duplicate_warning_count}件",
+    ]
+    if result.failures:
+        lines.extend(["", "失敗:"])
+        for failure in result.failures:
+            reason = failure.reason
+            if Path(reason).is_absolute() or "\\" in reason:
+                reason = "画像登録に失敗しました。"
+            lines.append(f"- {failure.filename}: {reason}")
+    return "\n".join(lines)
+
+
+def selected_gallery_ids(index: int | tuple[int, ...], ids: list[str]) -> list[str]:
+    selected = index[0] if isinstance(index, tuple) else index
+    if selected < 0 or selected >= len(ids):
+        return []
+    return [ids[selected]]
 
 
 def _parse_trigger_words(value: str) -> tuple[str, ...]:
@@ -345,6 +373,11 @@ def build_image_tab(
         show_label=True,
         object_fit="contain",
     )
+    gr.Markdown(
+        "サムネイルを選択すると単一画像を操作できます。"
+        "複数画像を変更する場合は、下の一覧から対象を選択してください。"
+    )
+    gallery_ids = gr.State(value=[])
     image_ids = gr.CheckboxGroup(label="状態変更対象（複数選択）", choices=[])
     with gr.Row():
         accepted = gr.Button("採用へ変更")
@@ -368,6 +401,7 @@ def build_image_tab(
         str,
         list[list[str]],
         list[tuple[str, str]],
+        list[str],
         Any,
         Any,
         str,
@@ -377,6 +411,7 @@ def build_image_tab(
             return (
                 gr.skip(),
                 "プロジェクト未選択",
+                [],
                 [],
                 [],
                 gr.update(choices=[]),
@@ -420,7 +455,8 @@ def build_image_tab(
             f"{images.projects.get(UUID(project_id)).name}（全{total}件）",
             image_rows(values),
             gallery_items(values),
-            gr.update(choices=choices),
+            gallery_image_ids(values),
+            gr.update(choices=choices, value=[]),
             current_page,
             f"{current_page} / {total_pages}ページ、全{total}件",
             "",
@@ -433,11 +469,7 @@ def build_image_tab(
             return "登録する画像を選択してください。"
         try:
             result = images.register_uploads(UUID(project_id), files)
-            failed = ", ".join(f.filename for f in result.failures)
-            message = f"成功: {len(result.successes)}件、失敗: {len(result.failures)}件"
-            if failed:
-                message += f"\n失敗ファイル: {failed}"
-            return message
+            return format_upload_result(result)
         except UserFacingError as exc:
             return f"エラー: {exc}"
 
@@ -454,6 +486,11 @@ def build_image_tab(
         except UserFacingError as exc:
             return f"エラー: {exc}"
 
+    def select_gallery(ids: list[str], event: gr.SelectData) -> list[str]:
+        return selected_gallery_ids(event.index, ids)
+
+    gallery.select(select_gallery, inputs=[gallery_ids], outputs=[image_ids])
+
     upload_button.click(
         register, inputs=[selected_id, upload], outputs=[upload_message]
     ).then(
@@ -464,6 +501,7 @@ def build_image_tab(
             project_label,
             image_table,
             gallery,
+            gallery_ids,
             image_ids,
             page,
             page_info,
@@ -478,6 +516,7 @@ def build_image_tab(
             project_label,
             image_table,
             gallery,
+            gallery_ids,
             image_ids,
             page,
             page_info,
@@ -492,6 +531,7 @@ def build_image_tab(
             project_label,
             image_table,
             gallery,
+            gallery_ids,
             image_ids,
             page,
             page_info,
@@ -509,6 +549,7 @@ def build_image_tab(
                 project_label,
                 image_table,
                 gallery,
+                gallery_ids,
                 image_ids,
                 page,
                 page_info,
@@ -525,6 +566,7 @@ def build_image_tab(
             project_label,
             image_table,
             gallery,
+            gallery_ids,
             image_ids,
             page,
             page_info,
@@ -541,6 +583,7 @@ def build_image_tab(
             project_label,
             image_table,
             gallery,
+            gallery_ids,
             image_ids,
             page,
             page_info,
@@ -564,6 +607,7 @@ def build_image_tab(
                 project_label,
                 image_table,
                 gallery,
+                gallery_ids,
                 image_ids,
                 page,
                 page_info,
