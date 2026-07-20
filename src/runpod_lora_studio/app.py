@@ -12,6 +12,9 @@ from runpod_lora_studio.config.settings import (
 )
 from runpod_lora_studio.environment import EnvironmentReport, collect_environment_report
 from runpod_lora_studio.logging.config import configure_logging
+from runpod_lora_studio.services.image_service import ImageService
+from runpod_lora_studio.services.project_service import ProjectService
+from runpod_lora_studio.ui.phase1 import build_image_tab, build_project_tab
 
 
 def build_status_markdown(settings: AppSettings, report: EnvironmentReport) -> str:
@@ -64,29 +67,43 @@ def build_paths_dataframe(settings: AppSettings) -> list[list[str]]:
 def create_app(
     settings: AppSettings | None = None,
     report: EnvironmentReport | None = None,
+    project_service: ProjectService | None = None,
+    image_service: ImageService | None = None,
 ) -> gr.Blocks:
     runtime_settings = settings or get_settings()
     environment_report = report or collect_environment_report(runtime_settings)
+    projects = project_service or ProjectService(runtime_settings)
+    images = image_service or ImageService(runtime_settings, projects)
     path_rows = build_paths_dataframe(runtime_settings)
 
     with gr.Blocks(title=runtime_settings.app_title) as demo:
-        gr.Markdown(f"# {runtime_settings.app_title}")
+        with gr.Tab("概要"):
+            gr.Markdown(f"# {runtime_settings.app_title}")
+            gr.Markdown(
+                "RunPod 上で SDXL LoRA のデータ収集・学習ワークフローを動かすための "
+                "Phase 1 ベースラインです。"
+            )
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown(
+                        build_status_markdown(runtime_settings, environment_report)
+                    )
+                with gr.Column():
+                    gr.Dataframe(
+                        headers=["Path", "Exists"],
+                        value=path_rows,
+                        label="Runtime Paths",
+                        interactive=False,
+                        row_count=len(path_rows),
+                    )
+        with gr.Tab("プロジェクト"):
+            selected_project = build_project_tab(projects)
+        with gr.Tab("画像"):
+            build_image_tab(images, selected_project)
         gr.Markdown(
-            "RunPod 上で SDXL LoRA のデータ収集・学習ワークフローを動かすための "
-            "Phase 0 ベースラインです。"
+            "Phase 2以降の重複判定・品質評価・タグ付け・学習機能は"
+            "まだ実装されていません。"
         )
-        with gr.Row():
-            with gr.Column():
-                gr.Markdown(build_status_markdown(runtime_settings, environment_report))
-            with gr.Column():
-                gr.Dataframe(
-                    headers=["Path", "Exists"],
-                    value=path_rows,
-                    label="Runtime Paths",
-                    interactive=False,
-                    row_count=len(path_rows),
-                )
-        gr.Markdown("Phase 1以降の機能はまだ実装されていません。")
 
     return cast(gr.Blocks, demo)
 

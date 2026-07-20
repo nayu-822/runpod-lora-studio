@@ -44,6 +44,10 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     logs_dir: Path = Path("/workspace/ldts-runtime/logs")
     temp_dir: Path = Path("/workspace/ldts-runtime/tmp")
     database_path: Path = Path("/workspace/ldts-runtime/database/ldts.sqlite3")
+    max_upload_files: int = Field(default=100, ge=1, le=1000)
+    max_upload_file_size_bytes: int = Field(default=50 * 1024 * 1024, ge=1)
+    max_image_pixels: int = Field(default=100_000_000, ge=1)
+    thumbnail_size: int = Field(default=320, ge=32, le=2048)
 
     runpod_pod_id: str | None = Field(default=None, validation_alias="RUNPOD_POD_ID")
     # Tokens and credentials added later must use SecretStr and repr=False as well.

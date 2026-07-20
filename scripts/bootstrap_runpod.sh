@@ -21,6 +21,7 @@ echo "Using Python executable: $PYTHON_BIN"
 "$PYTHON_BIN" -m pip install --upgrade pip
 "$PYTHON_BIN" -m pip install -e ".[dev]"
 "$PYTHON_BIN" -c 'from runpod_lora_studio.config.settings import ensure_runtime_directories, get_settings; ensure_runtime_directories(get_settings())'
+alembic upgrade head
 "$PYTHON_BIN" scripts/verify_environment.py
 
 cat <<'EOF'

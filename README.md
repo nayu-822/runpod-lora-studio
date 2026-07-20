@@ -1,9 +1,9 @@
 # RunPod LoRA Studio
 
 RunPod GPU Pod 上で動かす、SDXL LoRA 向けの Gradio ベース作業アプリです。  
-このリポジトリの現状は Phase 0 の基盤実装で、アプリ本体の最小起動、設定管理、環境検証、テスト・CI の土台までを含みます。
+このリポジトリの現状は Phase 1 の基盤実装で、プロジェクト管理とローカル画像登録までを含みます。
 
-## Phase 0 の範囲
+## Phase 1 の範囲
 
 - `src` レイアウトの Python パッケージ化
 - `python -m runpod_lora_studio.app` で起動できる最小 Gradio UI
@@ -11,6 +11,9 @@ RunPod GPU Pod 上で動かす、SDXL LoRA 向けの Gradio ベース作業ア�
 - RunPod 向けの環境検証スクリプト
 - 起動スクリプトと bootstrap スクリプト
 - `ruff` / `mypy` / `pytest` / GitHub Actions の整備
+- SQLite、SQLAlchemy、Alembicによるプロジェクト・画像メタデータ保存
+- Pillowによる画像実体検証、SHA-256計算、サムネイル生成
+- 採用・保留・除外の状態管理
 
 ## 要件
 
@@ -28,7 +31,10 @@ RunPod GPU Pod 上で動かす、SDXL LoRA 向けの Gradio ベース作業ア�
 cp .env.example .env
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
+alembic upgrade head
 ```
+
+`alembic upgrade head`は設定されたデータベースへ初期スキーマを適用します。アプリ起動時にテーブルを無条件作成することはありません。
 
 ## ローカル起動
 
@@ -82,9 +88,9 @@ pytest
 
 ## 現時点で未実装の内容
 
-Phase 0 では、以下はまだ実装していません。
+Phase 1 では、以下はまだ実装していません。
 
-- SQLite 永続化本体
+- pHashによる近似重複判定、品質評価
 - Danbooru 連携
 - タグ付け
 - 学習ジョブ管理
