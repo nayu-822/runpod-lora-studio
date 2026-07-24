@@ -6,8 +6,14 @@ from uuid import UUID
 from runpod_lora_studio.domain.models import (
     ConceptType,
     ImageAsset,
+    ImageInspectionResult,
+    InspectionRunResult,
+    InspectionSummary,
     Project,
     SelectionState,
+)
+from runpod_lora_studio.services.image_inspection_service import (
+    ImageInspectionService,
 )
 from runpod_lora_studio.services.image_service import ImageService, UploadResult
 from runpod_lora_studio.services.project_service import (
@@ -147,6 +153,22 @@ class ImageController:
         self, project_id: UUID, image_ids: list[UUID], state: SelectionState
     ) -> int:
         return self.service.change_state(project_id, image_ids, state)
+
+
+class ImageInspectionController:
+    def __init__(self, service: ImageInspectionService) -> None:
+        self.service = service
+
+    def inspect_project(
+        self, project_id: UUID, image_ids: list[UUID] | None = None
+    ) -> InspectionRunResult:
+        return self.service.inspect_project(project_id, image_ids)
+
+    def summary(self, project_id: UUID) -> InspectionSummary:
+        return self.service.get_summary(project_id)
+
+    def results(self, image_id: UUID) -> list[ImageInspectionResult]:
+        return self.service.get_results(image_id)
 
 
 def project_table_rows(projects: list[Project]) -> list[list[str | int]]:

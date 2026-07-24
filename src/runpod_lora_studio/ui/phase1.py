@@ -8,9 +8,12 @@ import gradio as gr
 
 from runpod_lora_studio.domain.models import (
     ImageAsset,
+    ImageInspectionResult,
+    InspectionRunResult,
     Project,
     SelectionState,
 )
+from runpod_lora_studio.services.image_inspection_service import ImageInspectionService
 from runpod_lora_studio.services.image_service import ImageService, UploadResult
 from runpod_lora_studio.services.project_service import (
     ProjectService,
@@ -19,6 +22,7 @@ from runpod_lora_studio.services.project_service import (
 from runpod_lora_studio.ui.phase1_controller import (
     CONCEPT_LABELS,
     ImageController,
+    ImageInspectionController,
     ProjectController,
     project_table_rows,
 )
@@ -35,7 +39,22 @@ def project_rows(projects: list[Project]) -> list[list[str | int]]:
     return project_table_rows(projects)
 
 
-def image_rows(images: list[ImageAsset]) -> list[list[str]]:
+def image_rows(
+    images: list[ImageAsset],
+    inspection_results: dict[UUID, list[ImageInspectionResult]] | None = None,
+) -> list[list[str]]:
+    inspection_results = inspection_results or {}
+
+    def inspection_label(image_id: UUID) -> str:
+        results = inspection_results.get(image_id, [])
+        if not results:
+            return "検査未実施"
+        if any(item.status.value == "failed" for item in results):
+            return "検査失敗"
+        if any(item.status.value == "warning" for item in results):
+            return "警告あり"
+        return "問題なし"
+
     return [
         [
             str(image.id),
@@ -44,6 +63,7 @@ def image_rows(images: list[ImageAsset]) -> list[list[str]]:
             str(image.file_size),
             image.mime_type,
             image.sha256[:12],
+            inspection_label(image.id),
             image.selection_state.value,
             image.created_at.isoformat(),
             str(image.id)[:8],
@@ -85,6 +105,35 @@ def selected_gallery_ids(index: int | tuple[int, ...], ids: list[str]) -> list[s
     if selected < 0 or selected >= len(ids):
         return []
     return [ids[selected]]
+
+
+def format_inspection_summary(result: InspectionRunResult) -> str:
+    summary = result.summary
+    return "\n".join(
+        [
+            f"検査済み: {summary.inspected_images}/{summary.total_images}画像",
+            f"警告: {summary.warning_count}件 / 失敗: {summary.failed_count}件",
+            f"完全重複: {summary.exact_duplicate_count}件",
+            f"最低解像度未満: {summary.resolution_too_small_count}件",
+            f"極端な縦横比: {summary.aspect_ratio_extreme_count}件",
+            f"低情報量候補: {summary.low_information_count}件",
+            f"ぼけ候補: {summary.blur_score_count}件",
+        ]
+    )
+
+
+def inspection_rows(results: list[ImageInspectionResult]) -> list[list[str | float]]:
+    return [
+        [
+            result.rule.value,
+            result.status.value,
+            "" if result.score is None else round(result.score, 4),
+            "" if result.threshold is None else round(result.threshold, 4),
+            result.reason,
+            result.detector_version,
+        ]
+        for result in results
+    ]
 
 
 def build_project_tab(projects: ProjectService) -> tuple[gr.State, gr.Dataframe]:
@@ -304,6 +353,8 @@ def build_image_tab(
     images: ImageService, selected_id: gr.State, project_table: gr.Dataframe
 ) -> None:
     controller = ImageController(images)
+    inspection = ImageInspectionService(images.settings, images.projects)
+    inspection_controller = ImageInspectionController(inspection)
     project_label = gr.Markdown("プロジェクト未選択")
     upload = gr.File(
         file_count="multiple", type="filepath", label="画像（JPEG / PNG / WebP）"
@@ -327,6 +378,7 @@ def build_image_tab(
             "容量",
             "MIME",
             "SHA-256",
+            "Inspection",
             "状態",
             "登録日時",
             "ID短縮",
@@ -353,6 +405,15 @@ def build_image_tab(
         excluded = gr.Button("除外へ変更")
         image_reload = gr.Button("一覧を再読込")
     image_message = gr.Markdown()
+    with gr.Row():
+        inspect_project = gr.Button("プロジェクト全体を検査", variant="primary")
+        inspect_selected = gr.Button("選択画像を再検査")
+    inspection_summary = gr.Markdown("検査未実施")
+    inspection_details = gr.Dataframe(
+        headers=["検査ルール", "結果", "計測値", "閾値", "理由", "バージョン"],
+        interactive=False,
+        label="選択画像の検査結果",
+    )
     with gr.Row():
         page_previous = gr.Button("前ページ")
         page_next = gr.Button("次ページ")
@@ -414,7 +475,7 @@ def build_image_tab(
         return (
             project_rows(images.projects.list_projects()),
             f"{images.projects.get(UUID(project_id)).name}（全{total}件）",
-            image_rows(values),
+            image_rows(values, inspection.get_project_results(UUID(project_id))),
             gallery_items(values),
             gallery_image_ids(values),
             gr.update(choices=choices, value=[]),
@@ -446,6 +507,46 @@ def build_image_tab(
             return f"{count}件を{STATE_LABELS[state.value]}へ変更しました。"
         except UserFacingError as exc:
             return f"エラー: {exc}"
+
+    def run_inspection(
+        project_id: str | None, selected: list[str] | None
+    ) -> tuple[str, list[list[str | float]], str]:
+        if not project_id:
+            return "エラー: 先にプロジェクトを選択してください。", [], "検査未実施"
+        selected_ids = [UUID(value) for value in (selected or [])]
+        try:
+            run = inspection_controller.inspect_project(
+                UUID(project_id), selected_ids or None
+            )
+            details = inspection.get_project_results(UUID(project_id))
+            rows = [
+                row
+                for image_id in (selected_ids or list(details))
+                for row in inspection_rows(details.get(image_id, []))
+            ]
+            return "検査が完了しました。", rows, format_inspection_summary(run)
+        except UserFacingError as exc:
+            return f"エラー: {exc}", [], "検査未実施"
+
+    def clear_inspection() -> tuple[str, list[list[str | float]]]:
+        return "検査結果を選び直してください。", []
+
+    inspect_project.click(
+        lambda project_id: run_inspection(project_id, None),
+        inputs=[selected_id],
+        outputs=[image_message, inspection_details, inspection_summary],
+    )
+    inspect_selected.click(
+        run_inspection,
+        inputs=[selected_id, image_ids],
+        outputs=[image_message, inspection_details, inspection_summary],
+    )
+
+    for control in (selected_id, state_filter, search, page, page_size):
+        control.change(
+            clear_inspection,
+            outputs=[inspection_summary, inspection_details],
+        )
 
     def select_gallery(ids: list[str], event: gr.SelectData) -> list[str]:
         return selected_gallery_ids(event.index, ids)

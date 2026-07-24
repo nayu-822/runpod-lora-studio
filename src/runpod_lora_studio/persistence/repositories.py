@@ -14,11 +14,19 @@ from sqlalchemy.orm import Session
 from runpod_lora_studio.domain.models import (
     ConceptType,
     ImageAsset,
+    ImageInspectionResult,
+    InspectionRule,
+    InspectionStatus,
+    InspectionSummary,
     Project,
     ProjectStatus,
     SelectionState,
 )
-from runpod_lora_studio.persistence.models import ImageAssetRecord, ProjectRecord
+from runpod_lora_studio.persistence.models import (
+    ImageAssetRecord,
+    ImageInspectionResultRecord,
+    ProjectRecord,
+)
 
 
 def utc_now() -> datetime:
@@ -234,6 +242,14 @@ class ImageRepository:
         ).all()
         return [image_from_record(record) for record in records], total
 
+    def list_all_for_project(self, project_id: UUID) -> list[ImageAsset]:
+        records = self.session.scalars(
+            select(ImageAssetRecord)
+            .where(ImageAssetRecord.project_id == str(project_id))
+            .order_by(ImageAssetRecord.created_at, ImageAssetRecord.id)
+        ).all()
+        return [image_from_record(record) for record in records]
+
     def update_state(
         self,
         project_id: UUID,
@@ -255,3 +271,116 @@ class ImageRepository:
             record.selection_source = "manual"
             record.updated_at = now
         return len(records)
+
+
+def inspection_from_record(
+    record: ImageInspectionResultRecord,
+) -> ImageInspectionResult:
+    return ImageInspectionResult(
+        image_id=UUID(record.image_id),
+        rule=InspectionRule(record.rule_code),
+        status=InspectionStatus(record.status),
+        score=record.score,
+        threshold=record.threshold,
+        reason=record.reason_ja,
+        detector_version=record.detector_version,
+        inspected_at=_utc(record.inspected_at),
+    )
+
+
+class ImageInspectionRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def replace_for_image(
+        self, image_id: UUID, results: Iterable[ImageInspectionResult]
+    ) -> None:
+        image_key = str(image_id)
+        self.session.query(ImageInspectionResultRecord).filter(
+            ImageInspectionResultRecord.image_id == image_key
+        ).delete(synchronize_session=False)
+        for result in results:
+            self.session.add(
+                ImageInspectionResultRecord(
+                    image_id=image_key,
+                    rule_code=result.rule.value,
+                    status=result.status.value,
+                    score=result.score,
+                    threshold=result.threshold,
+                    reason_ja=result.reason,
+                    detector_version=result.detector_version,
+                    inspected_at=result.inspected_at,
+                )
+            )
+
+    def list_for_image(self, image_id: UUID) -> list[ImageInspectionResult]:
+        records = self.session.scalars(
+            select(ImageInspectionResultRecord)
+            .where(ImageInspectionResultRecord.image_id == str(image_id))
+            .order_by(ImageInspectionResultRecord.rule_code)
+        ).all()
+        return [inspection_from_record(record) for record in records]
+
+    def list_for_project(
+        self, project_id: UUID
+    ) -> dict[UUID, list[ImageInspectionResult]]:
+        rows = self.session.scalars(
+            select(ImageInspectionResultRecord)
+            .join(ImageAssetRecord)
+            .where(ImageAssetRecord.project_id == str(project_id))
+            .order_by(
+                ImageInspectionResultRecord.image_id,
+                ImageInspectionResultRecord.rule_code,
+            )
+        ).all()
+        result: dict[UUID, list[ImageInspectionResult]] = {}
+        for row in rows:
+            result.setdefault(UUID(row.image_id), []).append(
+                inspection_from_record(row)
+            )
+        return result
+
+    def summary(self, project_id: UUID) -> InspectionSummary:
+        image_query = (
+            select(func.count())
+            .select_from(ImageAssetRecord)
+            .where(ImageAssetRecord.project_id == str(project_id))
+        )
+        total = int(self.session.scalar(image_query) or 0)
+        rows = self.session.execute(
+            select(
+                ImageInspectionResultRecord.image_id,
+                ImageInspectionResultRecord.rule_code,
+                ImageInspectionResultRecord.status,
+            )
+            .join(ImageAssetRecord)
+            .where(ImageAssetRecord.project_id == str(project_id))
+        ).all()
+        inspected_ids = self.session.scalar(
+            select(func.count(func.distinct(ImageInspectionResultRecord.image_id)))
+            .join(ImageAssetRecord)
+            .where(ImageAssetRecord.project_id == str(project_id))
+        )
+        counts = {"pass": set[str](), "warning": set[str](), "failed": set[str]()}
+        rules = {rule.value: set[str]() for rule in InspectionRule}
+        for image_id, rule, status in rows:
+            counts.setdefault(status, set()).add(image_id)
+            if status == InspectionStatus.WARNING.value:
+                rules[rule].add(image_id)
+        return InspectionSummary(
+            project_id=project_id,
+            total_images=total,
+            inspected_images=int(inspected_ids or 0),
+            pass_count=len(counts[InspectionStatus.PASS.value]),
+            warning_count=len(counts[InspectionStatus.WARNING.value]),
+            failed_count=len(counts[InspectionStatus.FAILED.value]),
+            exact_duplicate_count=len(rules[InspectionRule.EXACT_DUPLICATE.value]),
+            resolution_too_small_count=len(
+                rules[InspectionRule.RESOLUTION_TOO_SMALL.value]
+            ),
+            aspect_ratio_extreme_count=len(
+                rules[InspectionRule.ASPECT_RATIO_EXTREME.value]
+            ),
+            low_information_count=len(rules[InspectionRule.LOW_INFORMATION.value]),
+            blur_score_count=len(rules[InspectionRule.BLUR_SCORE.value]),
+        )

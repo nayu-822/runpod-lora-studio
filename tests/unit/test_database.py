@@ -65,7 +65,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0002_phase1_indexes"
+            "0003_phase2a_image_inspection"
         )
 
 
@@ -75,6 +75,27 @@ def test_existing_0001_database_upgrades_to_head(test_workspace: Path) -> None:
     engine = create_engine_for_settings(settings)
     indexes = {item["name"] for item in inspect(engine).get_indexes("projects")}
     assert "ix_projects_updated_at" in indexes
+
+
+def test_phase2a_migration_downgrade_removes_only_inspection_table(
+    test_workspace: Path,
+) -> None:
+    settings = migrate(test_workspace)
+    config = Config(str(Path("alembic.ini").resolve()))
+    old_path = os.environ.get("RUNPOD_LORA_STUDIO_DATABASE_PATH")
+    os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = str(settings.database_path)
+    get_settings.cache_clear()
+    try:
+        command.downgrade(config, "0002_phase1_indexes")
+    finally:
+        get_settings.cache_clear()
+        if old_path is None:
+            os.environ.pop("RUNPOD_LORA_STUDIO_DATABASE_PATH", None)
+        else:
+            os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
+    engine = create_engine_for_settings(settings)
+    assert "image_inspection_results" not in inspect(engine).get_table_names()
+    assert "image_assets" in inspect(engine).get_table_names()
 
 
 def test_foreign_keys_are_enabled_and_reject_orphans(test_workspace: Path) -> None:

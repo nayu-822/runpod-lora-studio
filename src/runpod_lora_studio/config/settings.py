@@ -50,6 +50,13 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     max_image_pixels: int = Field(default=100_000_000, ge=1)
     thumbnail_size: int = Field(default=320, ge=32, le=2048)
 
+    # Phase 2A image inspection defaults. These are warnings, not delete rules.
+    inspection_min_width: int = Field(default=512, ge=1)
+    inspection_min_height: int = Field(default=512, ge=1)
+    inspection_max_aspect_ratio: float = Field(default=3.0, gt=1.0)
+    inspection_low_information_stddev_threshold: float = Field(default=8.0, ge=0.0)
+    inspection_blur_score_threshold: float = Field(default=50.0, ge=0.0)
+
     runpod_pod_id: str | None = Field(default=None, validation_alias="RUNPOD_POD_ID")
     # Tokens and credentials added later must use SecretStr and repr=False as well.
     runpod_api_key: SecretStr | None = Field(

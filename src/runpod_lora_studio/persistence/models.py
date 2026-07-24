@@ -3,7 +3,15 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -65,6 +73,43 @@ class ImageAssetRecord(Base):
         DateTime(timezone=True), nullable=False
     )
     project: Mapped[ProjectRecord] = relationship(back_populates="images")
+    inspection_results: Mapped[list[ImageInspectionResultRecord]] = relationship(
+        back_populates="image", cascade="all, delete-orphan"
+    )
+
+
+class ImageInspectionResultRecord(Base):
+    __tablename__ = "image_inspection_results"
+    __table_args__ = (
+        UniqueConstraint(
+            "image_id",
+            "rule_code",
+            "detector_version",
+            name="uq_image_inspection_rule_version",
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    image_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("image_assets.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    rule_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reason_ja: Mapped[str] = mapped_column(Text, nullable=False)
+    detector_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    inspected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    image: Mapped[ImageAssetRecord] = relationship(back_populates="inspection_results")
+
+
+# Short compatibility name for service and test code.
+InspectionResultRecord = ImageInspectionResultRecord
 
 
 def record_values(record: Any) -> dict[str, Any]:

@@ -28,6 +28,20 @@ class SelectionState(StrEnum):
     EXCLUDED = "excluded"
 
 
+class InspectionRule(StrEnum):
+    EXACT_DUPLICATE = "exact_duplicate"
+    RESOLUTION_TOO_SMALL = "resolution_too_small"
+    ASPECT_RATIO_EXTREME = "aspect_ratio_extreme"
+    LOW_INFORMATION = "low_information"
+    BLUR_SCORE = "blur_score"
+
+
+class InspectionStatus(StrEnum):
+    PASS = "pass"
+    WARNING = "warning"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True, slots=True)
 class Project:
     id: UUID
@@ -61,3 +75,37 @@ class ImageAsset:
     created_at: datetime
     updated_at: datetime
     selection_source: str = "manual"
+
+
+@dataclass(frozen=True, slots=True)
+class ImageInspectionResult:
+    image_id: UUID
+    rule: InspectionRule
+    status: InspectionStatus
+    score: float | None
+    threshold: float | None
+    reason: str
+    detector_version: str
+    inspected_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class InspectionSummary:
+    project_id: UUID
+    total_images: int
+    inspected_images: int
+    pass_count: int
+    warning_count: int
+    failed_count: int
+    exact_duplicate_count: int
+    resolution_too_small_count: int
+    aspect_ratio_extreme_count: int
+    low_information_count: int
+    blur_score_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class InspectionRunResult:
+    summary: InspectionSummary
+    inspected_image_count: int
+    failed_image_count: int
