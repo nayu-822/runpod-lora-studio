@@ -293,11 +293,15 @@ class ImageInspectionRepository:
         self.session = session
 
     def replace_for_image(
-        self, image_id: UUID, results: Iterable[ImageInspectionResult]
+        self,
+        image_id: UUID,
+        results: Iterable[ImageInspectionResult],
+        detector_version: str,
     ) -> None:
         image_key = str(image_id)
         self.session.query(ImageInspectionResultRecord).filter(
-            ImageInspectionResultRecord.image_id == image_key
+            ImageInspectionResultRecord.image_id == image_key,
+            ImageInspectionResultRecord.detector_version == detector_version,
         ).delete(synchronize_session=False)
         for result in results:
             self.session.add(
@@ -313,22 +317,35 @@ class ImageInspectionRepository:
                 )
             )
 
-    def list_for_image(self, image_id: UUID) -> list[ImageInspectionResult]:
+    def list_for_image(
+        self, image_id: UUID, detector_version: str | None = None
+    ) -> list[ImageInspectionResult]:
+        query = select(ImageInspectionResultRecord).where(
+            ImageInspectionResultRecord.image_id == str(image_id)
+        )
+        if detector_version is not None:
+            query = query.where(
+                ImageInspectionResultRecord.detector_version == detector_version
+            )
         records = self.session.scalars(
-            select(ImageInspectionResultRecord)
-            .where(ImageInspectionResultRecord.image_id == str(image_id))
-            .order_by(ImageInspectionResultRecord.rule_code)
+            query.order_by(ImageInspectionResultRecord.rule_code)
         ).all()
         return [inspection_from_record(record) for record in records]
 
     def list_for_project(
-        self, project_id: UUID
+        self, project_id: UUID, detector_version: str | None = None
     ) -> dict[UUID, list[ImageInspectionResult]]:
-        rows = self.session.scalars(
+        query = (
             select(ImageInspectionResultRecord)
             .join(ImageAssetRecord)
             .where(ImageAssetRecord.project_id == str(project_id))
-            .order_by(
+        )
+        if detector_version is not None:
+            query = query.where(
+                ImageInspectionResultRecord.detector_version == detector_version
+            )
+        rows = self.session.scalars(
+            query.order_by(
                 ImageInspectionResultRecord.image_id,
                 ImageInspectionResultRecord.rule_code,
             )
@@ -340,14 +357,16 @@ class ImageInspectionRepository:
             )
         return result
 
-    def summary(self, project_id: UUID) -> InspectionSummary:
+    def summary(
+        self, project_id: UUID, detector_version: str | None = None
+    ) -> InspectionSummary:
         image_query = (
             select(func.count())
             .select_from(ImageAssetRecord)
             .where(ImageAssetRecord.project_id == str(project_id))
         )
         total = int(self.session.scalar(image_query) or 0)
-        rows = self.session.execute(
+        query = (
             select(
                 ImageInspectionResultRecord.image_id,
                 ImageInspectionResultRecord.rule_code,
@@ -355,32 +374,59 @@ class ImageInspectionRepository:
             )
             .join(ImageAssetRecord)
             .where(ImageAssetRecord.project_id == str(project_id))
-        ).all()
-        inspected_ids = self.session.scalar(
-            select(func.count(func.distinct(ImageInspectionResultRecord.image_id)))
-            .join(ImageAssetRecord)
-            .where(ImageAssetRecord.project_id == str(project_id))
         )
-        counts = {"pass": set[str](), "warning": set[str](), "failed": set[str]()}
-        rules = {rule.value: set[str]() for rule in InspectionRule}
+        if detector_version is not None:
+            query = query.where(
+                ImageInspectionResultRecord.detector_version == detector_version
+            )
+        rows = self.session.execute(query).all()
+        statuses_by_image: dict[str, set[str]] = {}
+        rules_by_image: dict[str, set[str]] = {}
+        warning_rules: dict[str, set[str]] = {
+            rule.value: set() for rule in InspectionRule
+        }
         for image_id, rule, status in rows:
-            counts.setdefault(status, set()).add(image_id)
-            if status == InspectionStatus.WARNING.value:
-                rules[rule].add(image_id)
+            statuses_by_image.setdefault(image_id, set()).add(status)
+            rules_by_image.setdefault(image_id, set()).add(rule)
+            if status == InspectionStatus.WARNING.value and rule in warning_rules:
+                warning_rules[rule].add(image_id)
+
+        # Each image receives exactly one aggregate state. Unknown statuses and
+        # incomplete rows are treated as failed so the summary remains safe and
+        # its counts remain exhaustive.
+        counts = {"pass": 0, "warning": 0, "failed": 0}
+        expected_rules = {rule.value for rule in InspectionRule}
+        for image_id, statuses in statuses_by_image.items():
+            if InspectionStatus.FAILED.value in statuses:
+                aggregate = InspectionStatus.FAILED.value
+            elif InspectionStatus.WARNING.value in statuses:
+                aggregate = InspectionStatus.WARNING.value
+            elif (
+                statuses == {InspectionStatus.PASS.value}
+                and rules_by_image.get(image_id, set()) == expected_rules
+            ):
+                aggregate = InspectionStatus.PASS.value
+            else:
+                aggregate = InspectionStatus.FAILED.value
+            counts[aggregate] += 1
         return InspectionSummary(
             project_id=project_id,
             total_images=total,
-            inspected_images=int(inspected_ids or 0),
-            pass_count=len(counts[InspectionStatus.PASS.value]),
-            warning_count=len(counts[InspectionStatus.WARNING.value]),
-            failed_count=len(counts[InspectionStatus.FAILED.value]),
-            exact_duplicate_count=len(rules[InspectionRule.EXACT_DUPLICATE.value]),
+            inspected_images=len(statuses_by_image),
+            pass_count=counts[InspectionStatus.PASS.value],
+            warning_count=counts[InspectionStatus.WARNING.value],
+            failed_count=counts[InspectionStatus.FAILED.value],
+            exact_duplicate_count=len(
+                warning_rules[InspectionRule.EXACT_DUPLICATE.value]
+            ),
             resolution_too_small_count=len(
-                rules[InspectionRule.RESOLUTION_TOO_SMALL.value]
+                warning_rules[InspectionRule.RESOLUTION_TOO_SMALL.value]
             ),
             aspect_ratio_extreme_count=len(
-                rules[InspectionRule.ASPECT_RATIO_EXTREME.value]
+                warning_rules[InspectionRule.ASPECT_RATIO_EXTREME.value]
             ),
-            low_information_count=len(rules[InspectionRule.LOW_INFORMATION.value]),
-            blur_score_count=len(rules[InspectionRule.BLUR_SCORE.value]),
+            low_information_count=len(
+                warning_rules[InspectionRule.LOW_INFORMATION.value]
+            ),
+            blur_score_count=len(warning_rules[InspectionRule.BLUR_SCORE.value]),
         )

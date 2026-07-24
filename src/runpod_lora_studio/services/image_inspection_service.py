@@ -63,17 +63,33 @@ class ImageInspectionService:
                 continue
             try:
                 results = self._inspect_one(image, duplicate_map)
-                self._save_results(image.id, results)
-                inspected += 1
-                failed += int(
-                    any(result.status is InspectionStatus.FAILED for result in results)
+            except Exception:
+                logger.exception(
+                    "image_inspection_failed project_id=%s image_id=%s",
+                    project_id,
+                    image.id,
                 )
+                results = self._failed_results(
+                    image.id,
+                    datetime.now(UTC),
+                    "画像検査処理に失敗しました。",
+                )
+            try:
+                self._save_results(image.id, results)
             except Exception:
                 logger.exception(
                     "image_inspection_persistence_failed project_id=%s image_id=%s",
                     project_id,
                     image.id,
                 )
+                # A persistence failure counts once, even if computed results
+                # also contained a failed rule.
+                failed += 1
+                continue
+            inspected += 1
+            failed += int(
+                any(result.status is InspectionStatus.FAILED for result in results)
+            )
         summary = self.get_summary(project_id)
         return InspectionRunResult(summary, inspected, failed)
 
@@ -87,17 +103,23 @@ class ImageInspectionService:
 
     def get_results(self, image_id: UUID) -> list[ImageInspectionResult]:
         with self.session_factory() as session:
-            return ImageInspectionRepository(session).list_for_image(image_id)
+            return ImageInspectionRepository(session).list_for_image(
+                image_id, self.detector_version
+            )
 
     def get_project_results(
         self, project_id: UUID
     ) -> dict[UUID, list[ImageInspectionResult]]:
         with self.session_factory() as session:
-            return ImageInspectionRepository(session).list_for_project(project_id)
+            return ImageInspectionRepository(session).list_for_project(
+                project_id, self.detector_version
+            )
 
     def get_summary(self, project_id: UUID) -> InspectionSummary:
         with self.session_factory() as session:
-            return ImageInspectionRepository(session).summary(project_id)
+            return ImageInspectionRepository(session).summary(
+                project_id, self.detector_version
+            )
 
     def _project_images(self, project_id: UUID) -> list[ImageAsset]:
         if self.projects.get(project_id) is None:
@@ -109,7 +131,9 @@ class ImageInspectionService:
         self, image_id: UUID, results: tuple[ImageInspectionResult, ...]
     ) -> None:
         with self.session_factory() as session:
-            ImageInspectionRepository(session).replace_for_image(image_id, results)
+            ImageInspectionRepository(session).replace_for_image(
+                image_id, results, self.detector_version
+            )
             session.commit()
 
     def _inspect_one(
@@ -124,6 +148,7 @@ class ImageInspectionService:
             with Image.open(image.original_path) as source:
                 source.load()
                 oriented = ImageOps.exif_transpose(source)
+                width, height = oriented.size
                 gray = oriented.convert("L")
                 sample = self._sample(gray)
                 low_information_score = self._standard_deviation(sample)
@@ -133,19 +158,19 @@ class ImageInspectionService:
                 image.id, now, "画像を読み込めないため検査できません。"
             )
 
-        minimum_side = float(min(image.width, image.height))
+        minimum_side = float(min(width, height))
         resolution_failed = (
-            image.width < self.settings.inspection_min_width
-            or image.height < self.settings.inspection_min_height
+            width < self.settings.inspection_min_width
+            or height < self.settings.inspection_min_height
         )
         missing_dimensions: list[str] = []
-        if image.width < self.settings.inspection_min_width:
+        if width < self.settings.inspection_min_width:
             missing_dimensions.append(f"幅 {self.settings.inspection_min_width}px未満")
-        if image.height < self.settings.inspection_min_height:
+        if height < self.settings.inspection_min_height:
             missing_dimensions.append(
                 f"高さ {self.settings.inspection_min_height}px未満"
             )
-        aspect_ratio = max(image.width / image.height, image.height / image.width)
+        aspect_ratio = max(width / height, height / width)
         aspect_failed = aspect_ratio > self.settings.inspection_max_aspect_ratio
         low_information = (
             low_information_score
