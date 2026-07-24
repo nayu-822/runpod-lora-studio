@@ -4,6 +4,7 @@ import math
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from PIL import Image, ImageFilter
 from sqlalchemy import create_engine, func, select
 
@@ -130,6 +131,39 @@ def test_summary_safely_classifies_unexpected_status_as_failed(
 
     summary = service.get_summary(project.id)
     assert summary.inspected_images == 1
+    assert summary.failed_count == 1
+    assert summary.pass_count + summary.warning_count + summary.failed_count == 1
+
+
+def test_summary_classifies_unknown_status_as_failed(
+    test_workspace: Path,
+) -> None:
+    settings = inspection_settings(test_workspace)
+    projects = ProjectService(settings)
+    project = projects.create(ProjectInput("Unknown status"))
+    source = test_workspace / "unknown.png"
+    Image.new("RGB", (640, 640), "white").save(source)
+    image = (
+        ImageService(settings, projects)
+        .register_uploads(project.id, [source])
+        .successes[0]
+    )
+    service = ImageInspectionService(settings, projects)
+    service._save_results(
+        image.id,
+        make_results(
+            image.id,
+            {rule: InspectionStatus.PASS for rule in InspectionRule},
+            service.detector_version,
+        ),
+    )
+    with service.session_factory() as session:
+        session.query(ImageInspectionResultRecord).filter(
+            ImageInspectionResultRecord.image_id == str(image.id)
+        ).first().status = "unknown"
+        session.commit()
+
+    summary = service.get_summary(project.id)
     assert summary.failed_count == 1
     assert summary.pass_count + summary.warning_count + summary.failed_count == 1
 
@@ -390,6 +424,60 @@ def test_reinspection_keeps_previous_detector_version_and_summary_uses_current(
         service.detector_version,
     }
     assert service.get_summary(project.id).warning_count == 0
+
+
+def test_replace_for_image_rejects_detector_version_mismatch_before_delete(
+    test_workspace: Path,
+) -> None:
+    settings = inspection_settings(test_workspace)
+    projects = ProjectService(settings)
+    project = projects.create(ProjectInput("Version validation"))
+    source = test_workspace / "validation.png"
+    Image.new("RGB", (640, 640), "white").save(source)
+    image = (
+        ImageService(settings, projects)
+        .register_uploads(project.id, [source])
+        .successes[0]
+    )
+    service = ImageInspectionService(settings, projects)
+    current = make_results(
+        image.id,
+        {rule: InspectionStatus.PASS for rule in InspectionRule},
+        service.detector_version,
+    )
+    with service.session_factory() as session:
+        repository = ImageInspectionRepository(session)
+        repository.replace_for_image(image.id, current, service.detector_version)
+        session.commit()
+
+    mismatched = make_results(
+        image.id,
+        {rule: InspectionStatus.WARNING for rule in InspectionRule},
+        "phase2a-other",
+    )
+    mixed = current[:-1] + (
+        ImageInspectionResult(
+            image_id=image.id,
+            rule=current[-1].rule,
+            status=InspectionStatus.WARNING,
+            score=1.0,
+            threshold=0.0,
+            reason="mixed",
+            detector_version="phase2a-other",
+            inspected_at=datetime.now(UTC),
+        ),
+    )
+    with service.session_factory() as session:
+        repository = ImageInspectionRepository(session)
+        with pytest.raises(ValueError):
+            repository.replace_for_image(image.id, mismatched, service.detector_version)
+        with pytest.raises(ValueError):
+            repository.replace_for_image(image.id, mixed, service.detector_version)
+        session.rollback()
+
+    assert {result.rule: result.status for result in service.get_results(image.id)} == {
+        result.rule: result.status for result in current
+    }
 
 
 def test_blur_score_is_higher_for_sharp_image(test_workspace: Path) -> None:

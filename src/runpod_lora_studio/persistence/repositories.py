@@ -298,12 +298,18 @@ class ImageInspectionRepository:
         results: Iterable[ImageInspectionResult],
         detector_version: str,
     ) -> None:
+        materialized = tuple(results)
+        result_versions = {result.detector_version for result in materialized}
+        if not materialized or result_versions != {detector_version}:
+            raise ValueError(
+                "All inspection results must use the requested detector_version."
+            )
         image_key = str(image_id)
         self.session.query(ImageInspectionResultRecord).filter(
             ImageInspectionResultRecord.image_id == image_key,
             ImageInspectionResultRecord.detector_version == detector_version,
         ).delete(synchronize_session=False)
-        for result in results:
+        for result in materialized:
             self.session.add(
                 ImageInspectionResultRecord(
                     image_id=image_key,
@@ -397,7 +403,10 @@ class ImageInspectionRepository:
         counts = {"pass": 0, "warning": 0, "failed": 0}
         expected_rules = {rule.value for rule in InspectionRule}
         for image_id, statuses in statuses_by_image.items():
-            if InspectionStatus.FAILED.value in statuses:
+            image_rules = rules_by_image.get(image_id, set())
+            if image_rules != expected_rules:
+                aggregate = InspectionStatus.FAILED.value
+            elif InspectionStatus.FAILED.value in statuses:
                 aggregate = InspectionStatus.FAILED.value
             elif InspectionStatus.WARNING.value in statuses:
                 aggregate = InspectionStatus.WARNING.value
