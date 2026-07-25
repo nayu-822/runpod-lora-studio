@@ -300,7 +300,7 @@ class TransferManifest:
     skipped_count: int
     total_bytes: int
     transferred_bytes: int
-    verification_level: VerificationPolicy
+    verification_level: VerificationPolicy | str
     status: TransferStatus
     items: tuple[dict[str, Any], ...]
     error_summary: str | None = None

@@ -392,7 +392,7 @@ class StorageService:
         )
         files = self._snapshot_files(root)
         remote_entries = self._remote_entries(target)
-        remote_content, has_remote_manifest, _manifest_hashes = (
+        remote_content, has_remote_manifest, remote_manifest_items = (
             self._remote_snapshot_content(target, remote_entries)
         )
         items: list[TransferItemPlan] = []
@@ -402,6 +402,10 @@ class StorageService:
             reason = ""
             if remote is not None:
                 identical = _remote_file_identical(remote, path)
+                if not identical and not remote.hash_type and not remote.hash_value:
+                    identical, _fallback_status = self._fallback_identity(
+                        remote, size, remote_manifest_items.get(relative)
+                    )
                 if policy is OverwritePolicy.FAIL_IF_EXISTS:
                     action, reason = "conflict", "remoteに同名ファイルがあります"
                 elif identical:
@@ -1032,7 +1036,7 @@ class StorageService:
 
     def _remote_snapshot_content(
         self, target: StorageRemotePath, entries: dict[str, StorageEntry]
-    ) -> tuple[str | None, bool, dict[str, str]]:
+    ) -> tuple[str | None, bool, dict[str, dict[str, Any]]]:
         manifest_entry = entries.get("transfer-manifest.json")
         if manifest_entry is None:
             return None, False, {}
@@ -1043,16 +1047,31 @@ class StorageService:
             payload = json.loads(reader(target.child("transfer-manifest.json")))
             settings = payload.get("settings", {})
             value = settings.get("snapshot_content_sha256")
-            hashes = {
-                str(item["relative_path"]): str(item["local_sha256"])
+            manifest_items = {
+                str(item["relative_path"]): dict(item)
                 for item in payload.get("items", [])
-                if isinstance(item, dict)
-                and item.get("relative_path")
-                and item.get("local_sha256")
+                if isinstance(item, dict) and item.get("relative_path")
             }
-            return str(value) if value else None, True, hashes
+            return str(value) if value else None, True, manifest_items
         except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
             return None, True, {}
+
+    def _fallback_identity(
+        self,
+        entry: StorageEntry,
+        local_size: int,
+        manifest_item: dict[str, Any] | None,
+    ) -> tuple[bool, str]:
+        fallback = self.settings.storage_remote_hash_fallback
+        if fallback == "existence_only":
+            return True, "existence_only"
+        if fallback == "size_and_manifest":
+            return (
+                manifest_item is not None
+                and self._manifest_metadata_matches(entry, local_size, manifest_item),
+                "manifest_metadata_and_size",
+            )
+        return False, "not_verified"
 
     def _verify_remote_snapshot(
         self,
@@ -1072,7 +1091,7 @@ class StorageService:
         if content != expected_content_sha256:
             raise UserFacingError("snapshot content SHA-256が一致しません")
 
-    def _remote_verification_statuses(
+    def _legacy_remote_verification_statuses(
         self,
         target: StorageRemotePath,
         files: list[tuple[str, Path, int, str]],
@@ -1095,6 +1114,95 @@ class StorageService:
                 raise UserFacingError("転送後のremoteハッシュ検証に失敗しました")
             statuses[relative] = "remote_hash_and_size"
         return statuses
+
+    def _remote_verification_statuses(
+        self,
+        target: StorageRemotePath,
+        files: list[tuple[str, Path, int, str]],
+        verification_policy: VerificationPolicy,
+    ) -> dict[str, str]:
+        entries = self._remote_entries(target)
+        _content, _has_manifest, manifest_items = self._remote_snapshot_content(
+            target, entries
+        )
+        statuses: dict[str, str] = {}
+        for relative, path, size, digest in files:
+            entry = entries.get(relative)
+            if entry is None:
+                raise UserFacingError("remoteファイル検証に失敗しました")
+            if verification_policy is VerificationPolicy.EXISTENCE_ONLY:
+                statuses[relative] = "existence_only"
+                continue
+            manifest_item = manifest_items.get(relative)
+            if verification_policy is VerificationPolicy.SIZE_AND_MANIFEST:
+                if not self._manifest_metadata_matches(entry, size, manifest_item):
+                    raise UserFacingError("remoteメタデータ検証に失敗しました")
+                statuses[relative] = "manifest_metadata_and_size"
+                continue
+            if entry.hash_type and entry.hash_value:
+                if verification_policy is VerificationPolicy.FULL_CHECKSUM:
+                    if _hash_algorithm(entry.hash_type) != "sha256":
+                        raise UserFacingError(
+                            "full checksumにはremote SHA-256が必要です"
+                        )
+                    if (
+                        entry.size_bytes != size
+                        or not _hash_matches(path, entry.hash_type, entry.hash_value)
+                        or _sha256_file(path) != digest
+                    ):
+                        raise UserFacingError("remote SHA-256検証に失敗しました")
+                    statuses[relative] = "full_checksum"
+                    continue
+                if entry.size_bytes != size or not _remote_file_identical(entry, path):
+                    raise UserFacingError("remoteハッシュ検証に失敗しました")
+                statuses[relative] = "remote_hash_and_size"
+                continue
+            identical, fallback_status = self._fallback_identity(
+                entry, size, manifest_item
+            )
+            if not identical:
+                raise UserFacingError("remote hashを取得できないため検証できません")
+            statuses[relative] = fallback_status
+        return statuses
+
+    @staticmethod
+    def _manifest_metadata_matches(
+        entry: StorageEntry,
+        local_size: int,
+        manifest_item: dict[str, Any] | None,
+    ) -> bool:
+        if entry.size_bytes != local_size or entry.modified_at is None:
+            return False
+        if manifest_item is None:
+            return True
+        recorded_size = manifest_item.get("remote_size")
+        recorded_modified = manifest_item.get("remote_modified_at")
+        if recorded_size is None or not recorded_modified:
+            return False
+        try:
+            expected_modified = datetime.fromisoformat(str(recorded_modified))
+        except ValueError:
+            return False
+        if expected_modified.tzinfo is None:
+            expected_modified = expected_modified.replace(tzinfo=UTC)
+        actual_modified = entry.modified_at
+        if actual_modified.tzinfo is None:
+            actual_modified = actual_modified.replace(tzinfo=UTC)
+        if (
+            entry.size_bytes != int(recorded_size)
+            or actual_modified != expected_modified
+        ):
+            return False
+        recorded_hash_type = manifest_item.get("remote_hash_type")
+        recorded_hash = manifest_item.get("remote_hash")
+        if entry.hash_type and entry.hash_value:
+            return (
+                recorded_hash_type is not None
+                and recorded_hash is not None
+                and str(recorded_hash_type).casefold() == entry.hash_type.casefold()
+                and str(recorded_hash).casefold() == entry.hash_value.casefold()
+            )
+        return True
 
     def _snapshot_remote_path(
         self, project_id: UUID, snapshot_id: UUID, value: ProjectStorageSettings
@@ -1508,6 +1616,9 @@ class StorageService:
     ) -> Path:
         path = self.transfer_root / "manifests" / f"{job_id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
+        verification_level = _manifest_verification_level(
+            items, settings.verification_policy
+        )
         payload = TransferManifest(
             "phase5-transfer-v1",
             job_id,
@@ -1523,6 +1634,7 @@ class StorageService:
             {
                 "overwrite_policy": settings.overwrite_policy.value,
                 "verification_policy": settings.verification_policy.value,
+                "remote_hash_fallback": self.settings.storage_remote_hash_fallback,
                 "snapshot_content_sha256": snapshot_content_sha256,
             },
             len(items),
@@ -1539,7 +1651,7 @@ class StorageService:
                 for item in items
                 if item["transfer_status"] == "completed"
             ),
-            settings.verification_policy,
+            verification_level,
             status,
             tuple(items),
         )
@@ -1595,12 +1707,37 @@ def _manifest_dict(manifest: TransferManifest) -> dict[str, Any]:
         "skipped_count": manifest.skipped_count,
         "total_bytes": manifest.total_bytes,
         "transferred_bytes": manifest.transferred_bytes,
-        "verification_level": manifest.verification_level.value,
+        "verification_level": (
+            manifest.verification_level.value
+            if isinstance(manifest.verification_level, VerificationPolicy)
+            else manifest.verification_level
+        ),
         "status": manifest.status.value,
         "items": list(manifest.items),
         "error_summary": manifest.error_summary,
         "application_version": "0.1.0",
     }
+
+
+def _manifest_verification_level(
+    items: list[dict[str, Any]], requested: VerificationPolicy
+) -> VerificationPolicy | str:
+    statuses = {str(item.get("verification_status", "not_verified")) for item in items}
+    if not statuses:
+        return requested
+    if "verification_failed" in statuses:
+        return "verification_failed"
+    if "not_verified" in statuses:
+        return "not_verified"
+    if statuses == {"full_checksum"}:
+        return VerificationPolicy.FULL_CHECKSUM
+    if statuses.issubset({"full_checksum", "remote_hash_and_size"}):
+        return VerificationPolicy.REMOTE_HASH_AND_SIZE
+    if "manifest_metadata_and_size" in statuses:
+        return VerificationPolicy.SIZE_AND_MANIFEST
+    if "existence_only" in statuses:
+        return VerificationPolicy.EXISTENCE_ONLY
+    return "not_verified"
 
 
 def _hash_file(path: Path, algorithm: str = "sha256") -> str:
@@ -1616,13 +1753,17 @@ def _sha256_file(path: Path) -> str:
 
 
 def _hash_matches(path: Path, hash_type: str, expected: str) -> bool:
-    algorithm = hash_type.casefold().replace("-", "")
+    algorithm = _hash_algorithm(hash_type)
     if algorithm not in hashlib.algorithms_available:
         return False
     try:
         return _hash_file(path, algorithm) == expected.casefold()
     except (ValueError, OSError):
         return False
+
+
+def _hash_algorithm(hash_type: str) -> str:
+    return hash_type.casefold().replace("-", "")
 
 
 def _remote_signature(entry: StorageEntry) -> tuple[object, ...]:

@@ -236,6 +236,14 @@ DBには`dataset_snapshots`、`dataset_snapshot_items`、`dataset_validation_iss
 
 類似グループは対象画像に関係するグループをID単位で一度だけ集計します。review status、全体member count、代表画像、否定済みペア数を参照し、未確認グループ数、否定済みペアを含むグループ数、未確認グループの対象画像数をプレビューとレポートへ表示します。未確認・否定済みペアを理由に自動除外はしません。
 
+### 転送検証ポリシー
+
+`full_checksum`はremote SHA-256とローカルSHA-256を比較し、MD5だけでは成功にしません。`remote_hash_and_size`はremoteが提供する比較可能なhashとサイズを使います。`size_and_manifest`はファイルの存在・サイズ・manifestに保存したremoteサイズ・更新日時・hashメタデータ・snapshot content SHA-256・必須ファイル集合を確認する限定検証です。`existence_only`は存在だけを確認します。
+
+`storage_remote_hash_fallback`は実処理へ反映されます。`error`は失敗、`existence_only`は`existence_only`へ、`size_and_manifest`は`manifest_metadata_and_size`へフォールバックします。設定値はmanifestのsettingsへ、実績は各itemの`verification_status`と全体`verification_level`へ保存します。全体レベルはitem実績から決定し、`not_verified`／`verification_failed`を含むジョブはcompletedにしません。
+
+0009で追加した累積進捗列は既存runningジョブでは0から初期化されます。既存ジョブのheartbeat／PIDは変更せず、再起動時のstale回復対象となった場合は従来どおりstaleへ遷移します。新しい転送は完了済みバイトと現在ファイルバイトを分けて更新します。
+
 ## Phase 5: モデル管理・Google Drive・rclone連携
 
 Phase 5では、rcloneを介してGoogle Driveのモデルを一覧表示し、RunPodのローカルキャッシュへ検証付きで取得できます。モデル一覧は許可拡張子、サイズ上限、ページング、検索条件で絞り込み、既存キャッシュはサイズとSHA-256が一致する場合に再利用します。取得中は固定バッファで`.part`へ保存し、サイズ・ハッシュ検証後に確定名へatomic renameします。

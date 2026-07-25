@@ -195,6 +195,26 @@ def test_phase5_progress_migration_upgrades_existing_0008_database(
     test_workspace: Path,
 ) -> None:
     settings = migrate(test_workspace, "0008_storage_transfer_heartbeat")
+    job_id = str(uuid4())
+    with create_engine_for_settings(settings).begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO storage_transfer_jobs
+                (id, project_id, snapshot_id, training_run_id, transfer_type,
+                 source_kind, destination_kind, status, current_step, item_count,
+                 processed_item_count, succeeded_item_count, failed_item_count,
+                 skipped_item_count, total_bytes, transferred_bytes, cancel_requested,
+                 pid, worker_id, heartbeat_at, started_at, completed_at,
+                 error_summary, manifest_path, created_at, updated_at)
+                VALUES
+                (:id, NULL, NULL, NULL, 'model_download', 'remote', 'local',
+                 'running', 'transferring', 1, 0, 0, 0, 0, 10, 0, 0,
+                 NULL, 'legacy-worker', :now, :now, NULL, NULL, NULL, :now, :now)
+                """
+            ),
+            {"id": job_id, "now": datetime.now(UTC)},
+        )
     migrate(test_workspace, "head")
     with create_engine_for_settings(settings).connect() as connection:
         columns = {
@@ -205,6 +225,15 @@ def test_phase5_progress_migration_upgrades_existing_0008_database(
             "completed_transferred_bytes",
             "current_file_transferred_bytes",
         }.issubset(columns)
+        row = connection.execute(
+            text(
+                "SELECT status, completed_transferred_bytes, "
+                "current_file_transferred_bytes FROM storage_transfer_jobs "
+                "WHERE id = :id"
+            ),
+            {"id": job_id},
+        ).one()
+        assert row == ("running", 0, 0)
         assert MigrationContext.configure(connection).get_current_revision() == (
             "0009_storage_transfer_progress"
         )

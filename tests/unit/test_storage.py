@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -17,6 +18,7 @@ from runpod_lora_studio.domain.storage_models import (
     StorageTransferType,
     TransferProgress,
     TransferStatus,
+    VerificationPolicy,
 )
 from runpod_lora_studio.external.fake_storage import FakeStorageTransferAdapter
 from runpod_lora_studio.external.rclone import CancelToken, ListOptions
@@ -32,6 +34,7 @@ from runpod_lora_studio.services.project_service import (
 from runpod_lora_studio.services.storage_service import (
     StorageService,
     _error_classification,
+    _manifest_verification_level,
 )
 
 
@@ -41,6 +44,22 @@ class NoHashFakeAdapter(FakeStorageTransferAdapter):
     ) -> tuple[StorageEntry, ...]:
         return tuple(
             replace(entry, hash_type=None, hash_value=None)
+            for entry in super().list_entries(remote_path, options)
+        )
+
+
+class Sha256FakeAdapter(FakeStorageTransferAdapter):
+    def list_entries(
+        self, remote_path: StorageRemotePath, options: ListOptions
+    ) -> tuple[StorageEntry, ...]:
+        return tuple(
+            replace(
+                entry,
+                hash_type="sha256",
+                hash_value=hashlib.sha256(
+                    self.files[entry.remote_path.relative_path]
+                ).hexdigest(),
+            )
             for entry in super().list_entries(remote_path, options)
         )
 
@@ -77,6 +96,34 @@ def _settings(test_workspace: Path) -> AppSettings:
     ensure_runtime_directories(settings)
     Base.metadata.create_all(create_engine_for_settings(settings))
     return settings
+
+
+def _remote_verification_fixture(
+    test_workspace: Path, adapter: FakeStorageTransferAdapter
+) -> tuple[StorageService, StorageRemotePath, list[tuple[str, Path, int, str]]]:
+    local = test_workspace / "verification.bin"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_bytes(b"abc")
+    target = StorageRemotePath("gdrive", "verification")
+    adapter.files["verification/file.bin"] = b"abc"
+    modified = adapter._modified_at.isoformat()
+    adapter.files["verification/transfer-manifest.json"] = json.dumps(
+        {
+            "settings": {"snapshot_content_sha256": "content"},
+            "items": [
+                {
+                    "relative_path": "file.bin",
+                    "remote_size": 3,
+                    "remote_modified_at": modified,
+                    "remote_hash_type": None,
+                    "remote_hash": None,
+                }
+            ],
+        }
+    ).encode()
+    settings = _settings(test_workspace)
+    service = StorageService(settings, adapter=adapter)
+    return service, target, [("file.bin", local, 3, hashlib.sha256(b"abc").hexdigest())]
 
 
 def test_model_list_download_and_reuse_with_fake_adapter(test_workspace: Path) -> None:
@@ -216,6 +263,129 @@ def test_retry_backoff_uses_injected_sleeper_and_cancellation(
     service._sleep_before_retry(2.5, token)
 
     assert delays == [2.5]
+
+
+def test_full_checksum_requires_remote_sha256(test_workspace: Path) -> None:
+    service, target, files = _remote_verification_fixture(
+        test_workspace, Sha256FakeAdapter()
+    )
+    assert service._remote_verification_statuses(
+        target, files, VerificationPolicy.FULL_CHECKSUM
+    ) == {"file.bin": "full_checksum"}
+
+    md5_service, md5_target, md5_files = _remote_verification_fixture(
+        test_workspace / "md5", FakeStorageTransferAdapter()
+    )
+    with pytest.raises(UserFacingError):
+        md5_service._remote_verification_statuses(
+            md5_target, md5_files, VerificationPolicy.FULL_CHECKSUM
+        )
+
+
+def test_remote_hash_and_size_accepts_md5_and_rejects_mismatch(
+    test_workspace: Path,
+) -> None:
+    service, target, files = _remote_verification_fixture(
+        test_workspace, FakeStorageTransferAdapter()
+    )
+    assert service._remote_verification_statuses(
+        target, files, VerificationPolicy.REMOTE_HASH_AND_SIZE
+    ) == {"file.bin": "remote_hash_and_size"}
+    service.adapter.files["verification/file.bin"] = b"abd"  # type: ignore[attr-defined]
+    with pytest.raises(UserFacingError):
+        service._remote_verification_statuses(
+            target, files, VerificationPolicy.REMOTE_HASH_AND_SIZE
+        )
+
+
+def test_size_and_manifest_checks_metadata_without_remote_hash(
+    test_workspace: Path,
+) -> None:
+    service, target, files = _remote_verification_fixture(
+        test_workspace, NoHashFakeAdapter()
+    )
+    assert service._remote_verification_statuses(
+        target, files, VerificationPolicy.SIZE_AND_MANIFEST
+    ) == {"file.bin": "manifest_metadata_and_size"}
+
+    service.adapter.files["verification/file.bin"] = b"abcd"  # type: ignore[attr-defined]
+    with pytest.raises(UserFacingError):
+        service._remote_verification_statuses(
+            target, files, VerificationPolicy.SIZE_AND_MANIFEST
+        )
+
+    service.adapter.files["verification/file.bin"] = b"abc"  # type: ignore[attr-defined]
+    service.adapter._modified_at += timedelta(seconds=1)  # type: ignore[attr-defined]
+    with pytest.raises(UserFacingError):
+        service._remote_verification_statuses(
+            target, files, VerificationPolicy.SIZE_AND_MANIFEST
+        )
+
+
+def test_existence_only_and_remote_hash_fallback_are_explicit(
+    test_workspace: Path,
+) -> None:
+    service, target, files = _remote_verification_fixture(
+        test_workspace, NoHashFakeAdapter()
+    )
+    with pytest.raises(UserFacingError):
+        service._remote_verification_statuses(
+            target, files, VerificationPolicy.REMOTE_HASH_AND_SIZE
+        )
+    assert service._remote_verification_statuses(
+        target, files, VerificationPolicy.EXISTENCE_ONLY
+    ) == {"file.bin": "existence_only"}
+    service.adapter.files.pop("verification/file.bin")  # type: ignore[attr-defined]
+    with pytest.raises(UserFacingError):
+        service._remote_verification_statuses(
+            target, files, VerificationPolicy.EXISTENCE_ONLY
+        )
+
+    fallback_service, fallback_target, fallback_files = _remote_verification_fixture(
+        test_workspace / "fallback", NoHashFakeAdapter()
+    )
+    fallback_service.settings.storage_remote_hash_fallback = "size_and_manifest"
+    assert fallback_service._remote_verification_statuses(
+        fallback_target, fallback_files, VerificationPolicy.REMOTE_HASH_AND_SIZE
+    ) == {"file.bin": "manifest_metadata_and_size"}
+    existence_service, existence_target, existence_files = _remote_verification_fixture(
+        test_workspace / "existence-fallback", NoHashFakeAdapter()
+    )
+    existence_service.settings.storage_remote_hash_fallback = "existence_only"
+    assert existence_service._remote_verification_statuses(
+        existence_target, existence_files, VerificationPolicy.REMOTE_HASH_AND_SIZE
+    ) == {"file.bin": "existence_only"}
+
+
+@pytest.mark.parametrize(
+    ("statuses", "expected"),
+    [
+        (["full_checksum"], VerificationPolicy.FULL_CHECKSUM),
+        (
+            ["full_checksum", "remote_hash_and_size"],
+            VerificationPolicy.REMOTE_HASH_AND_SIZE,
+        ),
+        (
+            ["remote_hash_and_size", "manifest_metadata_and_size"],
+            VerificationPolicy.SIZE_AND_MANIFEST,
+        ),
+        (
+            ["manifest_metadata_and_size", "existence_only"],
+            VerificationPolicy.SIZE_AND_MANIFEST,
+        ),
+        (["existence_only"], VerificationPolicy.EXISTENCE_ONLY),
+        (["verification_failed"], "verification_failed"),
+        (["not_verified"], "not_verified"),
+    ],
+)
+def test_manifest_verification_level_reflects_item_results(
+    statuses: list[str], expected: VerificationPolicy | str
+) -> None:
+    items = [{"verification_status": status} for status in statuses]
+    assert (
+        _manifest_verification_level(items, VerificationPolicy.FULL_CHECKSUM)
+        == expected
+    )
 
 
 def test_stale_running_job_is_recovered_idempotently(test_workspace: Path) -> None:

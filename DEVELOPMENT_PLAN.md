@@ -250,6 +250,8 @@ Phase 5のレビュー対応を完了し、完了扱いへ更新する。Alembic
 - 転送をキャンセル・再試行でき、再起動後に実行中プロセスの不在をstaleとして検出できる
 - 0009を空DB、0006適用済みDB、0007／0008適用済みDBへ適用でき、既存モデル・スナップショット・転送ジョブを変更しない
 
+0009で追加した`completed_transferred_bytes`と`current_file_transferred_bytes`は既存runningジョブでは0から開始する。既存のheartbeat／PIDは変更せず、アプリ再起動時のstale判定に従って回復する。転送検証は、設定値ではなくitemの実績からmanifest全体のverification levelを決定し、remote hash fallbackの実績もitemへ保存する。
+
 ## Phase 6: SDXL LoRA学習実行
 
 ### 実装内容
