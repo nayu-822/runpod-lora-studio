@@ -656,7 +656,6 @@ class StorageService:
                         str(item["transfer_status"]),
                         verification,
                     )
-                verification_phase = 0
                 manifest = self._write_transfer_manifest(
                     job_id,
                     StorageTransferType.SNAPSHOT_UPLOAD,
@@ -677,6 +676,19 @@ class StorageService:
                 )
                 if final_manifest_result.returncode != 0:
                     raise UserFacingError("転送マニフェストの確定に失敗しました")
+            self._validate_final_remote_manifest(
+                target,
+                manifest,
+                job_id,
+                project_id,
+                snapshot_id,
+                manifest_items,
+                _manifest_verification_level(
+                    manifest_items, project_settings.verification_policy
+                ),
+                record.content_sha256,
+            )
+            verification_phase = 0
             self._finish_job(job_id, TransferStatus.COMPLETED, manifest)
             return job_id
         except Exception as exc:
@@ -1145,6 +1157,108 @@ class StorageService:
             raise UserFacingError("snapshot content SHA-256が一致しません")
 
         return statuses
+
+    def _validate_final_remote_manifest(
+        self,
+        target: StorageRemotePath,
+        local_manifest: Path,
+        job_id: UUID,
+        project_id: UUID,
+        snapshot_id: UUID,
+        expected_items: list[dict[str, Any]],
+        expected_verification_level: VerificationPolicy | str,
+        expected_content_sha256: str,
+    ) -> None:
+        """Validate the final manifest after it has been copied to the remote."""
+        try:
+            local_payload = json.loads(local_manifest.read_text(encoding="utf-8"))
+            if not isinstance(local_payload, dict):
+                raise ValueError("local manifest is not an object")
+
+            entries = self._remote_entries(target)
+            remote_entry = entries.get("transfer-manifest.json")
+            reader = getattr(self.adapter, "read_remote_file", None)
+            if remote_entry is None or not callable(reader):
+                raise ValueError("remote final manifest is missing")
+            remote_payload = json.loads(reader(target.child("transfer-manifest.json")))
+            if not isinstance(remote_payload, dict):
+                raise ValueError("remote manifest is not an object")
+
+            expected_level = (
+                expected_verification_level.value
+                if isinstance(expected_verification_level, VerificationPolicy)
+                else expected_verification_level
+            )
+            if (
+                remote_payload.get("schema_version") != "phase5-transfer-v1"
+                or remote_payload.get("transfer_job_id") != str(job_id)
+                or remote_payload.get("transfer_type")
+                != StorageTransferType.SNAPSHOT_UPLOAD.value
+                or remote_payload.get("project_id") != str(project_id)
+                or remote_payload.get("snapshot_id") != str(snapshot_id)
+                or remote_payload.get("status") != TransferStatus.COMPLETED.value
+                or remote_payload.get("verification_level") != expected_level
+            ):
+                raise ValueError("remote manifest metadata does not match")
+
+            settings = remote_payload.get("settings")
+            if (
+                not isinstance(settings, dict)
+                or settings.get("snapshot_content_sha256") != expected_content_sha256
+            ):
+                raise ValueError("remote snapshot content does not match")
+
+            remote_items = remote_payload.get("items")
+            if not isinstance(remote_items, list):
+                raise ValueError("remote manifest items are invalid")
+            expected_by_path = {
+                str(item["relative_path"]): item for item in expected_items
+            }
+            actual_by_path = {
+                str(item["relative_path"]): item
+                for item in remote_items
+                if isinstance(item, dict) and item.get("relative_path")
+            }
+            if (
+                len(expected_by_path) != len(expected_items)
+                or len(actual_by_path) != len(remote_items)
+                or set(expected_by_path) != set(actual_by_path)
+                or remote_payload.get("item_count") != len(expected_items)
+            ):
+                raise ValueError("remote manifest item set does not match")
+            for relative, expected in expected_by_path.items():
+                actual = actual_by_path[relative]
+                for field in (
+                    "transfer_status",
+                    "verification_status",
+                    "size",
+                    "local_sha256",
+                ):
+                    if actual.get(field) != expected.get(field):
+                        raise ValueError("remote manifest item does not match")
+
+            local_bytes = local_manifest.read_bytes()
+            if remote_entry.size_bytes != len(local_bytes):
+                raise ValueError("remote manifest size does not match")
+            if remote_entry.hash_type and remote_entry.hash_value:
+                if not _hash_matches(
+                    local_manifest, remote_entry.hash_type, remote_entry.hash_value
+                ):
+                    raise ValueError("remote manifest hash does not match")
+            if _canonical_json(local_payload) != _canonical_json(remote_payload):
+                raise ValueError("remote manifest content does not match")
+        except (
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            UserFacingError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise UserFacingError(
+                "最終転送マニフェストを確認できません"
+                "（仮manifestがremoteに残っている可能性があります）"
+            ) from exc
 
     def _legacy_remote_verification_statuses(
         self,
@@ -1750,6 +1864,10 @@ class StorageService:
             "retry_count": 0,
             "error_summary": None,
         }
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _manifest_dict(manifest: TransferManifest) -> dict[str, Any]:
