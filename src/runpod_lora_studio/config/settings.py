@@ -57,6 +57,12 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     inspection_low_information_stddev_threshold: float = Field(default=8.0, ge=0.0)
     inspection_blur_score_threshold: float = Field(default=50.0, ge=0.0)
 
+    # Phase 2B perceptual duplicate detection. Candidates are never deleted.
+    phash_hash_size: int = Field(default=8, ge=4, le=32)
+    phash_distance_threshold: int = Field(default=8, ge=0, le=1024)
+    phash_batch_size: int = Field(default=100, ge=1, le=10_000)
+    similarity_group_page_size: int = Field(default=20, ge=1, le=100)
+
     runpod_pod_id: str | None = Field(default=None, validation_alias="RUNPOD_POD_ID")
     # Tokens and credentials added later must use SecretStr and repr=False as well.
     runpod_api_key: SecretStr | None = Field(

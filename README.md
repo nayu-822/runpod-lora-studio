@@ -168,5 +168,17 @@ Phase 1 では同期処理を実行せず、認証情報や `rclone.conf` を Gi
 画面とサマリーは現在の検査器バージョンのみを表示します。
 近似重複（pHash）と類似画像比較UIはPhase 2Bの対象であり、Phase 2Aには含まれません。
 
-Phase 2Aの一括検査は数千枚程度までを想定し、現在は重複判定と検査対象の画像レコードを
-一括取得します。より大規模なデータセット向けのストリーミング処理は、Phase 2B開始前の改善課題です。
+Phase 2Aの検査対象はPhase 2Bでkeyset paginationのバッチ処理へ移行しました。比較時に保持するのはpHashと代表選定に必要な最小メタデータで、画像ファイルは1枚ずつ閉じます。
+## Phase 2B: pHash近似重複検出
+
+pHash（perceptual hash）は、画像の見た目を縮約した固定長ハッシュです。SHA-256の完全一致とは異なり、PNG/JPEG再圧縮や軽微な変更をハミング距離で比較できます。今回の実装はPillowでEXIF Orientationを補正し、透過画像を白背景へ合成してRGBへ正規化した後、`imagehash.phash`で計算します。
+
+- 既定値: `hash_size=8`（64 bit）、最大ハミング距離 `8`。距離が閾値と等しいペアも候補に含めます。
+- 保存形式: 小文字の固定長16進文字列（hash_size=8なら16文字）。algorithm、hash_size、detector_version、状態、日時も同じレコードへ保存します。
+- グループ形成: 同じalgorithm/hash_size/detector_versionのペアだけを比較し、閾値以下の無向辺の連結成分をグループにします。連鎖による過剰なグループ化を確認できるよう、代表画像との距離とグループ内最小距離を表示します。
+- 代表候補: failedでない画像、警告数が少ない画像、高解像度、ぼけスコア、完全重複の既存代表を順に考慮します。同点はcreated_atとimage_idで決定的に解決し、手動代表は再検査でも維持します。
+- 「完全重複」は既存のSHA-256検査、「近似重複」はpHash検査としてUIとDBで区別します。類似候補は候補提示に過ぎず、自動削除や自動除外は行いません。手動で「類似ではない」とした関係は正規化したimage_idペアとして保存し、再グループ化時の辺から除外します。
+- `RUNPOD_LORA_STUDIO_PHASH_HASH_SIZE`、`RUNPOD_LORA_STUDIO_PHASH_DISTANCE_THRESHOLD`、`RUNPOD_LORA_STUDIO_PHASH_BATCH_SIZE`、`RUNPOD_LORA_STUDIO_SIMILARITY_GROUP_PAGE_SIZE`で設定できます。画像ファイルは1枚ずつ開き、プロジェクト全体はkeyset paginationのバッチで処理します。
+- 現在の比較はpHash値と代表選定に必要なメタデータだけをメモリへ保持するO(n²)比較です。想定上限は数千枚程度、1000枚では約50万ペアです。数万枚を扱う場合はBK-tree/LSH等の近傍探索を導入することが将来条件です。
+- 類似グループ画面では、グループ一覧、サムネイル横並び比較、代表変更、類似確認／否定、採用・保留・除外を操作できます。原画像とPhase 2A検査結果は変更しません。
+- CLIP埋め込みによる意味的類似判定、クロップ違い・顔・OCR等は未実装です。

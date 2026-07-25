@@ -15,6 +15,7 @@ authors = [
 dependencies = [
   "alembic>=1.13.0,<2.0.0",
   "gradio>=5.0.0,<6.0.0",
+  "ImageHash>=4.3.1,<5.0.0",
   "Pillow>=10.4.0,<12.0.0",
   "pydantic>=2.9.0,<3.0.0",
   "pydantic-settings>=2.5.0,<3.0.0",

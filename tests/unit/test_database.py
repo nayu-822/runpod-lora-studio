@@ -65,7 +65,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0003_phase2a_image_inspection"
+            "0004_phase2b_perceptual_similarity"
         )
 
 

@@ -108,6 +108,139 @@ class ImageInspectionResultRecord(Base):
     image: Mapped[ImageAssetRecord] = relationship(back_populates="inspection_results")
 
 
+class ImagePerceptualHashRecord(Base):
+    __tablename__ = "image_perceptual_hashes"
+    __table_args__ = (
+        UniqueConstraint(
+            "image_id",
+            "algorithm",
+            "hash_size",
+            "detector_version",
+            name="uq_image_phash_configuration",
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    image_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("image_assets.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    algorithm: Mapped[str] = mapped_column(String(32), nullable=False)
+    hash_value: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    hash_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    detector_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    calculated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    image: Mapped[ImageAssetRecord] = relationship()
+
+
+class SimilarityGroupRecord(Base):
+    __tablename__ = "similarity_groups"
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    group_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    detector_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    distance_threshold: Mapped[int] = mapped_column(Integer, nullable=False)
+    representative_image_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("image_assets.id", ondelete="SET NULL"), nullable=True
+    )
+    representative_source: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    members: Mapped[list[SimilarityGroupMemberRecord]] = relationship(
+        back_populates="group", cascade="all, delete-orphan"
+    )
+
+
+class SimilarityGroupMemberRecord(Base):
+    __tablename__ = "similarity_group_members"
+    __table_args__ = (
+        UniqueConstraint("group_id", "image_id", name="uq_similarity_group_image"),
+        UniqueConstraint(
+            "image_id", "detector_version", name="uq_similarity_image_version"
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("similarity_groups.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    image_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("image_assets.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    detector_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    representative_candidate_score: Mapped[float] = mapped_column(Float, nullable=False)
+    is_representative: Mapped[bool] = mapped_column(Integer, nullable=False, default=0)
+    representative_distance: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    minimum_distance: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    review_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    group: Mapped[SimilarityGroupRecord] = relationship(back_populates="members")
+    image: Mapped[ImageAssetRecord] = relationship()
+
+
+class SimilarityPairReviewRecord(Base):
+    __tablename__ = "similarity_pair_reviews"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "image_left_id",
+            "image_right_id",
+            "detector_version",
+            name="uq_similarity_pair_review",
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    image_left_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("image_assets.id", ondelete="CASCADE"), nullable=False
+    )
+    image_right_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("image_assets.id", ondelete="CASCADE"), nullable=False
+    )
+    detector_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    review_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 # Short compatibility name for service and test code.
 InspectionResultRecord = ImageInspectionResultRecord
 

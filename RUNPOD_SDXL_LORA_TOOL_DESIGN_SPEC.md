@@ -1750,3 +1750,6 @@ recommendation_engine_version: 1.0.0
 ```
 
 これにより、ツール更新前後で推奨値が変わった理由を追跡できる。
+## Phase 2B実装補足
+
+Phase 2Bでは、ImageHashのpHashをEXIF Orientation補正、透過画像の白背景合成、RGB正規化後に計算する。pHashは固定長16進文字列としてアルゴリズム、hash_size、detector_version、計算状態、日時とともに保存する。同一設定のハミング距離が閾値以下の無向グラフ連結成分を類似グループとし、完全重複のみのグループは`exact_only`として区別する。手動代表と手動否定ペアは自動再検査で保護し、原画像、既存のSHA-256／品質検査、SelectionStateは変更しない。

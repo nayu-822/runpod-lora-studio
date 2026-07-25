@@ -426,3 +426,10 @@ feat(storage): 完成した学習成果物をGoogle Driveへ同期する
 画像検査基盤、SHA-256完全重複検出、最低解像度・極端な縦横比・低情報量・ぼけの基本検査を実装済み。
 近似重複（pHash）と類似画像比較はPhase 2Bで実装する。
 Phase 2Aの一括検査は数千枚程度を想定し、ストリーミング化はPhase 2B開始前の改善課題とする。
+## Phase 2B 実装状況: pHash近似重複検出・類似グループ比較UI
+
+Phase 2Bを実装済みとする。ImageHash/PillowによるEXIF補正済みpHash計算、画像単位の失敗保存、ハミング距離の連結成分グループ化、代表候補と手動代表、正規化した手動否定ペア、バッチ処理、Alembic 0004、Gradio比較UIを追加した。自動処理は候補提示に限定し、原画像・Phase 2A検査結果・SelectionStateを自動変更しない。
+
+### Phase 2完了条件
+
+Phase 2AのSHA-256／基本品質検査と、Phase 2BのpHash近似重複検査・比較UIを合わせてPhase 2の完了条件を満たす。CLIPによる意味的類似判定、数万枚規模向けのBK-tree/LSH、学習処理・外部同期は後続Phaseの対象とする。

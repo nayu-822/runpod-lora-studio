@@ -42,6 +42,22 @@ class InspectionStatus(StrEnum):
     FAILED = "failed"
 
 
+class PerceptualHashStatus(StrEnum):
+    CALCULATED = "calculated"
+    FAILED = "failed"
+
+
+class SimilarityReviewStatus(StrEnum):
+    UNREVIEWED = "unreviewed"
+    CONFIRMED_SIMILAR = "confirmed_similar"
+    REJECTED_SIMILARITY = "rejected_similarity"
+
+
+class RepresentativeSource(StrEnum):
+    AUTOMATIC = "automatic"
+    MANUAL = "manual"
+
+
 @dataclass(frozen=True, slots=True)
 class Project:
     id: UUID
@@ -109,3 +125,69 @@ class InspectionRunResult:
     summary: InspectionSummary
     inspected_image_count: int
     failed_image_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class PerceptualHash:
+    image_id: UUID
+    algorithm: str
+    hash_value: str
+    hash_size: int
+    detector_version: str
+    status: PerceptualHashStatus
+    calculated_at: datetime
+    error_summary: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RepresentativeCandidate:
+    image_id: UUID
+    score: float
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class SimilarityGroupMember:
+    group_id: UUID
+    image_id: UUID
+    representative_candidate_score: float
+    is_representative: bool
+    representative_distance: int | None
+    minimum_distance: int | None
+    review_status: SimilarityReviewStatus
+    image: ImageAsset | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SimilarityGroup:
+    id: UUID
+    project_id: UUID
+    group_type: str
+    detector_version: str
+    distance_threshold: int
+    representative_image_id: UUID | None
+    representative_source: RepresentativeSource
+    created_at: datetime
+    updated_at: datetime
+    members: tuple[SimilarityGroupMember, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SimilaritySummary:
+    project_id: UUID
+    calculated_count: int
+    uncalculated_count: int
+    failed_count: int
+    group_count: int
+    candidate_image_count: int
+    exact_only_group_count: int
+    unreviewed_group_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SimilarityRunResult:
+    summary: SimilaritySummary
+    calculated_image_count: int
+    failed_image_count: int
+    skipped_image_count: int
+    group_count: int

@@ -350,7 +350,10 @@ def build_project_tab(projects: ProjectService) -> tuple[gr.State, gr.Dataframe]
 
 
 def build_image_tab(
-    images: ImageService, selected_id: gr.State, project_table: gr.Dataframe
+    images: ImageService,
+    selected_id: gr.State,
+    project_table: gr.Dataframe,
+    refresh_event: gr.State | None = None,
 ) -> None:
     controller = ImageController(images)
     inspection = ImageInspectionService(images.settings, images.projects)
@@ -606,6 +609,22 @@ def build_image_tab(
                 project_id, filter_value, query, 1, size
             ),
             inputs=[selected_id, state_filter, search, page_size],
+            outputs=[
+                project_table,
+                project_label,
+                image_table,
+                gallery,
+                gallery_ids,
+                image_ids,
+                page,
+                page_info,
+                image_message,
+            ],
+        )
+    if refresh_event is not None:
+        refresh_event.change(
+            load,
+            inputs=[selected_id, state_filter, search, page, page_size],
             outputs=[
                 project_table,
                 project_label,
