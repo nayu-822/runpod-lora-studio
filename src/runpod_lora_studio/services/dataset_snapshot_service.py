@@ -1202,13 +1202,20 @@ class DatasetSnapshotService:
         groups: dict[UUID, SimilarityGroupContext],
         settings: DatasetSettings,
     ) -> DatasetPreviewSummary:
-        warning_images = {
+        quality_failed_images = {
             issue.image_id
             for issue in issues
-            if issue.severity is DatasetIssueSeverity.WARNING and issue.image_id
+            if issue.image_id
+            and issue.category is DatasetIssueCategory.QUALITY
+            and issue.issue_code == "quality_failed"
         }
-        failed_images = {
-            issue.image_id for issue in issues if issue.issue_code == "quality_failed"
+        quality_warning_images = {
+            issue.image_id
+            for issue in issues
+            if issue.image_id
+            and issue.category is DatasetIssueCategory.QUALITY
+            and issue.severity is DatasetIssueSeverity.WARNING
+            and issue.image_id not in quality_failed_images
         }
         exact = [
             image for image in images if image.exact_duplicate_status == "duplicate"
@@ -1250,13 +1257,11 @@ class DatasetSnapshotService:
                 any(issue.issue_code == "file_corrupt" for issue in image.errors)
                 for image in images
             ),
-            quality_warning_image_count=len(warning_images),
-            quality_failed_image_count=len(failed_images),
+            quality_warning_image_count=len(quality_warning_images),
+            quality_failed_image_count=len(quality_failed_images),
             exact_duplicate_count=len(exact),
             exact_duplicate_nonrepresentative_count=sum(
-                image.exact_duplicate_status == "duplicate"
-                and image.is_similarity_representative is False
-                for image in images
+                image.exact_duplicate_status == "duplicate" for image in images
             ),
             approximate_duplicate_count=len(approx),
             approximate_duplicate_nonrepresentative_count=sum(

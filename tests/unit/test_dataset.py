@@ -6,14 +6,19 @@ import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import UUID, uuid4
 
 import pytest
 from PIL import Image
 
 from runpod_lora_studio.config.settings import AppSettings, ensure_runtime_directories
 from runpod_lora_studio.domain.models import (
+    DatasetIssueCategory,
+    DatasetIssueSeverity,
+    DatasetPreviewImage,
     DatasetSettings,
     DatasetSnapshotStatus,
+    DatasetValidationIssue,
     SelectionState,
 )
 from runpod_lora_studio.persistence.database import create_engine_for_settings
@@ -62,6 +67,150 @@ def _fixture(test_workspace: Path, *, caption: str | None = "character, blue_hai
             project.id, image.id, caption
         )
     return settings, projects, project, image
+
+
+def _summary_image(
+    *,
+    exact_duplicate_status: str = "unique",
+    is_similarity_representative: bool | None = None,
+) -> DatasetPreviewImage:
+    return DatasetPreviewImage(
+        image_id=uuid4(),
+        original_filename="image.png",
+        source_image_path=Path("image.png"),
+        width=128,
+        height=96,
+        aspect_ratio=128 / 96,
+        file_size=128,
+        source_sha256="a" * 64,
+        mime_type="image/png",
+        selection_state=SelectionState.ACCEPTED,
+        caption_id=uuid4(),
+        caption_revision=1,
+        caption_text="character",
+        caption_sha256="b" * 64,
+        tag_count=1,
+        trigger_word_count=0,
+        quality_status="ok",
+        exact_duplicate_status=exact_duplicate_status,
+        similarity_group_id=None,
+        is_similarity_representative=is_similarity_representative,
+        warnings=(),
+        errors=(),
+    )
+
+
+def _summary_issue(
+    image_id: UUID, *, code: str, category: DatasetIssueCategory
+) -> DatasetValidationIssue:
+    return DatasetValidationIssue(
+        issue_code=code,
+        severity=DatasetIssueSeverity.WARNING,
+        category=category,
+        message=code,
+        image_id=image_id,
+    )
+
+
+def test_summary_quality_counts_are_category_scoped_and_exclusive(
+    test_workspace: Path,
+) -> None:
+    settings, projects, _, _ = _fixture(test_workspace)
+    service = DatasetSnapshotService(settings, projects)
+    quality_warning_image = _summary_image()
+    quality_failed_image = _summary_image()
+    trigger_image = _summary_image()
+    exact_duplicate_image = _summary_image()
+    unreviewed_image = _summary_image()
+    multi_warning_image = _summary_image()
+    issues = [
+        _summary_issue(
+            quality_warning_image.image_id,
+            code="quality_low_information",
+            category=DatasetIssueCategory.QUALITY,
+        ),
+        _summary_issue(
+            quality_failed_image.image_id,
+            code="quality_failed",
+            category=DatasetIssueCategory.QUALITY,
+        ),
+        _summary_issue(
+            quality_failed_image.image_id,
+            code="quality_low_information",
+            category=DatasetIssueCategory.QUALITY,
+        ),
+        _summary_issue(
+            trigger_image.image_id,
+            code="trigger_missing",
+            category=DatasetIssueCategory.TRIGGER,
+        ),
+        _summary_issue(
+            exact_duplicate_image.image_id,
+            code="exact_duplicate",
+            category=DatasetIssueCategory.DUPLICATE,
+        ),
+        _summary_issue(
+            unreviewed_image.image_id,
+            code="similarity_group_unreviewed",
+            category=DatasetIssueCategory.DUPLICATE,
+        ),
+        _summary_issue(
+            multi_warning_image.image_id,
+            code="quality_blurry",
+            category=DatasetIssueCategory.QUALITY,
+        ),
+        _summary_issue(
+            multi_warning_image.image_id,
+            code="quality_low_information",
+            category=DatasetIssueCategory.QUALITY,
+        ),
+    ]
+
+    summary = service._summary(
+        [
+            quality_warning_image,
+            quality_failed_image,
+            trigger_image,
+            exact_duplicate_image,
+            unreviewed_image,
+            multi_warning_image,
+        ],
+        issues,
+        {},
+        DatasetSettings(),
+    )
+
+    assert summary.quality_warning_image_count == 2
+    assert summary.quality_failed_image_count == 1
+
+
+def test_summary_exact_duplicate_count_is_independent_of_phash_representative(
+    test_workspace: Path,
+) -> None:
+    settings, projects, _, _ = _fixture(test_workspace)
+    service = DatasetSnapshotService(settings, projects)
+    duplicate_without_phash_group = _summary_image(exact_duplicate_status="duplicate")
+    duplicate_phash_representative = _summary_image(
+        exact_duplicate_status="duplicate",
+        is_similarity_representative=True,
+    )
+    phash_nonrepresentative_only = _summary_image(
+        is_similarity_representative=False,
+    )
+
+    summary = service._summary(
+        [
+            duplicate_without_phash_group,
+            duplicate_phash_representative,
+            phash_nonrepresentative_only,
+        ],
+        [],
+        {},
+        DatasetSettings(),
+    )
+
+    assert summary.exact_duplicate_count == 2
+    assert summary.exact_duplicate_nonrepresentative_count == 2
 
 
 def test_snapshot_copies_current_dataset_and_is_immutable(test_workspace: Path) -> None:
