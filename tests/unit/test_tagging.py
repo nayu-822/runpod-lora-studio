@@ -11,6 +11,7 @@ from runpod_lora_studio.domain.models import (
     SelectionState,
     TagCategory,
     TaggerRunMode,
+    TaggerRunStatus,
     TagPrediction,
 )
 from runpod_lora_studio.external.fake_tagger import FakeTaggerAdapter
@@ -25,7 +26,11 @@ from runpod_lora_studio.services.caption_service import (
     parse_caption_tags,
 )
 from runpod_lora_studio.services.image_service import ImageService
-from runpod_lora_studio.services.project_service import ProjectInput, ProjectService
+from runpod_lora_studio.services.project_service import (
+    ProjectInput,
+    ProjectService,
+    UserFacingError,
+)
 from runpod_lora_studio.services.tagging_service import TaggingService
 
 
@@ -177,6 +182,105 @@ def test_frequency_deduplicates_tags_per_image_and_applies_deterministic_order(
     assert page.items[0].average_confidence == pytest.approx(0.75)
 
 
+def test_partially_failed_run_is_available_and_excludes_failed_images(
+    test_workspace: Path,
+) -> None:
+    settings, projects, project, images, fake, service = _fixture(
+        test_workspace, count=2
+    )
+    fake.failing_filenames.add(images[1].original_path.name)
+
+    run = service.run_sync(project.id, TaggerRunMode.ALL_ACCEPTED)
+    page = TagFrequencyService(settings, projects).list_frequencies(
+        project.id, run_id=run.id
+    )
+
+    assert run.status.value == "partially_failed"
+    assert page.run_id == run.id
+    assert page.target_image_count == 2
+    assert page.succeeded_image_count == 1
+    assert page.failed_image_count == 1
+    assert page.used_image_count == 1
+    assert page.items[0].target_image_count == 1
+
+
+def test_latest_partially_failed_run_is_selected_deterministically(
+    test_workspace: Path,
+) -> None:
+    settings, projects, project, images, fake, service = _fixture(
+        test_workspace, count=1
+    )
+    completed = service.run_sync(project.id, TaggerRunMode.ALL_ACCEPTED)
+    fake.failing_filenames.add(images[0].original_path.name)
+    partial = service.run_sync(project.id, TaggerRunMode.ALL_ACCEPTED)
+
+    page = TagFrequencyService(settings, projects).list_frequencies(project.id)
+    runs = service.list_runs(project.id)
+
+    assert completed.status is TaggerRunStatus.COMPLETED
+    assert partial.status is TaggerRunStatus.PARTIALLY_FAILED
+    assert page.run_id == partial.id
+    assert [run.id for run in runs[:2]] == [partial.id, completed.id]
+
+
+def test_failed_and_canceled_runs_are_not_available(
+    test_workspace: Path,
+) -> None:
+    settings, projects, project, _, _, service = _fixture(test_workspace, count=1)
+    failed = service.run_sync(project.id, TaggerRunMode.ALL_ACCEPTED)
+    with service.session_factory() as session:
+        from runpod_lora_studio.persistence.tagging_repository import TaggingRepository
+
+        repository = TaggingRepository(session)
+        repository.finish_run(failed.id, TaggerRunStatus.FAILED, "test")
+        session.commit()
+    assert (
+        TagFrequencyService(settings, projects)
+        .list_frequencies(project.id, run_id=failed.id)
+        .run_id
+        is None
+    )
+    canceled = service.run_sync(project.id, TaggerRunMode.ALL_ACCEPTED)
+    with service.session_factory() as session:
+        from runpod_lora_studio.persistence.tagging_repository import TaggingRepository
+
+        TaggingRepository(session).finish_run(canceled.id, TaggerRunStatus.CANCELED)
+        session.commit()
+    assert (
+        TagFrequencyService(settings, projects)
+        .list_frequencies(project.id, run_id=canceled.id)
+        .run_id
+        is None
+    )
+
+
+def test_skipped_count_survives_progress_and_partial_failure(
+    test_workspace: Path,
+) -> None:
+    settings, projects, project, images, fake, service = _fixture(
+        test_workspace, count=1
+    )
+    service.run_sync(project.id, TaggerRunMode.ALL_ACCEPTED)
+    source = test_workspace / "new-image.png"
+    Image.new("RGB", (128, 128), "blue").save(source)
+    new_image = (
+        ImageService(settings, projects)
+        .register_uploads(project.id, [source])
+        .successes[0]
+    )
+    ImageService(settings, projects).change_state(
+        project.id, [new_image.id], SelectionState.ACCEPTED
+    )
+    fake.failing_filenames.add(new_image.original_path.name)
+
+    run = service.run_sync(project.id, TaggerRunMode.UNTAGGED_ONLY)
+
+    assert run.target_image_count == 1
+    assert run.skipped_image_count == 1
+    assert run.failed_image_count == 1
+    assert run.processed_image_count == 1
+
+
 def test_preview_apply_trigger_and_stale_detection(test_workspace: Path) -> None:
     settings, projects, project, images, _, service = _fixture(test_workspace, 1)
     service.run_sync(project.id)
@@ -197,6 +301,52 @@ def test_preview_apply_trigger_and_stale_detection(test_workspace: Path) -> None
     captions.save_image_caption(project.id, images[0].id, "manual_change")
     with pytest.raises(ValueError, match="プレビューの有効期限"):
         captions.apply_preview(preview)
+
+
+@pytest.mark.parametrize("new_state", [SelectionState.PENDING, SelectionState.EXCLUDED])
+def test_preview_rejects_selection_state_change_without_writes(
+    test_workspace: Path, new_state: SelectionState
+) -> None:
+    settings, projects, project, images, _, service = _fixture(test_workspace, 1)
+    service.run_sync(project.id, TaggerRunMode.ALL_ACCEPTED)
+    captions = CaptionEditingService(settings, projects)
+    preview = captions.build_preview(project.id)
+    ImageService(settings, projects).change_state(project.id, [images[0].id], new_state)
+
+    with pytest.raises(UserFacingError, match="プレビューの有効期限"):
+        captions.apply_preview(preview)
+
+    assert captions.get_caption(project.id, images[0].id) is None
+    assert TagFrequencyService(settings, projects).rules(project.id) == {}
+
+
+def test_preview_rejects_new_accepted_image_and_caption_revision_change(
+    test_workspace: Path,
+) -> None:
+    settings, projects, project, images, _, service = _fixture(test_workspace, 1)
+    service.run_sync(project.id, TaggerRunMode.ALL_ACCEPTED)
+    captions = CaptionEditingService(settings, projects)
+
+    preview = captions.build_preview(project.id)
+    new_source = test_workspace / "accepted-after-preview.png"
+    Image.new("RGB", (64, 64), "green").save(new_source)
+    added = (
+        ImageService(settings, projects)
+        .register_uploads(project.id, [new_source])
+        .successes[0]
+    )
+    ImageService(settings, projects).change_state(
+        project.id, [added.id], SelectionState.ACCEPTED
+    )
+    with pytest.raises(UserFacingError, match="プレビューの有効期限"):
+        captions.apply_preview(preview)
+    assert captions.get_caption(project.id, images[0].id) is None
+
+    preview = captions.build_preview(project.id)
+    captions.save_image_caption(project.id, images[0].id, "edited")
+    with pytest.raises(UserFacingError, match="プレビューの有効期限"):
+        captions.apply_preview(preview)
+    assert captions.get_caption(project.id, images[0].id).caption_text == "edited"
 
 
 def test_manual_edit_restore_and_history(test_workspace: Path) -> None:

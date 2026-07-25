@@ -215,7 +215,6 @@ class TaggingService:
                             processed=processed,
                             succeeded=succeeded,
                             failed=failed,
-                            skipped=0,
                             current_image_id=None,
                         )
                         repository.finish_run(
@@ -230,7 +229,6 @@ class TaggingService:
                         processed=processed,
                         succeeded=succeeded,
                         failed=failed,
-                        skipped=0,
                         current_image_id=image.image_id,
                     )
                     session.commit()
@@ -254,7 +252,6 @@ class TaggingService:
                             processed=processed,
                             succeeded=succeeded,
                             failed=failed,
-                            skipped=0,
                             current_image_id=None,
                         )
                         session.commit()
@@ -281,7 +278,6 @@ class TaggingService:
                             processed=processed,
                             succeeded=succeeded,
                             failed=failed,
-                            skipped=0,
                             current_image_id=None,
                         )
                         session.commit()

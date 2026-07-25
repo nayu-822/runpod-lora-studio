@@ -277,7 +277,14 @@ def build_tagging_tab(
             gr.update(choices=choices, value=selected),
             choices,
             updated,
-            f"{result.total}タグ / 対象画像{result.target_image_count}枚",
+            (
+                f"{result.total}タグ / Run対象{result.target_image_count}枚 / "
+                f"成功{result.succeeded_image_count}枚 / "
+                f"失敗{result.failed_image_count}枚 / "
+                f"スキップ{result.skipped_image_count}枚 / "
+                f"頻度集計使用{result.used_image_count}枚。"
+                "失敗画像はキャプション生成の対象外です。"
+            ),
         )
 
     def update_checks(

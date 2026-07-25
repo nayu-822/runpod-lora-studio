@@ -174,14 +174,15 @@ class TaggingRepository:
         processed: int,
         succeeded: int,
         failed: int,
-        skipped: int,
+        skipped: int | None = None,
         current_image_id: UUID | None,
     ) -> None:
         record = self._required_run(run_id)
         record.processed_image_count = processed
         record.succeeded_image_count = succeeded
         record.failed_image_count = failed
-        record.skipped_image_count = skipped
+        if skipped is not None:
+            record.skipped_image_count = skipped
         record.current_image_id = str(current_image_id) if current_image_id else None
 
     def finish_run(

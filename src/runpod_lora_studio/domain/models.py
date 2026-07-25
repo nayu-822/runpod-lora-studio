@@ -343,6 +343,11 @@ class CaptionPreview:
     rules_snapshot: tuple[tuple[str, str, str], ...]
     trigger_words: tuple[str, ...]
     policy: ManualCaptionPolicy
+    run_target_image_count: int
+    run_succeeded_image_count: int
+    run_failed_image_count: int
+    run_skipped_image_count: int
+    used_image_count: int
 
 
 @dataclass(frozen=True, slots=True)

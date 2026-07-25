@@ -128,6 +128,12 @@ def preview_summary(preview: CaptionPreview) -> str:
     return "\n".join(
         [
             f"- 対象画像数: **{preview.target_image_count}**",
+            f"- Run対象画像数: **{preview.run_target_image_count}**",
+            f"- Run成功画像数: **{preview.run_succeeded_image_count}**",
+            f"- Run失敗画像数: **{preview.run_failed_image_count}**",
+            f"- Runスキップ画像数: **{preview.run_skipped_image_count}**",
+            f"- 集計・生成使用画像数: **{preview.used_image_count}**",
+            "- 失敗画像はキャプション生成の対象外です。",
             f"- 保持タグ数: **{preview.keep_tag_count}**",
             f"- 削除タグ数: **{preview.remove_tag_count}**",
             f"- 変更画像数: **{preview.changed_image_count}**",

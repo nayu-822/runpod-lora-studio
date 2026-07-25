@@ -18,6 +18,7 @@ from runpod_lora_studio.domain.models import (
     CaptionTagValue,
     ManualCaptionPolicy,
     ProjectTagRule,
+    SelectionState,
     StoredCaption,
     StoredTaggingResult,
     TagCategory,
@@ -44,6 +45,10 @@ class TagFrequencyPage:
     items: tuple[TagFrequency, ...]
     total: int
     target_image_count: int
+    succeeded_image_count: int
+    failed_image_count: int
+    skipped_image_count: int
+    used_image_count: int
     run_id: UUID | None
 
 
@@ -71,15 +76,15 @@ class TagFrequencyService:
             repository = TaggingRepository(session)
             selected_run = self._select_run(repository, project_id, run_id)
             if selected_run is None:
-                return TagFrequencyPage((), 0, 0, None)
+                return TagFrequencyPage((), 0, 0, 0, 0, 0, 0, None)
             results = repository.results_for_run(project_id, selected_run.id)
             results = [result for result in results if result.tags]
-            target_count = len(results)
+            used_count = len(results)
             rules = {
                 rule.normalized_tag_name: rule
                 for rule in repository.get_rules(project_id)
             }
-            frequencies = self._calculate(results, target_count, rules)
+            frequencies = self._calculate(results, used_count, rules)
             query = search.strip().casefold()
             filtered = [
                 item
@@ -98,7 +103,11 @@ class TagFrequencyService:
             return TagFrequencyPage(
                 tuple(filtered[start : start + size]),
                 len(filtered),
-                target_count,
+                selected_run.target_image_count,
+                selected_run.succeeded_image_count,
+                selected_run.failed_image_count,
+                selected_run.skipped_image_count,
+                used_count,
                 selected_run.id,
             )
 
@@ -156,12 +165,18 @@ class TagFrequencyService:
             run = repository.get_run(run_id)
             if run is None or run.project_id != project_id:
                 raise UserFacingError("指定されたTaggerRunが見つかりません。")
-            return run if run.status is TaggerRunStatus.COMPLETED else None
+            return (
+                run
+                if run.status
+                in {TaggerRunStatus.COMPLETED, TaggerRunStatus.PARTIALLY_FAILED}
+                else None
+            )
         return next(
             (
                 run
                 for run in repository.list_runs(project_id)
-                if run.status is TaggerRunStatus.COMPLETED
+                if run.status
+                in {TaggerRunStatus.COMPLETED, TaggerRunStatus.PARTIALLY_FAILED}
             ),
             None,
         )
@@ -397,8 +412,33 @@ class CaptionEditingService:
             repository, project_id, run_id
         )
         if run is None:
-            raise UserFacingError("完了済みのTaggerRunがありません。")
-        results = repository.results_for_run(project_id, run.id)
+            raise UserFacingError(
+                "利用可能な完了済みまたは部分成功のTaggerRunがありません。"
+            )
+        results = [
+            result
+            for result in repository.results_for_run(project_id, run.id)
+            if result.tags
+        ]
+        accepted_images = session.scalars(
+            select(ImageAssetRecord)
+            .where(
+                ImageAssetRecord.project_id == str(project_id),
+                ImageAssetRecord.selection_state == SelectionState.ACCEPTED.value,
+            )
+            .order_by(ImageAssetRecord.internal_id)
+        ).all()
+        accepted_image_snapshot_values: list[tuple[str, str, int]] = []
+        for image in accepted_images:
+            current_caption = repository.get_current_caption(UUID(image.id))
+            accepted_image_snapshot_values.append(
+                (
+                    image.id,
+                    image.selection_state,
+                    current_caption.revision if current_caption else 0,
+                )
+            )
+        accepted_image_snapshots = tuple(accepted_image_snapshot_values)
         rule_records = repository.get_rules(project_id)
         state = dict(keep_states or {})
         if not state:
@@ -427,6 +467,7 @@ class CaptionEditingService:
         )
         triggers = normalize_trigger_words(trigger_words)
         changes: list[CaptionChange] = []
+        image_snapshots: list[tuple[str, str, int]] = []
         keep_names: set[str] = set()
         remove_names: set[str] = set()
         manual_count = 0
@@ -478,6 +519,17 @@ class CaptionEditingService:
                     ImageAssetRecord.id == str(result.image_id)
                 )
             )
+            if image is None or image.selection_state != SelectionState.ACCEPTED.value:
+                raise UserFacingError(
+                    "プレビュー対象画像の採用状態が変わりました。再生成してください。"
+                )
+            image_snapshots.append(
+                (
+                    str(result.image_id),
+                    image.selection_state,
+                    current.revision if current else 0,
+                )
+            )
             filename = image.original_filename if image else str(result.image_id)
             changes.append(
                 CaptionChange(
@@ -496,12 +548,43 @@ class CaptionEditingService:
                     warning=warning,
                 )
             )
+        source_results = [
+            (
+                str(result.image_id),
+                str(result.tagger_run_id),
+                result.status.value,
+                result.tagged_at.isoformat() if result.tagged_at else None,
+                tuple(
+                    (
+                        tag.tag_name_raw,
+                        tag.tag_name_normalized,
+                        tag.category.value,
+                        tag.confidence,
+                        tag.original_order,
+                        tag.source.value,
+                    )
+                    for tag in result.tags
+                ),
+            )
+            for result in results
+        ]
         token_payload = {
             "project": str(project_id),
             "run": str(run.id),
+            "run_snapshot": {
+                "target": run.target_image_count,
+                "succeeded": run.succeeded_image_count,
+                "failed": run.failed_image_count,
+                "skipped": run.skipped_image_count,
+                "model": run.model_identifier,
+                "revision": run.model_revision,
+            },
             "policy": policy.value,
             "rules": rules_snapshot,
             "triggers": triggers,
+            "source_results": source_results,
+            "image_snapshots": tuple(image_snapshots),
+            "accepted_image_snapshots": accepted_image_snapshots,
             "changes": [
                 (str(item.image_id), item.before, item.after) for item in changes
             ],
@@ -526,6 +609,11 @@ class CaptionEditingService:
             rules_snapshot=rules_snapshot,
             trigger_words=triggers,
             policy=policy,
+            run_target_image_count=run.target_image_count,
+            run_succeeded_image_count=run.succeeded_image_count,
+            run_failed_image_count=run.failed_image_count,
+            run_skipped_image_count=run.skipped_image_count,
+            used_image_count=len(results),
         )
 
     @staticmethod
