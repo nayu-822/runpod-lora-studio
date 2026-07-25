@@ -21,6 +21,7 @@ from runpod_lora_studio.external.rclone import (
     CommandResult,
     CopyOptions,
     ListOptions,
+    ProcessCallback,
     ProgressCallback,
 )
 
@@ -113,11 +114,16 @@ class FakeStorageTransferAdapter:
         options: CopyOptions,
         progress_callback: ProgressCallback | None = None,
         cancel_token: CancelToken | None = None,
+        process_callback: ProcessCallback | None = None,
     ) -> CommandResult:
         source_value = _value(source)
         destination_value = _value(destination)
         self.copy_calls.append((source_value, destination_value))
+        if process_callback:
+            process_callback(99999)
         if cancel_token and cancel_token.cancelled:
+            if process_callback:
+                process_callback(None)
             return CommandResult(130, "", "canceled")
         if isinstance(source, Path):
             if source.is_dir():
@@ -138,6 +144,8 @@ class FakeStorageTransferAdapter:
             remote_key = source_value.split(":", 1)[1].strip("/")
             content = self.files.get(remote_key)
             if content is None:
+                if process_callback:
+                    process_callback(None)
                 return CommandResult(1, "", "missing")
             target = Path(destination_value)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -150,6 +158,8 @@ class FakeStorageTransferAdapter:
                         transfers=1,
                     )
                 )
+        if process_callback:
+            process_callback(None)
         return CommandResult(0, "", "")
 
     def verify(

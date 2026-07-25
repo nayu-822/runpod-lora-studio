@@ -69,6 +69,7 @@ class CancelToken:
 
 
 ProgressCallback = Callable[[TransferProgress], None]
+ProcessCallback = Callable[[int | None], None]
 
 
 class StorageTransferAdapter(Protocol):
@@ -94,6 +95,7 @@ class StorageTransferAdapter(Protocol):
         options: CopyOptions,
         progress_callback: ProgressCallback | None = None,
         cancel_token: CancelToken | None = None,
+        process_callback: ProcessCallback | None = None,
     ) -> CommandResult: ...
 
     def verify(
@@ -402,6 +404,7 @@ class RcloneAdapter:
         options: CopyOptions,
         progress_callback: ProgressCallback | None = None,
         cancel_token: CancelToken | None = None,
+        process_callback: ProcessCallback | None = None,
     ) -> CommandResult:
         command = [
             *self._common_args(timeout=options.timeout),
@@ -421,7 +424,11 @@ class RcloneAdapter:
         if options.overwrite_policy is OverwritePolicy.FAIL_IF_EXISTS:
             command.append("--immutable")
         return self._run_streaming(
-            command, options.timeout, progress_callback, cancel_token
+            command,
+            options.timeout,
+            progress_callback,
+            cancel_token,
+            process_callback,
         )
 
     def _run_streaming(
@@ -430,6 +437,7 @@ class RcloneAdapter:
         timeout: float | None,
         progress_callback: ProgressCallback | None,
         cancel_token: CancelToken | None,
+        process_callback: ProcessCallback | None,
     ) -> CommandResult:
         full_command = self.runner._command(command)
         started = time.monotonic()
@@ -444,11 +452,15 @@ class RcloneAdapter:
                 shell=False,
             )
         except FileNotFoundError:
+            if process_callback:
+                process_callback(None)
             return CommandResult(
                 127, "", "rclone executable was not found", tuple(full_command)
             )
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
+        if process_callback:
+            process_callback(process.pid)
 
         def read_stream(stream: Any, target: list[str]) -> None:
             for line in iter(stream.readline, ""):
@@ -465,37 +477,41 @@ class RcloneAdapter:
         stderr_thread = threading.Thread(
             target=read_stream, args=(process.stderr, stderr_lines), daemon=True
         )
-        stdout_thread.start()
-        stderr_thread.start()
-        timed_out = False
-        while process.poll() is None:
-            if cancel_token and cancel_token.cancelled:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-                break
-            if timeout is not None and time.monotonic() - started > timeout:
-                timed_out = True
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-                break
-            time.sleep(0.05)
-        stdout_thread.join(timeout=2)
-        stderr_thread.join(timeout=2)
-        return CommandResult(
-            process.returncode if process.returncode is not None else 1,
-            "".join(stdout_lines),
-            "".join(stderr_lines),
-            tuple(full_command),
-            timed_out=timed_out,
-        )
+        try:
+            stdout_thread.start()
+            stderr_thread.start()
+            timed_out = False
+            while process.poll() is None:
+                if cancel_token and cancel_token.cancelled:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    break
+                if timeout is not None and time.monotonic() - started > timeout:
+                    timed_out = True
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    break
+                time.sleep(0.05)
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
+            return CommandResult(
+                process.returncode if process.returncode is not None else 1,
+                "".join(stdout_lines),
+                "".join(stderr_lines),
+                tuple(full_command),
+                timed_out=timed_out,
+            )
+        finally:
+            if process_callback:
+                process_callback(None)
 
     def verify(
         self,

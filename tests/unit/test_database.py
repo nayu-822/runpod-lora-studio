@@ -67,7 +67,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0007_phase5_storage"
+            "0008_storage_transfer_heartbeat"
         )
 
 
@@ -124,7 +124,7 @@ def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0007_phase5_storage"
+            "0008_storage_transfer_heartbeat"
         )
 
 
@@ -152,7 +152,7 @@ def test_phase4_downgrade_and_reupgrade_preserves_phase3_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0007_phase5_storage"
+            "0008_storage_transfer_heartbeat"
         )
 
 
@@ -166,7 +166,23 @@ def test_phase5_upgrades_existing_0006_database_to_head(
         assert "managed_models" in tables
         assert "storage_transfer_jobs" in tables
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0007_phase5_storage"
+            "0008_storage_transfer_heartbeat"
+        )
+
+
+def test_phase5_heartbeat_migration_upgrades_existing_0007_database(
+    test_workspace: Path,
+) -> None:
+    settings = migrate(test_workspace, "0007_phase5_storage")
+    migrate(test_workspace, "head")
+    with create_engine_for_settings(settings).connect() as connection:
+        columns = {
+            column["name"]
+            for column in inspect(connection).get_columns("storage_transfer_jobs")
+        }
+        assert {"worker_id", "heartbeat_at"}.issubset(columns)
+        assert MigrationContext.configure(connection).get_current_revision() == (
+            "0008_storage_transfer_heartbeat"
         )
 
 

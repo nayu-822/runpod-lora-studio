@@ -728,6 +728,10 @@ class StorageTransferJobRecord(Base):
     transferred_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     cancel_requested: Mapped[bool] = mapped_column(Integer, nullable=False)
     pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

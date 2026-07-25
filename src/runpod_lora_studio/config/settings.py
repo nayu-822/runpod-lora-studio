@@ -133,6 +133,8 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     model_max_file_size_bytes: int = Field(default=30 * 1024**3, ge=1)
     model_disk_safety_margin_bytes: int = Field(default=256 * 1024**1024, ge=0)
     transfer_progress_interval_seconds: float = Field(default=2.0, gt=0.1, le=60.0)
+    storage_retry_max_backoff_seconds: float = Field(default=300.0, ge=0.0)
+    storage_job_stale_after_seconds: float = Field(default=120.0, gt=0.0)
 
     runpod_pod_id: str | None = Field(default=None, validation_alias="RUNPOD_POD_ID")
     # Tokens and credentials added later must use SecretStr and repr=False as well.

@@ -271,6 +271,8 @@ class StorageTransferJob:
     transferred_bytes: int
     cancel_requested: bool
     pid: int | None
+    worker_id: str | None
+    heartbeat_at: datetime | None
     started_at: datetime | None
     completed_at: datetime | None
     error_summary: str | None
