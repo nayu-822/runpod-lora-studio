@@ -232,6 +232,22 @@ RunPod内だけに一時保存するもの:
 - `rclone copy`の失敗を検知できる
 - `rclone sync`を通常処理で使用しない
 
+Phase 5のレビュー対応を完了し、完了扱いへ更新する。Alembic 0007でモデル、モデル転送、汎用ストレージ転送ジョブ、転送項目、プロジェクト別保存設定を追加した。rcloneは引数配列・`shell=False`で実行し、設定ファイルをログへ出力しない。モデル取得はサイズ・SHA-256検証付きの`.part`コピー、既存キャッシュ再利用、失敗時の再試行を行う。
+
+- completedスナップショットのみを再検証してGoogle Driveへ転送する
+- 転送前ドライランと`fail_if_exists`／`skip_identical`／`copy_missing`／`overwrite_changed`の衝突規則を提供する
+- 転送後にファイルサイズ、manifest、設定、snapshot content hashを検証する
+- 成功・失敗・スキップ件数、進捗、キャンセル要求、stale状態をDBへ保存する
+- 通常処理で`rclone sync`を使わず、remoteの無関係なファイルを削除しない
+- rclone.conf、remote名、相対パス、モデル拡張子、サイズ上限を検証する
+
+### Phase 5の完了条件
+
+- Google Driveから許可されたモデルを一覧・検索し、ローカルへ安全に取得・再利用・再検証できる
+- completedスナップショットをドライラン、衝突判定、転送、manifest検証付きで保存できる
+- 転送をキャンセル・再試行でき、再起動後に実行中プロセスの不在をstaleとして検出できる
+- 0007を空DBおよび0006適用済みDBへ適用でき、既存Phase 4スナップショットを変更しない
+
 ## Phase 6: SDXL LoRA学習実行
 
 ### 実装内容

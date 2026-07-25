@@ -1,7 +1,7 @@
 # RunPod LoRA Studio
 
 RunPod GPU Pod 上で動かす、SDXL LoRA 向けの Gradio ベース作業アプリです。  
-このリポジトリの現状は Phase 1 の基盤実装で、プロジェクト管理とローカル画像登録までを含みます。
+このリポジトリは、Phase 1〜4の画像選別・タグ付け・固定スナップショットに加え、Phase 5のモデル管理とGoogle Drive連携基盤を含みます。
 
 ## Phase 1 の範囲
 
@@ -235,3 +235,15 @@ DBには`dataset_snapshots`、`dataset_snapshot_items`、`dataset_validation_iss
 画像本体は一括読込せず、`.part`へ固定サイズバッファでコピーし、SHA-256とサイズ検証後に確定名へrenameします。容量検査では画像、キャプション、manifest/report/CSV/TOML等のメタデータ、設定可能な安全マージンを合算し、保存先filesystemの空き容量不足をDB作成前に拒否します。現在はプレビューのaccepted画像についてIDとパス、キャプションメタデータをメモリへ保持する方式で、想定上限は数千枚程度です。将来はスナップショット対象テーブルのkeyset paginationとストリーミング作成へ移行し、アプリ再起動後も対象集合をDBから再現できるようにします。
 
 類似グループは対象画像に関係するグループをID単位で一度だけ集計します。review status、全体member count、代表画像、否定済みペア数を参照し、未確認グループ数、否定済みペアを含むグループ数、未確認グループの対象画像数をプレビューとレポートへ表示します。未確認・否定済みペアを理由に自動除外はしません。
+
+## Phase 5: モデル管理・Google Drive・rclone連携
+
+Phase 5では、rcloneを介してGoogle Driveのモデルを一覧表示し、RunPodのローカルキャッシュへ検証付きで取得できます。モデル一覧は許可拡張子、サイズ上限、ページング、検索条件で絞り込み、既存キャッシュはサイズとSHA-256が一致する場合に再利用します。取得中は固定バッファで`.part`へ保存し、サイズ・ハッシュ検証後に確定名へatomic renameします。
+
+`rclone.conf`はGitへ保存せず、`RUNPOD_LORA_STUDIO_RCLONE_CONFIG_PATH`で指定します。起動時またはUIから、実行ファイル、設定ファイル、remote、接続、ローカルキャッシュ、転送一時領域を検証します。remote名と相対パスは`..`、絶対パス、制御文字、別remote指定を拒否します。
+
+スナップショットは`completed`かつ再検証に成功したものだけを対象にします。既定の保存先は`<remote>:lora-studio/projects/<project_id>/snapshots/<snapshot_id>/`です。転送前にドライランを実行し、remote上の同名内容、manifest、snapshot `content_sha256`、設定、ポリシーを確認します。衝突ポリシーは`fail_if_exists`、`skip_identical`、`copy_missing`、`overwrite_changed`から選択でき、既定値は安全側の`skip_identical`です。変更されたremote内容に検証可能なmanifestがない場合は自動上書きせず衝突として扱います。
+
+転送後は各ファイルの存在・サイズと`transfer-manifest.json`を検証し、ローカルmanifestへ成功・失敗・スキップ件数、サイズ、ハッシュ、rcloneバージョン、設定スナップショットを記録します。進捗、キャンセル、再試行、アプリ再起動後のstale検出をDBへ保存します。DBトランザクションは短く保ち、画像やモデル全体をbytesへ展開しません。
+
+通常処理では`rclone sync`、remote側の無関係なファイル削除、危険な上書き、秘密情報のログ出力を行いません。Google Drive実通信の手動確認は、rclone設定を配置したRunPodで`rclone version`、`rclone listremotes`、接続確認、モデル一覧、ドライラン、少量のモデル取得、completedスナップショットの転送・再検証の順に実施してください。認証情報がない環境の自動テストはFakeStorageTransferAdapterを使用します。

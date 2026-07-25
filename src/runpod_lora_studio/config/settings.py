@@ -9,6 +9,11 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from runpod_lora_studio.domain.storage_models import (
+    OverwritePolicy,
+    VerificationPolicy,
+)
+
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
 
@@ -94,6 +99,41 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     dataset_disk_safety_margin_bytes: int = Field(default=256 * 1024 * 1024, ge=0)
     dataset_disk_warning_margin_bytes: int = Field(default=1024 * 1024 * 1024, ge=0)
 
+    # Phase 5 storage and rclone defaults. Credentials remain in the external
+    # rclone config file and are never copied into the application database.
+    rclone_executable: str = "rclone"
+    rclone_config_path: Path | None = None
+    storage_remote_name: str = "gdrive"
+    storage_model_remote_root: str = "lora-studio/models"
+    storage_project_remote_root: str = "lora-studio/projects"
+    storage_snapshot_remote_root: str = "snapshots"
+    storage_artifact_remote_root: str = "artifacts"
+    model_cache_dir: Path | None = None
+    transfer_temp_dir: Path | None = None
+    rclone_transfers: int = Field(default=4, ge=1, le=64)
+    rclone_checkers: int = Field(default=8, ge=1, le=128)
+    rclone_retries: int = Field(default=3, ge=0, le=20)
+    rclone_low_level_retries: int = Field(default=10, ge=0, le=100)
+    rclone_retry_interval_seconds: float = Field(default=5.0, ge=0.0, le=3600.0)
+    rclone_connect_timeout_seconds: float = Field(default=30.0, gt=0.0, le=3600.0)
+    rclone_transfer_timeout_seconds: float = Field(default=3600.0, gt=0.0)
+    rclone_bandwidth_limit: str | None = None
+    rclone_buffer_size: str = "16M"
+    storage_use_checksum: bool = True
+    storage_remote_hash_fallback: Literal[
+        "size_and_manifest", "existence_only", "error"
+    ] = "size_and_manifest"
+    storage_dry_run_default: bool = True
+    storage_overwrite_policy: OverwritePolicy = OverwritePolicy.SKIP_IDENTICAL
+    storage_verification_policy: VerificationPolicy = (
+        VerificationPolicy.REMOTE_HASH_AND_SIZE
+    )
+    model_allowed_extensions: tuple[str, ...] = (".safetensors", ".yaml", ".json")
+    model_allow_ckpt: bool = False
+    model_max_file_size_bytes: int = Field(default=30 * 1024**3, ge=1)
+    model_disk_safety_margin_bytes: int = Field(default=256 * 1024**1024, ge=0)
+    transfer_progress_interval_seconds: float = Field(default=2.0, gt=0.1, le=60.0)
+
     runpod_pod_id: str | None = Field(default=None, validation_alias="RUNPOD_POD_ID")
     # Tokens and credentials added later must use SecretStr and repr=False as well.
     runpod_api_key: SecretStr | None = Field(
@@ -140,6 +180,9 @@ def ensure_runtime_directories(settings: AppSettings) -> None:
         settings.temp_dir,
         settings.database_path.parent,
     )
+    for directory in (settings.model_cache_dir, settings.transfer_temp_dir):
+        if directory is not None:
+            directory.mkdir(parents=True, exist_ok=True)
     for directory in directories:
         directory.mkdir(parents=True, exist_ok=True)
 

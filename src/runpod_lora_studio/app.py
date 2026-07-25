@@ -18,10 +18,12 @@ from runpod_lora_studio.services.project_service import ProjectService
 from runpod_lora_studio.services.similarity_detection_service import (
     SimilarityDetectionService,
 )
+from runpod_lora_studio.services.storage_service import StorageService
 from runpod_lora_studio.services.tagging_service import TaggingService
 from runpod_lora_studio.ui.dataset import build_dataset_tab
 from runpod_lora_studio.ui.phase1 import build_image_tab, build_project_tab
 from runpod_lora_studio.ui.similarity import build_similarity_tab
+from runpod_lora_studio.ui.storage import build_storage_tab
 from runpod_lora_studio.ui.tagging import build_tagging_tab
 
 
@@ -69,6 +71,9 @@ def build_paths_dataframe(settings: AppSettings) -> list[list[str]]:
         settings.temp_dir,
         settings.database_path.parent,
     ]
+    for optional_path in (settings.model_cache_dir, settings.transfer_temp_dir):
+        if optional_path is not None:
+            paths.append(optional_path)
     return [[str(path), str(path.exists())] for path in paths]
 
 
@@ -85,8 +90,10 @@ def create_app(
     similarity = SimilarityDetectionService(runtime_settings, projects, images=images)
     tagging = TaggingService(runtime_settings, projects)
     datasets = DatasetSnapshotService(runtime_settings, projects)
+    storage = StorageService(runtime_settings, datasets=datasets)
     datasets.recover_finalized_snapshots()
     datasets.recover_stale()
+    storage.recover_stale_jobs()
     path_rows = build_paths_dataframe(runtime_settings)
 
     with gr.Blocks(title=runtime_settings.app_title) as demo:
@@ -120,9 +127,11 @@ def create_app(
             build_tagging_tab(tagging, selected_project, image_refresh)
         with gr.Tab("データセット"):
             build_dataset_tab(datasets, selected_project)
+        with gr.Tab("モデル・Google Drive"):
+            build_storage_tab(storage, selected_project)
         gr.Markdown(
-            "Phase 4のデータセットスナップショット生成まで実装済みです。"
-            "学習実行、成果物同期、RunPod制御は後続Phaseの対象です。"
+            "Phase 5のモデル管理・Google Drive転送基盤まで実装済みです。"
+            "学習実行、学習成果物の最終同期、RunPod制御は後続Phaseの対象です。"
         )
 
     return cast(gr.Blocks, demo)

@@ -67,7 +67,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0006_phase4_dataset_snapshots"
+            "0007_phase5_storage"
         )
 
 
@@ -124,7 +124,7 @@ def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0006_phase4_dataset_snapshots"
+            "0007_phase5_storage"
         )
 
 
@@ -152,7 +152,21 @@ def test_phase4_downgrade_and_reupgrade_preserves_phase3_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0006_phase4_dataset_snapshots"
+            "0007_phase5_storage"
+        )
+
+
+def test_phase5_upgrades_existing_0006_database_to_head(
+    test_workspace: Path,
+) -> None:
+    settings = migrate(test_workspace, "0006_phase4_dataset_snapshots")
+    migrate(test_workspace, "head")
+    with create_engine_for_settings(settings).connect() as connection:
+        tables = set(inspect(connection).get_table_names())
+        assert "managed_models" in tables
+        assert "storage_transfer_jobs" in tables
+        assert MigrationContext.configure(connection).get_current_revision() == (
+            "0007_phase5_storage"
         )
 
 

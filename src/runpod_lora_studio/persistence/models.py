@@ -614,6 +614,196 @@ class SnapshotCreationJobRecord(Base):
     snapshot: Mapped[DatasetSnapshotRecord] = relationship(back_populates="jobs")
 
 
+class ManagedModelRecord(Base):
+    __tablename__ = "managed_models"
+    __table_args__ = (
+        UniqueConstraint(
+            "remote_name",
+            "remote_relative_path",
+            name="uq_managed_model_remote_path",
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    model_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    remote_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    remote_relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    remote_file_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    remote_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    remote_modified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    remote_hash_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    remote_hash_value: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    local_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    local_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    local_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    rclone_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    downloaded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ModelTransferRecord(Base):
+    __tablename__ = "model_transfers"
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    managed_model_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("managed_models.id", ondelete="CASCADE"), index=True
+    )
+    direction: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    source_path: Mapped[str] = mapped_column(Text, nullable=False)
+    destination_path: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    transferred_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_hash: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    actual_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rclone_exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rclone_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    settings_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class StorageTransferJobRecord(Base):
+    __tablename__ = "storage_transfer_jobs"
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    project_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    snapshot_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    training_run_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    transfer_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    destination_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    current_step: Mapped[str] = mapped_column(String(128), nullable=False)
+    item_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    processed_item_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    succeeded_item_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    failed_item_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    skipped_item_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    transferred_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    cancel_requested: Mapped[bool] = mapped_column(Integer, nullable=False)
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    manifest_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class TransferItemRecord(Base):
+    __tablename__ = "storage_transfer_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "transfer_job_id",
+            "relative_path",
+            name="uq_storage_transfer_item_path",
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    transfer_job_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("storage_transfer_jobs.id", ondelete="CASCADE"),
+        index=True,
+    )
+    relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    item_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    direction: Mapped[str] = mapped_column(String(16), nullable=False)
+    expected_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    transferred_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    destination_hash_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    destination_hash_value: Mapped[str | None] = mapped_column(
+        String(512), nullable=True
+    )
+    verification_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ProjectStorageSettingsRecord(Base):
+    __tablename__ = "project_storage_settings"
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), unique=True
+    )
+    project_remote_root: Mapped[str] = mapped_column(Text, nullable=False)
+    snapshot_remote_root: Mapped[str] = mapped_column(Text, nullable=False)
+    training_remote_root: Mapped[str] = mapped_column(Text, nullable=False)
+    artifact_remote_root: Mapped[str] = mapped_column(Text, nullable=False)
+    selected_managed_model_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True
+    )
+    overwrite_policy: Mapped[str] = mapped_column(String(32), nullable=False)
+    verification_policy: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 # Short compatibility name for service and test code.
 InspectionResultRecord = ImageInspectionResultRecord
 
