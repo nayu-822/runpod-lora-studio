@@ -146,6 +146,7 @@ class DatasetRepository:
                         DatasetSnapshotStatus.DRAFT.value,
                         DatasetSnapshotStatus.VALIDATING.value,
                         DatasetSnapshotStatus.CREATING.value,
+                        DatasetSnapshotStatus.DB_FINALIZATION_PENDING.value,
                     ]
                 ),
             )
@@ -228,6 +229,68 @@ class DatasetRepository:
         job.completed_at = now
         job.current_step = status.value
         job.error_summary = error_summary
+
+    def mark_db_finalization_pending(
+        self, snapshot_id: UUID, error_summary: str
+    ) -> None:
+        record = self._required(snapshot_id)
+        now = datetime.now(UTC)
+        record.status = DatasetSnapshotStatus.DB_FINALIZATION_PENDING.value
+        record.error_summary = error_summary
+        record.completed_at = None
+        record.updated_at = now
+        job = self._job(snapshot_id)
+        job.status = DatasetSnapshotStatus.DB_FINALIZATION_PENDING.value
+        job.current_step = DatasetSnapshotStatus.DB_FINALIZATION_PENDING.value
+        job.error_summary = error_summary
+
+    def list_records_for_recovery(
+        self, project_id: UUID | None = None
+    ) -> list[DatasetSnapshotRecord]:
+        statuses = [
+            DatasetSnapshotStatus.DB_FINALIZATION_PENDING.value,
+            DatasetSnapshotStatus.FAILED.value,
+            DatasetSnapshotStatus.CREATING.value,
+        ]
+        query = select(DatasetSnapshotRecord).where(
+            DatasetSnapshotRecord.status.in_(statuses)
+        )
+        if project_id is not None:
+            query = query.where(DatasetSnapshotRecord.project_id == str(project_id))
+        return list(
+            self.session.scalars(
+                query.order_by(
+                    DatasetSnapshotRecord.created_at, DatasetSnapshotRecord.id
+                )
+            ).all()
+        )
+
+    def add_item_if_missing(self, item: DatasetSnapshotItem) -> bool:
+        existing = self.session.scalar(
+            select(DatasetSnapshotItemRecord).where(
+                DatasetSnapshotItemRecord.snapshot_id == str(item.snapshot_id),
+                DatasetSnapshotItemRecord.image_id == str(item.image_id),
+            )
+        )
+        if existing is not None:
+            return False
+        self.add_item(item)
+        return True
+
+    def add_issue_if_missing(
+        self, snapshot_id: UUID, issue: DatasetValidationIssue
+    ) -> bool:
+        query = select(DatasetValidationIssueRecord).where(
+            DatasetValidationIssueRecord.snapshot_id == str(snapshot_id),
+            DatasetValidationIssueRecord.issue_code == issue.issue_code,
+            DatasetValidationIssueRecord.image_id
+            == (str(issue.image_id) if issue.image_id else None),
+            DatasetValidationIssueRecord.message == issue.message,
+        )
+        if self.session.scalar(query) is not None:
+            return False
+        self.add_issue(snapshot_id, issue)
+        return True
 
     def add_item(self, item: DatasetSnapshotItem) -> None:
         self.session.add(

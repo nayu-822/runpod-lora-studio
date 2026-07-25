@@ -21,6 +21,8 @@ from runpod_lora_studio.config.settings import (
 from runpod_lora_studio.domain.models import SelectionState
 from runpod_lora_studio.persistence.database import create_engine_for_settings
 from runpod_lora_studio.persistence.models import ImageAssetRecord, ProjectRecord
+from runpod_lora_studio.services.caption_service import CaptionEditingService
+from runpod_lora_studio.services.dataset_snapshot_service import DatasetSnapshotService
 from runpod_lora_studio.services.image_service import ImageService
 from runpod_lora_studio.services.project_service import ProjectInput, ProjectService
 
@@ -264,3 +266,25 @@ def test_phase1_services_work_on_alembic_database(test_workspace: Path) -> None:
             "image_assets"
         )
     }
+
+
+def test_0006_database_supports_snapshot_creation_and_revalidation(
+    test_workspace: Path,
+) -> None:
+    settings = migrate(test_workspace)
+    projects = ProjectService(settings)
+    project = projects.create(ProjectInput("phase4-db"))
+    source = test_workspace / "phase4.png"
+    Image.new("RGB", (96, 96), "blue").save(source)
+    uploads = ImageService(settings, projects).register_uploads(project.id, [source])
+    assert len(uploads.successes) == 1
+    image = uploads.successes[0]
+    ImageService(settings, projects).change_state(
+        project.id, [image.id], SelectionState.ACCEPTED
+    )
+    CaptionEditingService(settings, projects).save_image_caption(
+        project.id, image.id, "phase4"
+    )
+    service = DatasetSnapshotService(settings, projects)
+    snapshot = service.create_snapshot_sync(service.preview(project.id), name="db-head")
+    assert service.revalidate(snapshot.id).value == "completed"

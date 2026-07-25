@@ -85,6 +85,8 @@ def create_app(
     similarity = SimilarityDetectionService(runtime_settings, projects, images=images)
     tagging = TaggingService(runtime_settings, projects)
     datasets = DatasetSnapshotService(runtime_settings, projects)
+    datasets.recover_finalized_snapshots()
+    datasets.recover_stale()
     path_rows = build_paths_dataframe(runtime_settings)
 
     with gr.Blocks(title=runtime_settings.app_title) as demo:

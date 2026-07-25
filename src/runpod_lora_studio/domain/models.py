@@ -411,6 +411,7 @@ class DatasetSnapshotStatus(StrEnum):
     FAILED = "failed"
     CANCELED = "canceled"
     CORRUPTED = "corrupted"
+    DB_FINALIZATION_PENDING = "db_finalization_pending"
 
 
 class DatasetIssueSeverity(StrEnum):
@@ -499,6 +500,16 @@ class DatasetPreviewImage:
 
 
 @dataclass(frozen=True, slots=True)
+class DatasetSimilarityGroupSummary:
+    group_id: UUID
+    review_status: str
+    member_count: int
+    target_image_count: int
+    representative_image_id: UUID | None
+    rejected_pair_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class DatasetPreviewSummary:
     target_image_count: int
     caption_present_count: int
@@ -512,11 +523,19 @@ class DatasetPreviewSummary:
     approximate_duplicate_count: int
     approximate_duplicate_nonrepresentative_count: int
     unreviewed_group_count: int
+    rejected_pair_group_count: int
+    unreviewed_group_image_count: int
     empty_caption_count: int
     trigger_missing_count: int
     warning_count: int
     error_count: int
     estimated_size_bytes: int
+    image_size_bytes: int
+    caption_size_bytes: int
+    metadata_size_bytes: int
+    required_size_bytes: int
+    safety_margin_bytes: int
+    warning_margin_bytes: int
     available_disk_bytes: int
     estimated_free_bytes: int
 
@@ -533,6 +552,7 @@ class DatasetPreview:
     issues: tuple[DatasetValidationIssue, ...]
     summary: DatasetPreviewSummary
     source_tagger_run_ids: tuple[UUID, ...]
+    similarity_groups: tuple[DatasetSimilarityGroupSummary, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

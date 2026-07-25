@@ -226,10 +226,12 @@ currentキャプションがない、原画像がない・読めない、DB保�
 
 キャプションファイルはUTF-8（BOMなし）、LF改行、末尾改行1つへ正規化します。TOMLはSDXL向けのresolution、bucket、caption、augmentation、repeats設定を生成し、`tomllib`で再パースしてから保存します。既定値はresolution 1024、min/max bucket 256/2048、steps 64、num_repeats 1、caption extension `.txt`です。`DatasetConfigService`は範囲、整列、拡張子、制御文字、空subset、極端なrepeatsを検査します。
 
-`manifest.json`には画像・キャプションの対応、元／スナップショットのハッシュ、サイズ、解像度、タグ数、トリガーワード数、品質・重複状態、警告、設定、TOMLハッシュを記録します。`content_sha256`は連番・画像ハッシュ・キャプションハッシュの順序付き集合から計算します。レポートには解像度・縦横比、画像単位重複率と近似重複率、画像単位タグ頻度、トリガーワード付与率、空キャプション数、警告を出力します。同一キャプション内のタグ重複は1回として集計します。
+`manifest.json`には画像・キャプションの対応、元／スナップショットのハッシュ、サイズ、解像度、タグ数、トリガーワード数、品質・重複状態、警告、設定、TOMLハッシュを記録します。`content_sha256`は、sequence、画像相対パス、キャプション相対パス、スナップショット画像SHA-256、キャプションSHA-256をsequence順に並べ、`dataset_toml_sha256`と正規化設定JSONのSHA-256を加えたpayloadから計算します。絶対パス、作成日時、snapshot IDは含めません。レポートには解像度（短辺・長辺・総画素数のmin/max/mean/median/p10/p25/p75/p90と境界別件数）、縦横比、bucket候補、画像単位重複率と近似重複率、画像単位タグ頻度、トリガーワード付与率、空キャプション数、警告を出力します。同一キャプション内のタグ重複は1回として集計します。
 
-DBには`dataset_snapshots`、`dataset_snapshot_items`、`dataset_validation_issues`、`snapshot_creation_jobs`を追加し、Alembic 0006で作成します。状態は`draft`、`validating`、`creating`、`completed`、`failed`、`canceled`、`corrupted`です。作成中は`{snapshot_id}.creating`へ書き込み、全ファイル・TOML・manifest・レポート・ハッシュ検証完了後に同一プロジェクト内へatomic renameし、DBをcompletedへ更新します。コピーは画像単位でキャンセルを確認し、再起動時にvalidating/creatingのstale行はfailedへ復旧します。再検証で破損を検出した場合はcorruptedへ変更しますが、スナップショットや原画像を削除しません。
+DBには`dataset_snapshots`、`dataset_snapshot_items`、`dataset_validation_issues`、`snapshot_creation_jobs`を追加し、Alembic 0006で作成します。状態は`draft`、`validating`、`creating`、`db_finalization_pending`、`completed`、`failed`、`canceled`、`corrupted`です。作成中は`{snapshot_id}.creating`へ書き込み、全ファイル・TOML・manifest・レポート・ハッシュ検証完了後に同一プロジェクト内へatomic renameし、DBをcompletedへ更新します。rename後のDB保存・commitに失敗した場合は確定ファイルを削除せず`db_finalization_pending`へ記録し、起動時または回復操作でmanifestからitem/issueを冪等に再構築します。コピーは固定バッファのストリーミングと画像単位のキャンセル確認を行い、再起動時にcreatingのstale行はfailedへ復旧します。再検証で破損を検出した場合はcorruptedへ変更しますが、スナップショットや原画像を削除しません。
 
 現在のUIはプレビュー、警告確認付き作成、一覧、再検証を提供します。作成完了後に原画像・キャプション・SelectionStateを変更してもスナップショットは変化しません。スナップショットは将来のPhase 5/6で学習入力と同期対象として利用しますが、Phase 4単体では学習実行、成果物同期、削除機能は提供しません。
 
-画像本体は一括読込せず1枚ずつコピー・ハッシュ検証します。現在はプレビューのaccepted画像についてIDとパス、キャプションメタデータをメモリへ保持する方式で、想定上限は数千枚程度です。将来はスナップショット対象テーブルのkeyset paginationとストリーミング作成へ移行し、アプリ再起動後も対象集合をDBから再現できるようにします。
+画像本体は一括読込せず、`.part`へ固定サイズバッファでコピーし、SHA-256とサイズ検証後に確定名へrenameします。容量検査では画像、キャプション、manifest/report/CSV/TOML等のメタデータ、設定可能な安全マージンを合算し、保存先filesystemの空き容量不足をDB作成前に拒否します。現在はプレビューのaccepted画像についてIDとパス、キャプションメタデータをメモリへ保持する方式で、想定上限は数千枚程度です。将来はスナップショット対象テーブルのkeyset paginationとストリーミング作成へ移行し、アプリ再起動後も対象集合をDBから再現できるようにします。
+
+類似グループは対象画像に関係するグループをID単位で一度だけ集計します。review status、全体member count、代表画像、否定済みペア数を参照し、未確認グループ数、否定済みペアを含むグループ数、未確認グループの対象画像数をプレビューとレポートへ表示します。未確認・否定済みペアを理由に自動除外はしません。

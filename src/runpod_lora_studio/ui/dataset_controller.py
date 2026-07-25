@@ -56,6 +56,10 @@ def preview_summary(preview: DatasetPreview) -> str:
             f"{summary.quality_failed_image_count}**",
             f"- 完全重複/近似重複: **{summary.exact_duplicate_count} / "
             f"{summary.approximate_duplicate_count}**",
+            f"- 未確認グループ/否定ペア含む: **{summary.unreviewed_group_count} / "
+            f"{summary.rejected_pair_group_count}**",
+            f"- 必要容量/安全マージン: **{summary.required_size_bytes} / "
+            f"{summary.safety_margin_bytes} bytes**",
             f"- トリガー未付与: **{summary.trigger_missing_count}**",
             f"- 警告: **{summary.warning_count}**",
             f"- エラー: **{summary.error_count}**",

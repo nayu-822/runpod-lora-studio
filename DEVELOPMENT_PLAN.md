@@ -453,13 +453,16 @@ Run開始時点の対象画像ID・パスは現在メモリへ保持するが、
 
 ## Phase 4実装状況: 学習用データセット生成・固定スナップショット・学習前検査
 
-Phase 4を完了扱いとする。Alembic 0006で、採用画像とcurrentキャプションを独立した不変スナップショットへ保存する機能、SDXL dataset TOML、manifest、ハッシュ付きレポート、作成ジョブ、キャンセル、stale復旧、再検証を追加した。
+Phase 4のレビュー対応を完了し、完了扱いへ戻す。Alembic 0006で、採用画像とcurrentキャプションを独立した不変スナップショットへ保存する機能、SDXL dataset TOML、manifest、設定を含む内容ハッシュ、容量検査、ハッシュ付きレポート、作成ジョブ、キャンセル、stale復旧、DB確定失敗からのmanifest回復、再検証を追加した。
 
 - 対象は作成時点で`accepted`の画像だけで、currentキャプション・原画像の存在、可読性、DBハッシュ、ファイルサイズを必須検査する
 - 品質・完全重複・pHash近似重複・トリガーワード不足は警告として表示し、確認なしでは作成しないが自動除外しない
 - プレビュー署名には対象画像集合、SelectionState、原画像ハッシュ／サイズ、キャプションID／revision／本文ハッシュ、元TaggerRun、設定、トリガーワード、生成器バージョンを含める
-- 作成中は一時ディレクトリへ画像を1枚ずつコピーし、コピー後ハッシュ検証、TOML再パース、manifest・レポート生成の完了後にatomic renameする
-- `manifest_sha256`、`dataset_toml_sha256`、順序付き画像／キャプション集合の`content_sha256`を保存し、再検証失敗時はファイルを削除せず`corrupted`へ遷移する
+- 作成中は一時ディレクトリへ画像を1枚ずつストリーミングコピーし、コピー後ハッシュ検証、TOML再パース、manifest・レポート生成の完了後にatomic renameする
+- rename後のDB保存・commit失敗は`db_finalization_pending`へ記録し、確定ファイルを残してmanifestからitem/issueを冪等に回復できる
+- `manifest_sha256`、`dataset_toml_sha256`、相対パス・画像／キャプション・TOML・設定を含む`content_sha256`を保存し、再検証失敗時はファイルを削除せず`corrupted`へ遷移する
+- 画像、キャプション、manifest/report/CSV/TOML、安全マージンを合算し、filesystem空き容量が必要量未満ならDB作成前に拒否する
+- 類似グループのreview status、member count、代表、否定済みペアを対象グループ単位で集計し、未確認・否定済みを自動除外せずレポートする
 - キャプションはUTF-8 BOMなし、LF、末尾改行1つへ正規化し、TOMLの既定値はresolution 1024、bucket 256～2048／step 64、repeats 1とする
 - 画像本体は一括ロードしない。現在はID・パス・キャプションメタデータをプレビュー中にメモリ保持するため想定数千枚までとし、将来は対象テーブルとkeyset paginationでストリーミング化する
 - Phase 4は学習実行、Google Drive同期、スナップショット削除を行わず、Phase 5/6の入力境界を固定する
@@ -470,4 +473,7 @@ Phase 4を完了扱いとする。Alembic 0006で、採用画像とcurrentキャ
 - プレビュー後の対象集合、SelectionState、原画像、キャプション、設定変更を適用前に検知できる
 - 必須エラー、警告確認、コピー後検証、TOML検証、manifest検証が完了条件へ含まれる
 - DBとファイルの再検証、破損状態、作成中ジョブのstale復旧を扱える
+- rename後DB失敗を回復でき、completedスナップショットへ回復処理の影響を与えない
+- content hashが相対パス、TOML、正規化設定の変更を識別できる
+- 容量不足、未確認類似グループ、解像度・縦横比分布をプレビューとレポートへ反映できる
 - SQLite/Alembic 0006、Gradio UI、単体テスト、品質コマンドを確認済みである

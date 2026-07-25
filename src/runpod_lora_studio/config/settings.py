@@ -91,6 +91,8 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     dataset_default_bucket_reso_steps: int = Field(default=64, ge=1, le=2048)
     dataset_default_num_repeats: int = Field(default=1, ge=1, le=10000)
     dataset_allow_empty_caption: bool = False
+    dataset_disk_safety_margin_bytes: int = Field(default=256 * 1024 * 1024, ge=0)
+    dataset_disk_warning_margin_bytes: int = Field(default=1024 * 1024 * 1024, ge=0)
 
     runpod_pod_id: str | None = Field(default=None, validation_alias="RUNPOD_POD_ID")
     # Tokens and credentials added later must use SecretStr and repr=False as well.
