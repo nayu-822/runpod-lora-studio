@@ -170,6 +170,7 @@ class SimilarityGroup:
     created_at: datetime
     updated_at: datetime
     members: tuple[SimilarityGroupMember, ...] = ()
+    rejected_pairs: tuple[tuple[UUID, UUID], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

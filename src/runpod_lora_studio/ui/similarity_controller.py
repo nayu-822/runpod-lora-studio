@@ -97,6 +97,7 @@ def similarity_group_rows(groups: list[SimilarityGroup]) -> list[list[str | int]
                 max(distances, default=0),
                 review,
                 group.representative_source.value,
+                len(group.rejected_pairs),
             ]
         )
     return rows
@@ -116,12 +117,14 @@ def similarity_detail_rows(group: SimilarityGroup) -> list[list[str | int | floa
                 image.selection_state.value,
                 member.representative_distance
                 if member.representative_distance is not None
-                else "代表",
+                else 0,
                 member.minimum_distance if member.minimum_distance is not None else "-",
                 f"{member.representative_candidate_score:.2f}",
                 "代表" if member.is_representative else "",
                 member.review_status.value,
                 ", ".join(image.exclusion_reasons) or "なし",
+                "; ".join(f"{left} - {right}" for left, right in group.rejected_pairs)
+                or "-",
             ]
         )
     return rows

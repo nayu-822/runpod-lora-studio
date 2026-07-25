@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from itertools import combinations
 from uuid import UUID, uuid4
@@ -23,6 +23,7 @@ from runpod_lora_studio.domain.models import (
     SimilaritySummary,
 )
 from runpod_lora_studio.persistence.database import create_session_factory
+from runpod_lora_studio.persistence.models import SimilarityGroupRecord
 from runpod_lora_studio.persistence.repositories import (
     ImageInspectionRepository,
     ImageRepository,
@@ -135,7 +136,12 @@ class SimilarityDetectionService:
                 if distance <= self.settings.phash_distance_threshold:
                     uf.union(left_key, right_key)
             groups = self._make_groups(uf.components(), candidate_by_key)
-            SimilarityRepository(session).replace_groups(
+            repository = SimilarityRepository(session)
+            old_groups = repository.current_groups(
+                project_id, self.hashes.detector_version
+            )
+            groups = self._finalize_groups(groups, old_groups, values)
+            repository.replace_groups(
                 project_id,
                 self.hashes.detector_version,
                 self.settings.phash_distance_threshold,
@@ -143,6 +149,101 @@ class SimilarityDetectionService:
             )
             session.commit()
             return groups
+
+    def _finalize_groups(
+        self,
+        groups: list[SimilarityGroup],
+        old_groups: list[SimilarityGroupRecord],
+        values: list[PerceptualHash],
+    ) -> list[SimilarityGroup]:
+        value_by_id = {str(value.image_id): value for value in values}
+        finalized: list[SimilarityGroup] = []
+        for group in groups:
+            member_ids = {str(member.image_id) for member in group.members}
+            manual_id = self._manual_representative_for_component(
+                member_ids, old_groups
+            )
+            representative_id = manual_id or group.representative_image_id
+            if representative_id is None:
+                raise ValueError("similarity group has no representative")
+            representative_hash = value_by_id.get(str(representative_id))
+            if representative_hash is None:
+                raise ValueError("representative pHash is unavailable")
+            updated_members: list[SimilarityGroupMember] = []
+            for member in group.members:
+                value = value_by_id.get(str(member.image_id))
+                if value is None:
+                    raise ValueError("group member pHash is unavailable")
+                distance = PerceptualHashService.hamming_distance(
+                    value.hash_value,
+                    value.hash_size,
+                    representative_hash.hash_value,
+                    representative_hash.hash_size,
+                )
+                updated_members.append(
+                    replace(
+                        member,
+                        is_representative=member.image_id == representative_id,
+                        representative_distance=distance,
+                    )
+                )
+            finalized.append(
+                replace(
+                    group,
+                    representative_image_id=representative_id,
+                    representative_source=(
+                        RepresentativeSource.MANUAL
+                        if manual_id is not None
+                        else RepresentativeSource.AUTOMATIC
+                    ),
+                    members=tuple(updated_members),
+                )
+            )
+        return finalized
+
+    @staticmethod
+    def _manual_representative_for_component(
+        member_ids: set[str], old_groups: list[SimilarityGroupRecord]
+    ) -> UUID | None:
+        candidates: list[tuple[datetime, datetime, str, UUID]] = []
+        for old_group in old_groups:
+            representative_id = old_group.representative_image_id
+            if (
+                old_group.representative_source != RepresentativeSource.MANUAL.value
+                or representative_id not in member_ids
+            ):
+                continue
+            member = next(
+                (
+                    item
+                    for item in old_group.members
+                    if item.image_id == representative_id
+                ),
+                None,
+            )
+            image_created_at = (
+                member.image.created_at
+                if member is not None and member.image is not None
+                else None
+            )
+            candidates.append(
+                (
+                    SimilarityDetectionService._sortable_datetime(old_group.created_at),
+                    SimilarityDetectionService._sortable_datetime(image_created_at),
+                    representative_id,
+                    UUID(representative_id),
+                )
+            )
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        return candidates[0][3]
+
+    @staticmethod
+    def _sortable_datetime(value: datetime | None) -> datetime:
+        if value is None:
+            return datetime.max.replace(tzinfo=UTC)
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
     def _candidates(
         self, session: Session, project_id: UUID, hashes: dict[str, PerceptualHash]
@@ -218,7 +319,7 @@ class SimilarityDetectionService:
             for candidate in sorted(members, key=lambda item: str(item.image.id)):
                 key = str(candidate.image.id)
                 rep_distance = (
-                    None if key == rep_key else distances.get(_pair_key(key, rep_key))
+                    0 if key == rep_key else distances.get(_pair_key(key, rep_key))
                 )
                 minimum = min(
                     (distance for pair, distance in distances.items() if key in pair),
@@ -316,7 +417,37 @@ class SimilarityDetectionService:
 
     def change_representative(self, group_id: UUID, image_id: UUID) -> None:
         with self.session_factory() as session:
-            SimilarityRepository(session).set_representative(group_id, image_id)
+            repository = SimilarityRepository(session)
+            group = repository.get_group(group_id)
+            if group is None:
+                raise ValueError("similarity group not found")
+            hash_repository = PerceptualHashRepository(session)
+            values: dict[UUID, PerceptualHash] = {}
+            for member in group.members:
+                value = hash_repository.get_for_image(
+                    member.image_id,
+                    self.hashes.algorithm,
+                    self.hashes.hash_size,
+                    self.hashes.detector_version,
+                )
+                if value is None or value.status is not PerceptualHashStatus.CALCULATED:
+                    raise ValueError(
+                        f"pHash is unavailable for image {member.image_id}"
+                    )
+                values[member.image_id] = value
+            if image_id not in values:
+                raise ValueError("image is not a member of the similarity group")
+            representative = values[image_id]
+            distances = {
+                member_id: PerceptualHashService.hamming_distance(
+                    value.hash_value,
+                    value.hash_size,
+                    representative.hash_value,
+                    representative.hash_size,
+                )
+                for member_id, value in values.items()
+            }
+            repository.set_representative(group_id, image_id, distances)
             session.commit()
 
     def review_group(self, group_id: UUID, similar: bool) -> None:

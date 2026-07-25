@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from collections import Counter
 from collections.abc import Iterable
+from dataclasses import replace
 from datetime import UTC, datetime
+from itertools import combinations
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -548,6 +550,23 @@ class PerceptualHashRepository:
             for record in self.session.scalars(query).all()
         ]
 
+    def get_for_image(
+        self,
+        image_id: UUID,
+        algorithm: str,
+        hash_size: int,
+        detector_version: str,
+    ) -> PerceptualHash | None:
+        record = self.session.scalar(
+            select(ImagePerceptualHashRecord).where(
+                ImagePerceptualHashRecord.image_id == str(image_id),
+                ImagePerceptualHashRecord.algorithm == algorithm,
+                ImagePerceptualHashRecord.hash_size == hash_size,
+                ImagePerceptualHashRecord.detector_version == detector_version,
+            )
+        )
+        return perceptual_hash_from_record(record) if record else None
+
     def status_counts(
         self, project_id: UUID, algorithm: str, hash_size: int, detector_version: str
     ) -> dict[str, int]:
@@ -643,7 +662,7 @@ class SimilarityRepository:
             .offset(max(page - 1, 0) * max(page_size, 1))
             .limit(max(page_size, 1))
         ).all()
-        return [_group_from_record(row) for row in rows], count
+        return [self._group_view(row) for row in rows], count
 
     def get_group(self, group_id: UUID) -> SimilarityGroup | None:
         record = self.session.scalar(
@@ -651,7 +670,57 @@ class SimilarityRepository:
                 SimilarityGroupRecord.id == str(group_id)
             )
         )
-        return _group_from_record(record) if record else None
+        return self._group_view(record) if record else None
+
+    def _group_view(self, record: SimilarityGroupRecord) -> SimilarityGroup:
+        group = _group_from_record(record)
+        member_ids = {str(member.image_id) for member in group.members}
+        rejected = tuple(
+            (
+                UUID(row.image_left_id),
+                UUID(row.image_right_id),
+            )
+            for row in self.session.scalars(
+                select(SimilarityPairReviewRecord).where(
+                    SimilarityPairReviewRecord.project_id == record.project_id,
+                    SimilarityPairReviewRecord.detector_version
+                    == record.detector_version,
+                    SimilarityPairReviewRecord.review_status
+                    == SimilarityReviewStatus.REJECTED_SIMILARITY.value,
+                )
+            ).all()
+            if row.image_left_id in member_ids and row.image_right_id in member_ids
+        )
+        return replace(group, rejected_pairs=rejected)
+
+    def _review_status_for_members(
+        self, project_id: str, detector_version: str, member_ids: list[str]
+    ) -> SimilarityReviewStatus:
+        pairs = list(combinations(sorted(member_ids), 2))
+        if not pairs:
+            return SimilarityReviewStatus.UNREVIEWED
+        rows = self.session.scalars(
+            select(SimilarityPairReviewRecord).where(
+                SimilarityPairReviewRecord.project_id == project_id,
+                SimilarityPairReviewRecord.detector_version == detector_version,
+            )
+        ).all()
+        reviews = {
+            (row.image_left_id, row.image_right_id): row.review_status
+            for row in rows
+            if (row.image_left_id, row.image_right_id) in pairs
+        }
+        if any(
+            reviews.get(pair) == SimilarityReviewStatus.REJECTED_SIMILARITY.value
+            for pair in pairs
+        ):
+            return SimilarityReviewStatus.REJECTED_SIMILARITY
+        if all(
+            reviews.get(pair) == SimilarityReviewStatus.CONFIRMED_SIMILAR.value
+            for pair in pairs
+        ):
+            return SimilarityReviewStatus.CONFIRMED_SIMILAR
+        return SimilarityReviewStatus.UNREVIEWED
 
     def replace_groups(
         self,
@@ -661,40 +730,32 @@ class SimilarityRepository:
         groups: Iterable[SimilarityGroup],
     ) -> None:
         old = self.current_groups(project_id, detector_version)
-        manual_representatives = {
-            member.image_id
-            for group in old
-            if group.representative_source == RepresentativeSource.MANUAL.value
-            for member in group.members
-            if member.is_representative
-        }
-        old_review: dict[str, str] = {
-            member.image_id: member.review_status
-            for group in old
-            for member in group.members
-        }
+        group_list = list(groups)
+        for group in group_list:
+            member_ids = {str(member.image_id) for member in group.members}
+            if (
+                group.representative_image_id is not None
+                and str(group.representative_image_id) not in member_ids
+            ):
+                raise ValueError("representative image is not a group member")
+            if sum(member.is_representative for member in group.members) != 1:
+                raise ValueError(
+                    "similarity group must have exactly one representative"
+                )
         for record in old:
             self.session.delete(record)
         self.session.flush()
         now = utc_now()
-        for group in groups:
-            manual_image = next(
-                (
-                    str(image_id)
-                    for image_id in manual_representatives
-                    if image_id in {str(member.image_id) for member in group.members}
-                ),
-                None,
-            )
-            representative_id = manual_image or (
+        for group in group_list:
+            representative_id = (
                 str(group.representative_image_id)
                 if group.representative_image_id
                 else None
             )
-            source = (
-                RepresentativeSource.MANUAL.value
-                if manual_image
-                else group.representative_source.value
+            review = self._review_status_for_members(
+                str(project_id),
+                detector_version,
+                [str(item.image_id) for item in group.members],
             )
             record = SimilarityGroupRecord(
                 id=str(group.id),
@@ -703,31 +764,34 @@ class SimilarityRepository:
                 detector_version=detector_version,
                 distance_threshold=threshold,
                 representative_image_id=representative_id,
-                representative_source=source,
+                representative_source=group.representative_source.value,
                 created_at=now,
                 updated_at=now,
             )
             self.session.add(record)
             for member in group.members:
                 image_key = str(member.image_id)
-                is_rep = image_key == representative_id
-                review = old_review.get(image_key, member.review_status.value)
                 record.members.append(
                     SimilarityGroupMemberRecord(
                         group_id=str(group.id),
                         image_id=image_key,
                         detector_version=detector_version,
                         representative_candidate_score=member.representative_candidate_score,
-                        is_representative=is_rep,
+                        is_representative=member.is_representative,
                         representative_distance=member.representative_distance,
                         minimum_distance=member.minimum_distance,
-                        review_status=review,
+                        review_status=review.value,
                         created_at=now,
                         updated_at=now,
                     )
                 )
 
-    def set_representative(self, group_id: UUID, image_id: UUID) -> None:
+    def set_representative(
+        self,
+        group_id: UUID,
+        image_id: UUID,
+        representative_distances: dict[UUID, int],
+    ) -> None:
         group = self.session.scalar(
             select(SimilarityGroupRecord).where(
                 SimilarityGroupRecord.id == str(group_id)
@@ -735,20 +799,21 @@ class SimilarityRepository:
         )
         if group is None:
             raise ValueError("similarity group not found")
-        member = self.session.scalar(
-            select(SimilarityGroupMemberRecord).where(
-                SimilarityGroupMemberRecord.group_id == str(group_id),
-                SimilarityGroupMemberRecord.image_id == str(image_id),
-            )
-        )
-        if member is None:
+        member_ids = {UUID(item.image_id) for item in group.members}
+        if image_id not in member_ids:
             raise ValueError("image is not a member of the similarity group")
+        if set(representative_distances) != member_ids or any(
+            value < 0 for value in representative_distances.values()
+        ):
+            raise ValueError("representative distances do not match group members")
+        now = utc_now()
         for item in group.members:
             item.is_representative = item.image_id == str(image_id)
-            item.updated_at = utc_now()
+            item.representative_distance = representative_distances[UUID(item.image_id)]
+            item.updated_at = now
         group.representative_image_id = str(image_id)
         group.representative_source = RepresentativeSource.MANUAL.value
-        group.updated_at = utc_now()
+        group.updated_at = now
 
     def set_group_review(self, group_id: UUID, status: SimilarityReviewStatus) -> None:
         group = self.session.scalar(
