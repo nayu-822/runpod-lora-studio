@@ -63,6 +63,24 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     phash_batch_size: int = Field(default=100, ge=1, le=10_000)
     similarity_group_page_size: int = Field(default=20, ge=1, le=100)
 
+    # Phase 3 tagging defaults. Model files are never downloaded by default.
+    tagger_adapter_name: str = "wd14"
+    tagger_model_identifier: str = "SmilingWolf/wd-eva02-large-tagger-v3"
+    tagger_model_revision: str = "main"
+    tagger_model_dir: Path = Path("/workspace/ldts-runtime/models/taggers/wd14")
+    tagger_device: Literal["auto", "cuda", "cpu"] = "auto"
+    tagger_batch_size: int = Field(default=4, ge=1, le=128)
+    tagger_general_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+    tagger_character_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
+    tagger_save_rating: bool = False
+    tagger_save_character: bool = True
+    tagger_save_general: bool = True
+    tagger_underscore_to_space: bool = False
+    tagger_escape_mode: Literal["none", "backslash"] = "none"
+    tagger_max_workers: int = Field(default=1, ge=1, le=8)
+    tagger_allow_model_download: bool = False
+    tagger_caption_page_size: int = Field(default=20, ge=1, le=100)
+
     runpod_pod_id: str | None = Field(default=None, validation_alias="RUNPOD_POD_ID")
     # Tokens and credentials added later must use SecretStr and repr=False as well.
     runpod_api_key: SecretStr | None = Field(
@@ -90,6 +108,7 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
         "logs_dir",
         "temp_dir",
         "database_path",
+        "tagger_model_dir",
     )
     @classmethod
     def validate_paths(cls, value: Path) -> Path:

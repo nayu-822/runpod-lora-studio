@@ -7,10 +7,12 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -237,6 +239,218 @@ class SimilarityPairReviewRecord(Base):
         DateTime(timezone=True), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class TaggerRunRecord(Base):
+    __tablename__ = "tagger_runs"
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    adapter_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_identifier: Mapped[str] = mapped_column(String(256), nullable=False)
+    model_revision: Mapped[str] = mapped_column(String(128), nullable=False)
+    model_path: Mapped[str] = mapped_column(Text, nullable=False)
+    device: Mapped[str] = mapped_column(String(16), nullable=False)
+    general_threshold: Mapped[float] = mapped_column(Float, nullable=False)
+    character_threshold: Mapped[float] = mapped_column(Float, nullable=False)
+    save_rating: Mapped[bool] = mapped_column(Integer, nullable=False)
+    save_character: Mapped[bool] = mapped_column(Integer, nullable=False)
+    save_general: Mapped[bool] = mapped_column(Integer, nullable=False)
+    underscore_to_space: Mapped[bool] = mapped_column(Integer, nullable=False)
+    escape_mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    batch_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_workers: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    target_image_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    processed_image_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    succeeded_image_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    failed_image_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    skipped_image_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    current_image_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    cancel_requested: Mapped[bool] = mapped_column(Integer, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    settings_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    implementation_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    results: Mapped[list[ImageTaggingResultRecord]] = relationship(
+        back_populates="tagger_run", cascade="all, delete-orphan"
+    )
+
+
+class ImageTaggingResultRecord(Base):
+    __tablename__ = "image_tagging_results"
+    __table_args__ = (
+        UniqueConstraint(
+            "image_id", "tagger_run_id", name="uq_image_tagging_result_run"
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    image_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("image_assets.id", ondelete="CASCADE"), index=True
+    )
+    tagger_run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tagger_runs.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tagged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    raw_output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tags: Mapped[list[DetectedTagRecord]] = relationship(
+        back_populates="result", cascade="all, delete-orphan"
+    )
+    tagger_run: Mapped[TaggerRunRecord] = relationship(back_populates="results")
+    image: Mapped[ImageAssetRecord] = relationship()
+
+
+class DetectedTagRecord(Base):
+    __tablename__ = "detected_tags"
+    __table_args__ = (
+        UniqueConstraint(
+            "image_tagging_result_id",
+            "original_order",
+            name="uq_detected_tag_order",
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    image_tagging_result_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("image_tagging_results.internal_id", ondelete="CASCADE"),
+        index=True,
+    )
+    tag_name_raw: Mapped[str] = mapped_column(String(512), nullable=False)
+    tag_name_normalized: Mapped[str] = mapped_column(String(512), nullable=False)
+    category: Mapped[str] = mapped_column(String(24), nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    original_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    model_identifier: Mapped[str] = mapped_column(String(256), nullable=False)
+    model_revision: Mapped[str] = mapped_column(String(128), nullable=False)
+    tagger_run_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    result: Mapped[ImageTaggingResultRecord] = relationship(back_populates="tags")
+
+
+class ImageCaptionRecord(Base):
+    __tablename__ = "image_captions"
+    __table_args__ = (
+        Index(
+            "uq_image_caption_current",
+            "image_id",
+            unique=True,
+            sqlite_where=text("is_current = 1"),
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    image_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("image_assets.id", ondelete="CASCADE"), index=True
+    )
+    source_tagger_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("tagger_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    caption_text: Mapped[str] = mapped_column(Text, nullable=False)
+    caption_format_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_current: Mapped[bool] = mapped_column(Integer, nullable=False)
+    edit_source: Mapped[str] = mapped_column(String(24), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    tags: Mapped[list[CaptionTagRecord]] = relationship(
+        back_populates="caption", cascade="all, delete-orphan"
+    )
+    image: Mapped[ImageAssetRecord] = relationship()
+
+
+class CaptionTagRecord(Base):
+    __tablename__ = "caption_tags"
+    __table_args__ = (
+        UniqueConstraint(
+            "image_caption_id", "position", name="uq_caption_tag_position"
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    image_caption_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("image_captions.internal_id", ondelete="CASCADE"),
+        index=True,
+    )
+    tag_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    normalized_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    category: Mapped[str] = mapped_column(String(24), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    manually_added: Mapped[bool] = mapped_column(Integer, nullable=False)
+    manually_removed: Mapped[bool] = mapped_column(Integer, nullable=False)
+    caption: Mapped[ImageCaptionRecord] = relationship(back_populates="tags")
+
+
+class ProjectTagRuleRecord(Base):
+    __tablename__ = "project_tag_rules"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "normalized_tag_name", name="uq_project_tag_rule_name"
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    normalized_tag_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    category: Mapped[str] = mapped_column(String(24), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_by: Mapped[str] = mapped_column(String(24), nullable=False)
+
+
+class CaptionEditHistoryRecord(Base):
+    __tablename__ = "caption_edit_history"
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    image_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("image_assets.id", ondelete="CASCADE"), index=True
+    )
+    image_caption_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("image_captions.internal_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    previous_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    new_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    before_text: Mapped[str] = mapped_column(Text, nullable=False)
+    after_text: Mapped[str] = mapped_column(Text, nullable=False)
+    diff_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    edit_source: Mapped[str] = mapped_column(String(24), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
 

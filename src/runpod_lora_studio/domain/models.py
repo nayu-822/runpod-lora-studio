@@ -58,6 +58,59 @@ class RepresentativeSource(StrEnum):
     MANUAL = "manual"
 
 
+class TagCategory(StrEnum):
+    GENERAL = "general"
+    CHARACTER = "character"
+    RATING = "rating"
+    META = "meta"
+    UNKNOWN = "unknown"
+    MANUAL = "manual"
+    TRIGGER = "trigger"
+
+
+class TagSource(StrEnum):
+    WD_TAGGER = "wd_tagger"
+    SOURCE_METADATA = "source_metadata"
+    MANUAL = "manual"
+    TRIGGER_WORD = "trigger_word"
+
+
+class TaggerRunStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    PARTIALLY_FAILED = "partially_failed"
+    FAILED = "failed"
+    CANCELED = "canceled"
+    STALE = "stale"
+
+
+class TaggingResultStatus(StrEnum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class CaptionEditSource(StrEnum):
+    GENERATED = "generated"
+    BULK_FILTER = "bulk_filter"
+    MANUAL = "manual"
+    RESTORED = "restored"
+
+
+class TaggerRunMode(StrEnum):
+    UNTAGGED_ONLY = "untagged_only"
+    FAILED_ONLY = "failed_only"
+    ALL_ACCEPTED = "all_accepted"
+
+
+class ManualCaptionPolicy(StrEnum):
+    KEEP_MANUAL = "keep_manual"
+    REBUILD_FROM_SOURCE = "rebuild_from_source"
+    EXCLUDE_MANUAL = "exclude_manual"
+
+
 @dataclass(frozen=True, slots=True)
 class Project:
     id: UUID
@@ -192,3 +245,154 @@ class SimilarityRunResult:
     failed_image_count: int
     skipped_image_count: int
     group_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class TaggerModelIdentity:
+    adapter_name: str
+    model_identifier: str
+    model_revision: str
+    model_path: str
+    implementation_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaggerInferenceSettings:
+    device: str
+    batch_size: int
+    general_threshold: float
+    character_threshold: float
+    save_rating: bool
+    save_character: bool
+    save_general: bool
+    underscore_to_space: bool
+    escape_mode: str
+    max_workers: int
+    allow_model_download: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TagPrediction:
+    tag_name_raw: str
+    tag_name_normalized: str
+    category: TagCategory
+    confidence: float | None
+    original_order: int
+    source: TagSource = TagSource.WD_TAGGER
+
+
+@dataclass(frozen=True, slots=True)
+class TaggingResult:
+    tags: tuple[TagPrediction, ...]
+    raw_output: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TagFrequency:
+    tag_name_normalized: str
+    display_name: str
+    category: TagCategory
+    image_count: int
+    target_image_count: int
+    occurrence_rate: float
+    average_confidence: float | None
+    minimum_confidence: float | None
+    maximum_confidence: float | None
+    keep: bool
+    rule_origin: str
+
+
+@dataclass(frozen=True, slots=True)
+class CaptionTagValue:
+    tag_name: str
+    normalized_name: str
+    category: TagCategory
+    source: TagSource
+    position: int
+    confidence: float | None = None
+    manually_added: bool = False
+    manually_removed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CaptionChange:
+    image_id: UUID
+    filename: str
+    before: str
+    after: str
+    added_tags: tuple[str, ...]
+    removed_tags: tuple[str, ...]
+    trigger_words: tuple[str, ...]
+    manual_policy: ManualCaptionPolicy
+    warning: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CaptionPreview:
+    token: str
+    project_id: UUID
+    tagger_run_id: UUID
+    changes: tuple[CaptionChange, ...]
+    target_image_count: int
+    keep_tag_count: int
+    remove_tag_count: int
+    changed_image_count: int
+    empty_caption_count: int
+    trigger_image_count: int
+    manual_image_count: int
+    rules_snapshot: tuple[tuple[str, str, str], ...]
+    trigger_words: tuple[str, ...]
+    policy: ManualCaptionPolicy
+
+
+@dataclass(frozen=True, slots=True)
+class TaggerRunSummary:
+    id: UUID
+    project_id: UUID
+    adapter_name: str
+    model_identifier: str
+    model_revision: str
+    model_path: str
+    device: str
+    status: TaggerRunStatus
+    target_image_count: int
+    processed_image_count: int
+    succeeded_image_count: int
+    failed_image_count: int
+    skipped_image_count: int
+    current_image_id: UUID | None
+    cancel_requested: bool
+    started_at: datetime | None
+    completed_at: datetime | None
+    error_summary: str | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class StoredTaggingResult:
+    image_id: UUID
+    tagger_run_id: UUID
+    status: TaggingResultStatus
+    error_summary: str | None
+    tagged_at: datetime | None
+    tags: tuple[TagPrediction, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectTagRule:
+    normalized_tag_name: str
+    action: str
+    category: TagCategory
+    updated_by: str
+
+
+@dataclass(frozen=True, slots=True)
+class StoredCaption:
+    image_id: UUID
+    id: UUID
+    revision: int
+    caption_text: str
+    source_tagger_run_id: UUID | None
+    edit_source: CaptionEditSource
+    tags: tuple[CaptionTagValue, ...]
+    updated_at: datetime

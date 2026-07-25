@@ -65,7 +65,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0004_phase2b_perceptual_similarity"
+            "0005_phase3_tagging_caption"
         )
 
 
@@ -96,6 +96,34 @@ def test_phase2a_migration_downgrade_removes_only_inspection_table(
     engine = create_engine_for_settings(settings)
     assert "image_inspection_results" not in inspect(engine).get_table_names()
     assert "image_assets" in inspect(engine).get_table_names()
+
+
+def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
+    test_workspace: Path,
+) -> None:
+    settings = migrate(test_workspace)
+    config = Config(str(Path("alembic.ini").resolve()))
+    old_path = os.environ.get("RUNPOD_LORA_STUDIO_DATABASE_PATH")
+    os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = str(settings.database_path)
+    get_settings.cache_clear()
+    try:
+        command.downgrade(config, "0004_phase2b_perceptual_similarity")
+        tables_after_downgrade = set(
+            inspect(create_engine_for_settings(settings)).get_table_names()
+        )
+        assert "tagger_runs" not in tables_after_downgrade
+        assert "similarity_groups" in tables_after_downgrade
+        command.upgrade(config, "head")
+    finally:
+        get_settings.cache_clear()
+        if old_path is None:
+            os.environ.pop("RUNPOD_LORA_STUDIO_DATABASE_PATH", None)
+        else:
+            os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
+    with create_engine_for_settings(settings).connect() as connection:
+        assert MigrationContext.configure(connection).get_current_revision() == (
+            "0005_phase3_tagging_caption"
+        )
 
 
 def test_foreign_keys_are_enabled_and_reject_orphans(test_workspace: Path) -> None:

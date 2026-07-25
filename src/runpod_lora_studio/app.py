@@ -17,8 +17,10 @@ from runpod_lora_studio.services.project_service import ProjectService
 from runpod_lora_studio.services.similarity_detection_service import (
     SimilarityDetectionService,
 )
+from runpod_lora_studio.services.tagging_service import TaggingService
 from runpod_lora_studio.ui.phase1 import build_image_tab, build_project_tab
 from runpod_lora_studio.ui.similarity import build_similarity_tab
+from runpod_lora_studio.ui.tagging import build_tagging_tab
 
 
 def build_status_markdown(settings: AppSettings, report: EnvironmentReport) -> str:
@@ -79,6 +81,7 @@ def create_app(
     projects = project_service or ProjectService(runtime_settings)
     images = image_service or ImageService(runtime_settings, projects)
     similarity = SimilarityDetectionService(runtime_settings, projects, images=images)
+    tagging = TaggingService(runtime_settings, projects)
     path_rows = build_paths_dataframe(runtime_settings)
 
     with gr.Blocks(title=runtime_settings.app_title) as demo:
@@ -108,9 +111,11 @@ def create_app(
             build_image_tab(images, selected_project, project_table, image_refresh)
         with gr.Tab("近似重複"):
             build_similarity_tab(similarity, selected_project, image_refresh)
+        with gr.Tab("タグ付け・キャプション"):
+            build_tagging_tab(tagging, selected_project, image_refresh)
         gr.Markdown(
-            "Phase 2BのpHash近似重複検出・類似グループ比較UIまで実装済みです。"
-            "CLIP類似判定、タグ付け、学習機能は未実装です。"
+            "Phase 3のpHash近似重複検出、タグ付け、キャプション編集まで実装済みです。"
+            "CLIP類似判定、学習、データセット生成、成果物同期は後続Phaseの対象です。"
         )
 
     return cast(gr.Blocks, demo)

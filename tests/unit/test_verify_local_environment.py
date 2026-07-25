@@ -145,7 +145,7 @@ def test_migration_check_requires_current_to_equal_head(test_workspace: Path) ->
     check = _check_migration(settings)
 
     assert check.ok
-    assert "current=0004_phase2b_perceptual_similarity" in check.detail
+    assert "current=0005_phase3_tagging_caption" in check.detail
 
 
 def test_migration_check_rejects_unmigrated_database(test_workspace: Path) -> None:
