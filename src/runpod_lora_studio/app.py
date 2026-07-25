@@ -12,12 +12,14 @@ from runpod_lora_studio.config.settings import (
 )
 from runpod_lora_studio.environment import EnvironmentReport, collect_environment_report
 from runpod_lora_studio.logging.config import configure_logging
+from runpod_lora_studio.services.dataset_snapshot_service import DatasetSnapshotService
 from runpod_lora_studio.services.image_service import ImageService
 from runpod_lora_studio.services.project_service import ProjectService
 from runpod_lora_studio.services.similarity_detection_service import (
     SimilarityDetectionService,
 )
 from runpod_lora_studio.services.tagging_service import TaggingService
+from runpod_lora_studio.ui.dataset import build_dataset_tab
 from runpod_lora_studio.ui.phase1 import build_image_tab, build_project_tab
 from runpod_lora_studio.ui.similarity import build_similarity_tab
 from runpod_lora_studio.ui.tagging import build_tagging_tab
@@ -82,6 +84,7 @@ def create_app(
     images = image_service or ImageService(runtime_settings, projects)
     similarity = SimilarityDetectionService(runtime_settings, projects, images=images)
     tagging = TaggingService(runtime_settings, projects)
+    datasets = DatasetSnapshotService(runtime_settings, projects)
     path_rows = build_paths_dataframe(runtime_settings)
 
     with gr.Blocks(title=runtime_settings.app_title) as demo:
@@ -113,9 +116,11 @@ def create_app(
             build_similarity_tab(similarity, selected_project, image_refresh)
         with gr.Tab("タグ付け・キャプション"):
             build_tagging_tab(tagging, selected_project, image_refresh)
+        with gr.Tab("データセット"):
+            build_dataset_tab(datasets, selected_project)
         gr.Markdown(
-            "Phase 3のpHash近似重複検出、タグ付け、キャプション編集まで実装済みです。"
-            "CLIP類似判定、学習、データセット生成、成果物同期は後続Phaseの対象です。"
+            "Phase 4のデータセットスナップショット生成まで実装済みです。"
+            "学習実行、成果物同期、RunPod制御は後続Phaseの対象です。"
         )
 
     return cast(gr.Blocks, demo)

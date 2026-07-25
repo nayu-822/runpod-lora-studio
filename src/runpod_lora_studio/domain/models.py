@@ -401,3 +401,195 @@ class StoredCaption:
     edit_source: CaptionEditSource
     tags: tuple[CaptionTagValue, ...]
     updated_at: datetime
+
+
+class DatasetSnapshotStatus(StrEnum):
+    DRAFT = "draft"
+    VALIDATING = "validating"
+    CREATING = "creating"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELED = "canceled"
+    CORRUPTED = "corrupted"
+
+
+class DatasetIssueSeverity(StrEnum):
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+
+class DatasetIssueCategory(StrEnum):
+    FILE = "file"
+    CAPTION = "caption"
+    DUPLICATE = "duplicate"
+    QUALITY = "quality"
+    DISTRIBUTION = "distribution"
+    TRIGGER = "trigger"
+    CONFIGURATION = "configuration"
+    STORAGE = "storage"
+    INTEGRITY = "integrity"
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetSettings:
+    resolution: int = 1024
+    enable_bucket: bool = True
+    min_bucket_reso: int = 256
+    max_bucket_reso: int = 2048
+    bucket_reso_steps: int = 64
+    bucket_no_upscale: bool = True
+    caption_extension: str = ".txt"
+    shuffle_caption: bool = True
+    keep_tokens: int = 0
+    caption_separator: str = ", "
+    flip_aug: bool = False
+    color_aug: bool = False
+    random_crop: bool = False
+    face_crop_aug_range: tuple[float, float] | None = None
+    debug_dataset: bool = False
+    class_tokens: str = ""
+    is_reg: bool = False
+    num_repeats: int = 1
+    allow_empty_caption: bool = False
+    warning_confirmation_required: bool = True
+    schema_version: str = "phase4-dataset-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetValidationIssue:
+    issue_code: str
+    severity: DatasetIssueSeverity
+    category: DatasetIssueCategory
+    message: str
+    image_id: UUID | None = None
+    measured_value: str | None = None
+    threshold_value: str | None = None
+    details: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetPreviewImage:
+    image_id: UUID
+    original_filename: str
+    source_image_path: Path
+    width: int
+    height: int
+    aspect_ratio: float
+    file_size: int
+    source_sha256: str
+    mime_type: str
+    selection_state: SelectionState
+    caption_id: UUID | None
+    caption_revision: int | None
+    caption_text: str
+    caption_sha256: str
+    tag_count: int
+    trigger_word_count: int
+    quality_status: str
+    exact_duplicate_status: str
+    similarity_group_id: UUID | None
+    is_similarity_representative: bool | None
+    warnings: tuple[DatasetValidationIssue, ...]
+    errors: tuple[DatasetValidationIssue, ...]
+
+    @property
+    def can_include(self) -> bool:
+        return not self.errors
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetPreviewSummary:
+    target_image_count: int
+    caption_present_count: int
+    caption_missing_count: int
+    missing_file_count: int
+    corrupt_file_count: int
+    quality_warning_image_count: int
+    quality_failed_image_count: int
+    exact_duplicate_count: int
+    exact_duplicate_nonrepresentative_count: int
+    approximate_duplicate_count: int
+    approximate_duplicate_nonrepresentative_count: int
+    unreviewed_group_count: int
+    empty_caption_count: int
+    trigger_missing_count: int
+    warning_count: int
+    error_count: int
+    estimated_size_bytes: int
+    available_disk_bytes: int
+    estimated_free_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetPreview:
+    token: str
+    project_id: UUID
+    project_updated_at: datetime
+    project_name: str
+    trigger_words: tuple[str, ...]
+    settings: DatasetSettings
+    images: tuple[DatasetPreviewImage, ...]
+    issues: tuple[DatasetValidationIssue, ...]
+    summary: DatasetPreviewSummary
+    source_tagger_run_ids: tuple[UUID, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetSnapshotSummary:
+    id: UUID
+    project_id: UUID
+    name: str
+    description: str
+    status: DatasetSnapshotStatus
+    target_image_count: int
+    copied_image_count: int
+    failed_image_count: int
+    warning_count: int
+    total_size_bytes: int
+    snapshot_root: Path
+    manifest_sha256: str | None
+    content_sha256: str | None
+    source_tagger_run_id: UUID | None
+    created_at: datetime
+    completed_at: datetime | None
+    error_summary: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetSnapshotItem:
+    snapshot_id: UUID
+    image_id: UUID
+    source_image_path: Path
+    snapshot_image_relative_path: str
+    caption_relative_path: str
+    sequence_number: int
+    source_image_sha256: str
+    snapshot_image_sha256: str
+    source_file_size: int
+    snapshot_file_size: int
+    width: int
+    height: int
+    aspect_ratio: float
+    mime_type: str
+    caption_id: UUID
+    caption_revision: int
+    caption_sha256: str
+    caption_text: str
+    tag_count: int
+    trigger_word_count: int
+    quality_status: str
+    exact_duplicate_status: str
+    similarity_group_id: UUID | None
+    is_similarity_representative: bool | None
+    warnings: tuple[DatasetValidationIssue, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetReport:
+    report_json: dict[str, object]
+    report_markdown: str
+    tag_frequency_csv: str
+    resolution_csv: str
+    aspect_ratio_csv: str
+    warnings_json: str

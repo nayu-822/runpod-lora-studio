@@ -198,3 +198,38 @@ Phase 3では、採用（`accepted`）画像だけを対象にWD Tagger互換の
 TaggerRunの`target_image_count`はRun開始時点で実際に推論する画像数です。既存結果などで対象外になった画像は`skipped_image_count`へ分けて保存し、頻度集計の`used_image_count`は現在acceptedで、該当Runのcompleted結果かつタグが1件以上ある画像数です。partially_failed Runも利用できますが、失敗画像は頻度集計・キャプション生成の対象外です。
 
 Run開始時には採用画像のIDとパスをメモリへ保持して対象集合を固定します。画像本体は一括ロードせず、処理時に1枚ずつ開いて閉じます。現在は数千枚程度を想定しており、将来はRun対象画像テーブルまたはkeyset paginationによるワーカー側ストリーミングへ移行します。Run開始後のSelectionState変更は実行中の対象集合には反映せず、キャプションプレビューでは現在のaccepted集合・状態・キャプションrevisionが変化していれば適用を拒否します。
+
+## Phase 4: 学習用データセットスナップショット
+
+Phase 4では、学習開始前の採用画像とその時点のcurrentキャプションを、後からプロジェクトを編集しても変わらない独立成果物として固定します。スナップショット作成は学習やGoogle Drive同期を開始せず、RunPod内のプロジェクト領域へ保存します。
+
+保存先は次の構成です。画像とキャプションのファイル名は元ファイル名を使わず、決定的な連番と安全な拡張子で生成します。
+
+```text
+projects/{project_id}/dataset_snapshots/{snapshot_id}/
+├── images/000001.png
+├── captions/000001.txt
+├── configs/dataset.toml
+├── reports/dataset_report.json
+├── reports/dataset_report.md
+├── reports/tag_frequency.csv
+├── reports/resolution_distribution.csv
+├── reports/aspect_ratio_distribution.csv
+├── reports/warnings.json
+├── manifest.json
+└── snapshot.json
+```
+
+プレビューではaccepted画像、SelectionState、原画像のSHA-256とファイルサイズ、currentキャプションのID・revision・本文ハッシュ、元TaggerRun、トリガーワード、DatasetSettings、生成器バージョンを署名します。適用時にDBから同じ集合を再取得し、いずれかが変わっていれば「プレビューの有効期限が切れています。再生成してください。」として書き込みを開始しません。対象画像はacceptedのみです。
+
+currentキャプションがない、原画像がない・読めない、DB保存ハッシュまたはサイズと一致しない、設定・TOML・コピー後ハッシュ・manifest・最終検証に失敗した場合は必須エラーとして作成を停止します。品質検査、完全重複、pHash近似重複、トリガーワード不足、空ではないが構造化タグがない状態は警告として表示し、警告確認を明示した場合だけ作成できます。品質・重複警告だけで自動的に画像を除外しません。
+
+キャプションファイルはUTF-8（BOMなし）、LF改行、末尾改行1つへ正規化します。TOMLはSDXL向けのresolution、bucket、caption、augmentation、repeats設定を生成し、`tomllib`で再パースしてから保存します。既定値はresolution 1024、min/max bucket 256/2048、steps 64、num_repeats 1、caption extension `.txt`です。`DatasetConfigService`は範囲、整列、拡張子、制御文字、空subset、極端なrepeatsを検査します。
+
+`manifest.json`には画像・キャプションの対応、元／スナップショットのハッシュ、サイズ、解像度、タグ数、トリガーワード数、品質・重複状態、警告、設定、TOMLハッシュを記録します。`content_sha256`は連番・画像ハッシュ・キャプションハッシュの順序付き集合から計算します。レポートには解像度・縦横比、画像単位重複率と近似重複率、画像単位タグ頻度、トリガーワード付与率、空キャプション数、警告を出力します。同一キャプション内のタグ重複は1回として集計します。
+
+DBには`dataset_snapshots`、`dataset_snapshot_items`、`dataset_validation_issues`、`snapshot_creation_jobs`を追加し、Alembic 0006で作成します。状態は`draft`、`validating`、`creating`、`completed`、`failed`、`canceled`、`corrupted`です。作成中は`{snapshot_id}.creating`へ書き込み、全ファイル・TOML・manifest・レポート・ハッシュ検証完了後に同一プロジェクト内へatomic renameし、DBをcompletedへ更新します。コピーは画像単位でキャンセルを確認し、再起動時にvalidating/creatingのstale行はfailedへ復旧します。再検証で破損を検出した場合はcorruptedへ変更しますが、スナップショットや原画像を削除しません。
+
+現在のUIはプレビュー、警告確認付き作成、一覧、再検証を提供します。作成完了後に原画像・キャプション・SelectionStateを変更してもスナップショットは変化しません。スナップショットは将来のPhase 5/6で学習入力と同期対象として利用しますが、Phase 4単体では学習実行、成果物同期、削除機能は提供しません。
+
+画像本体は一括読込せず1枚ずつコピー・ハッシュ検証します。現在はプレビューのaccepted画像についてIDとパス、キャプションメタデータをメモリへ保持する方式で、想定上限は数千枚程度です。将来はスナップショット対象テーブルのkeyset paginationとストリーミング作成へ移行し、アプリ再起動後も対象集合をDBから再現できるようにします。

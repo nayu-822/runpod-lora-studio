@@ -455,6 +455,165 @@ class CaptionEditHistoryRecord(Base):
     )
 
 
+class DatasetSnapshotRecord(Base):
+    __tablename__ = "dataset_snapshots"
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    snapshot_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    generator_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_project_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_tagger_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("tagger_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    source_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    target_image_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    copied_image_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    failed_image_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    warning_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    snapshot_root: Mapped[str] = mapped_column(Text, nullable=False)
+    dataset_toml_path: Mapped[str] = mapped_column(Text, nullable=False)
+    manifest_path: Mapped[str] = mapped_column(Text, nullable=False)
+    report_path: Mapped[str] = mapped_column(Text, nullable=False)
+    manifest_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    dataset_toml_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    settings_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    validation_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    items: Mapped[list[DatasetSnapshotItemRecord]] = relationship(
+        back_populates="snapshot", cascade="all, delete-orphan"
+    )
+    issues: Mapped[list[DatasetValidationIssueRecord]] = relationship(
+        back_populates="snapshot", cascade="all, delete-orphan"
+    )
+    jobs: Mapped[list[SnapshotCreationJobRecord]] = relationship(
+        back_populates="snapshot", cascade="all, delete-orphan"
+    )
+
+
+class DatasetSnapshotItemRecord(Base):
+    __tablename__ = "dataset_snapshot_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_id", "image_id", name="uq_dataset_snapshot_item_image"
+        ),
+        UniqueConstraint(
+            "snapshot_id", "sequence_number", name="uq_dataset_snapshot_item_seq"
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    snapshot_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("dataset_snapshots.id", ondelete="CASCADE"), index=True
+    )
+    image_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("image_assets.id", ondelete="RESTRICT"), index=True
+    )
+    source_image_path: Mapped[str] = mapped_column(Text, nullable=False)
+    snapshot_image_relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    caption_relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_image_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    snapshot_image_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_file_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    snapshot_file_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    width: Mapped[int] = mapped_column(Integer, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, nullable=False)
+    aspect_ratio: Mapped[float] = mapped_column(Float, nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    caption_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    caption_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    caption_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    caption_text: Mapped[str] = mapped_column(Text, nullable=False)
+    tag_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    trigger_word_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    quality_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    exact_duplicate_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    similarity_group_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    is_similarity_representative: Mapped[bool | None] = mapped_column(
+        Integer, nullable=True
+    )
+    warnings_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    snapshot: Mapped[DatasetSnapshotRecord] = relationship(back_populates="items")
+
+
+class DatasetValidationIssueRecord(Base):
+    __tablename__ = "dataset_validation_issues"
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    snapshot_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("dataset_snapshots.id", ondelete="CASCADE"), index=True
+    )
+    image_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("image_assets.id", ondelete="SET NULL"), nullable=True
+    )
+    issue_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    category: Mapped[str] = mapped_column(String(24), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    measured_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    threshold_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    details: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    snapshot: Mapped[DatasetSnapshotRecord] = relationship(back_populates="issues")
+
+
+class SnapshotCreationJobRecord(Base):
+    __tablename__ = "snapshot_creation_jobs"
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    snapshot_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("dataset_snapshots.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    cancel_requested: Mapped[bool] = mapped_column(Integer, nullable=False)
+    current_step: Mapped[str] = mapped_column(String(64), nullable=False)
+    processed_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    current_image_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    snapshot: Mapped[DatasetSnapshotRecord] = relationship(back_populates="jobs")
+
+
 # Short compatibility name for service and test code.
 InspectionResultRecord = ImageInspectionResultRecord
 

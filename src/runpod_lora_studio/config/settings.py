@@ -81,6 +81,17 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     tagger_allow_model_download: bool = False
     tagger_caption_page_size: int = Field(default=20, ge=1, le=100)
 
+    # Phase 4 dataset snapshot defaults.
+    dataset_snapshot_page_size: int = Field(default=20, ge=1, le=100)
+    dataset_snapshot_copy_batch_size: int = Field(default=20, ge=1, le=500)
+    dataset_snapshot_generator_version: str = "phase4-snapshot-v1"
+    dataset_default_resolution: int = Field(default=1024, ge=64, le=8192)
+    dataset_default_min_bucket_reso: int = Field(default=256, ge=1, le=8192)
+    dataset_default_max_bucket_reso: int = Field(default=2048, ge=1, le=16384)
+    dataset_default_bucket_reso_steps: int = Field(default=64, ge=1, le=2048)
+    dataset_default_num_repeats: int = Field(default=1, ge=1, le=10000)
+    dataset_allow_empty_caption: bool = False
+
     runpod_pod_id: str | None = Field(default=None, validation_alias="RUNPOD_POD_ID")
     # Tokens and credentials added later must use SecretStr and repr=False as well.
     runpod_api_key: SecretStr | None = Field(
