@@ -6,6 +6,8 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -81,6 +83,8 @@ class StorageService:
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="storage")
         self._futures: dict[UUID, Future[Any]] = {}
         self._cancel_tokens: dict[UUID, CancelToken] = {}
+        self._worker_ids: dict[UUID, str] = {}
+        self._heartbeat_stops: dict[UUID, threading.Event] = {}
         self._sleeper = sleeper
 
     @property
@@ -199,6 +203,7 @@ class StorageService:
                         record,
                         local_path=str(destination),
                         local_size_bytes=destination.stat().st_size,
+                        local_sha256=_sha256_file(destination),
                         status=ManagedModelStatus.AVAILABLE.value,
                         verified_at=datetime.now(UTC),
                         downloaded_at=record.downloaded_at or datetime.now(UTC),
@@ -307,6 +312,16 @@ class StorageService:
     def verify_model(self, model_id: UUID) -> bool:
         model = self.get_model(model_id)
         if model.local_path is None or not model.local_path.is_file():
+            with self.session_factory() as session:
+                record = StorageRepository(session).get_model(model_id)
+                if record is not None:
+                    StorageRepository(session).update_model(
+                        record,
+                        status=ManagedModelStatus.VERIFICATION_FAILED.value,
+                        verified_at=None,
+                        error_summary="ローカルモデルが見つかりません",
+                    )
+                    session.commit()
             return False
         try:
             remote = self._refresh_model(model)
@@ -377,18 +392,16 @@ class StorageService:
         )
         files = self._snapshot_files(root)
         remote_entries = self._remote_entries(target)
-        remote_content, has_remote_manifest, manifest_hashes = (
+        remote_content, has_remote_manifest, _manifest_hashes = (
             self._remote_snapshot_content(target, remote_entries)
         )
         items: list[TransferItemPlan] = []
-        for relative, path, size, digest in files:
+        for relative, path, size, _digest in files:
             remote = remote_entries.get(relative)
             action = "copy"
             reason = ""
             if remote is not None:
-                identical = _remote_file_identical(
-                    remote, relative, path, digest, manifest_hashes
-                )
+                identical = _remote_file_identical(remote, path)
                 if policy is OverwritePolicy.FAIL_IF_EXISTS:
                     action, reason = "conflict", "remoteに同名ファイルがあります"
                 elif identical:
@@ -400,8 +413,10 @@ class StorageService:
                 elif policy is OverwritePolicy.SKIP_IDENTICAL:
                     action, reason = "conflict", "remote内容を同一と確認できません"
             items.append(TransferItemPlan(relative, size, action, reason))
-        if remote_entries and (
-            not has_remote_manifest or remote_content != record.content_sha256
+        if (
+            remote_entries
+            and has_remote_manifest
+            and remote_content != record.content_sha256
         ):
             items = [
                 TransferItemPlan(
@@ -479,6 +494,7 @@ class StorageService:
         token = cancel_token or CancelToken()
         self._cancel_tokens[job_id] = token
         manifest_items: list[dict[str, Any]] = []
+        verification_phase = 0
         try:
             self._set_job_running(job_id)
             for index, (relative, path, size, digest) in enumerate(files, start=1):
@@ -498,18 +514,23 @@ class StorageService:
                     )
                     if action == "skip":
                         item_record.status = TransferStatus.COMPLETED.value
-                        item_record.verification_status = "size_and_manifest"
+                        item_record.verification_status = "remote_hash_and_size"
                         item_record.transferred_size = size
                         session.commit()
                         manifest_items.append(
                             self._manifest_item(
-                                relative, size, digest, "skipped", "size_and_manifest"
+                                relative,
+                                size,
+                                digest,
+                                "skipped",
+                                "remote_hash_and_size",
                             )
                         )
                         self._update_job(
-                            job_id, index, succeeded=0, skipped=1, transferred=size
+                            job_id, index, succeeded=0, skipped=1, transferred=0
                         )
                         continue
+                self._set_current_file(job_id, size)
                 result = self.adapter.copy(
                     path,
                     target.child(relative),
@@ -546,16 +567,41 @@ class StorageService:
                     )
                     raise UserFacingError("スナップショットの転送に失敗しました")
                 self._update_transfer_item(
-                    job_id, relative, size, "completed", "size_and_manifest"
+                    job_id, relative, size, "completed", "not_verified"
                 )
                 manifest_items.append(
                     self._manifest_item(
-                        relative, size, digest, "completed", "size_and_manifest"
+                        relative, size, digest, "completed", "not_verified"
                     )
                 )
-                self._update_job(
-                    job_id, index, succeeded=1, skipped=0, transferred=size
+                self._complete_current_file(job_id, size)
+                self._update_job(job_id, index, succeeded=1, skipped=0, transferred=0)
+            verification_phase = 1
+            verification_statuses = self._remote_verification_statuses(
+                target, files, project_settings.verification_policy
+            )
+            verified_entries = self._remote_entries(target)
+            for item in manifest_items:
+                verification = verification_statuses[item["relative_path"]]
+                item["verification_status"] = verification
+                remote_entry = verified_entries.get(item["relative_path"])
+                if remote_entry is not None:
+                    item["remote_hash_type"] = remote_entry.hash_type
+                    item["remote_hash"] = remote_entry.hash_value
+                    item["remote_size"] = remote_entry.size_bytes
+                    item["remote_modified_at"] = (
+                        remote_entry.modified_at.isoformat()
+                        if remote_entry.modified_at is not None
+                        else None
+                    )
+                self._update_transfer_item(
+                    job_id,
+                    item["relative_path"],
+                    int(item["size"]),
+                    str(item["transfer_status"]),
+                    verification,
                 )
+            verification_phase = 0
             manifest = self._write_transfer_manifest(
                 job_id,
                 StorageTransferType.SNAPSHOT_UPLOAD,
@@ -576,6 +622,7 @@ class StorageService:
             )
             if manifest_result.returncode != 0:
                 raise UserFacingError("転送結果マニフェストの転送に失敗しました")
+            verification_phase = 2
             self._verify_remote_snapshot(
                 target,
                 files,
@@ -588,6 +635,16 @@ class StorageService:
             status = (
                 TransferStatus.CANCELED if token.cancelled else TransferStatus.FAILED
             )
+            if verification_phase:
+                for item in manifest_items:
+                    item["verification_status"] = "verification_failed"
+                    self._update_transfer_item(
+                        job_id,
+                        item["relative_path"],
+                        int(item["size"]),
+                        str(item["transfer_status"]),
+                        "verification_failed",
+                    )
             manifest = None
             if manifest_items:
                 manifest = self._write_transfer_manifest(
@@ -666,10 +723,26 @@ class StorageService:
                     seconds=self.settings.storage_job_stale_after_seconds
                 )
                 for record in records:
+                    job_id = UUID(record.id)
                     heartbeat = record.heartbeat_at
                     if heartbeat is not None and heartbeat.tzinfo is None:
                         heartbeat = heartbeat.replace(tzinfo=UTC)
                     if heartbeat is not None and heartbeat >= cutoff:
+                        continue
+                    future = self._futures.get(job_id)
+                    worker_matches = (
+                        record.worker_id is not None
+                        and self._worker_ids.get(job_id) == record.worker_id
+                    )
+                    future_running = future is not None and not future.done()
+                    process_running = (
+                        record.pid is not None
+                        and _pid_exists(record.pid)
+                        and _is_expected_rclone_process(
+                            record.pid, self.settings.rclone_executable
+                        )
+                    )
+                    if process_running or (worker_matches and future_running):
                         continue
                     record.status = TransferStatus.STALE.value
                     record.current_step = "stale"
@@ -678,6 +751,9 @@ class StorageService:
                     )
                     record.completed_at = datetime.now(UTC)
                     record.pid = None
+                    stop = self._heartbeat_stops.pop(job_id, None)
+                    if stop is not None:
+                        stop.set()
                     record.heartbeat_at = datetime.now(UTC)
                     record.updated_at = datetime.now(UTC)
                     count += 1
@@ -731,6 +807,7 @@ class StorageService:
         part_root = self.transfer_root / str(job_id)
         part_root.mkdir(parents=True, exist_ok=True)
         part = part_root / f"{destination.name}.part"
+        self._set_current_file(job_id, entry.size_bytes)
         attempts = max(1, self.settings.rclone_retries + 1)
         last_error = "モデル転送に失敗しました"
         for attempt in range(1, attempts + 1):
@@ -817,9 +894,8 @@ class StorageService:
                         backup.replace(destination)
                     raise
                 backup.unlink(missing_ok=True)
-                self._update_job(
-                    job_id, 1, succeeded=1, skipped=0, transferred=entry.size_bytes
-                )
+                self._complete_current_file(job_id, entry.size_bytes)
+                self._update_job(job_id, 1, succeeded=1, skipped=0, transferred=0)
                 self._finish_job(job_id, TransferStatus.COMPLETED, None)
                 shutil.rmtree(part_root, ignore_errors=True)
                 return
@@ -838,6 +914,7 @@ class StorageService:
                 max(0, attempt - 1),
                 classification,
                 delay if attempt < attempts else 0.0,
+                result.returncode,
             )
             if (
                 not _retryable(result.stderr, timed_out=result.timed_out)
@@ -985,27 +1062,39 @@ class StorageService:
         verification_policy: VerificationPolicy,
     ) -> None:
         entries = self._remote_entries(target)
-        _content, has_manifest, manifest_hashes = self._remote_snapshot_content(
+        _content, has_manifest, _manifest_hashes = self._remote_snapshot_content(
             target, entries
         )
         if not has_manifest:
             raise UserFacingError("転送結果マニフェストをremoteで確認できません")
-        for relative, path, size, digest in files:
-            entry = entries.get(relative)
-            if entry is None:
-                raise UserFacingError("転送後のremoteファイル検証に失敗しました")
-            if verification_policy is not VerificationPolicy.EXISTENCE_ONLY:
-                if entry.size_bytes != size:
-                    raise UserFacingError("転送後のremoteファイル検証に失敗しました")
-            if verification_policy is not VerificationPolicy.EXISTENCE_ONLY:
-                verified = _remote_file_identical(
-                    entry, relative, path, digest, manifest_hashes
-                )
-                if not verified:
-                    raise UserFacingError("転送後のremoteハッシュ検証に失敗しました")
+        self._remote_verification_statuses(target, files, verification_policy)
         content, _has_manifest, _hashes = self._remote_snapshot_content(target, entries)
         if content != expected_content_sha256:
             raise UserFacingError("snapshot content SHA-256が一致しません")
+
+    def _remote_verification_statuses(
+        self,
+        target: StorageRemotePath,
+        files: list[tuple[str, Path, int, str]],
+        verification_policy: VerificationPolicy,
+    ) -> dict[str, str]:
+        entries = self._remote_entries(target)
+        statuses: dict[str, str] = {}
+        for relative, path, size, _digest in files:
+            entry = entries.get(relative)
+            if entry is None:
+                raise UserFacingError("転送後のremoteファイル検証に失敗しました")
+            if verification_policy is VerificationPolicy.EXISTENCE_ONLY:
+                statuses[relative] = "existence_only"
+                continue
+            if entry.size_bytes != size:
+                raise UserFacingError("転送後のremoteファイル検証に失敗しました")
+            if not entry.hash_type or not entry.hash_value:
+                raise UserFacingError("remoteハッシュを取得できないため検証できません")
+            if not _remote_file_identical(entry, path):
+                raise UserFacingError("転送後のremoteハッシュ検証に失敗しました")
+            statuses[relative] = "remote_hash_and_size"
+        return statuses
 
     def _snapshot_remote_path(
         self, project_id: UUID, snapshot_id: UUID, value: ProjectStorageSettings
@@ -1062,10 +1151,6 @@ class StorageService:
     def _local_matches(
         self, path: Path, entry: StorageEntry, model: ManagedModel
     ) -> bool:
-        if not self._saved_local_matches(model, path):
-            return False
-        if path.stat().st_size != entry.size_bytes:
-            return False
         if (
             model.remote_name != entry.remote_path.remote_name
             or model.remote_relative_path != entry.remote_path.relative_path
@@ -1075,10 +1160,20 @@ class StorageService:
             or model.remote_hash_value != entry.hash_value
         ):
             return False
-        return (
-            not entry.hash_type
-            or not entry.hash_value
-            or _hash_matches(path, entry.hash_type, entry.hash_value)
+        if path.stat().st_size != entry.size_bytes:
+            return False
+        if model.local_sha256 is not None:
+            if _sha256_file(path) != model.local_sha256:
+                return False
+            return (
+                not entry.hash_type
+                or not entry.hash_value
+                or _hash_matches(path, entry.hash_type, entry.hash_value)
+            )
+        return bool(
+            entry.hash_type
+            and entry.hash_value
+            and _hash_matches(path, entry.hash_type, entry.hash_value)
         )
 
     def _model_plan_token(self, entry: StorageEntry, destination: Path) -> str:
@@ -1147,6 +1242,9 @@ class StorageService:
             "rclone_checkers": self.settings.rclone_checkers,
             "rclone_retries": self.settings.rclone_retries,
             "rclone_low_level_retries": self.settings.rclone_low_level_retries,
+            "retry_max_backoff_seconds": (
+                self.settings.storage_retry_max_backoff_seconds
+            ),
             "rclone_use_checksum": self.settings.storage_use_checksum,
             "verification_policy": self.settings.storage_verification_policy.value,
             "overwrite_policy": policy.value,
@@ -1163,17 +1261,56 @@ class StorageService:
         }
 
     def _set_job_running(self, job_id: UUID) -> None:
+        worker_id = str(uuid4())
+        self._worker_ids[job_id] = worker_id
+        stop = threading.Event()
+        old_stop = self._heartbeat_stops.pop(job_id, None)
+        if old_stop is not None:
+            old_stop.set()
+        self._heartbeat_stops[job_id] = stop
         with self.session_factory() as session:
             record = StorageRepository(session).get_job(job_id)
             if record is not None:
                 record.status = TransferStatus.RUNNING.value
                 record.current_step = "transferring"
                 record.started_at = datetime.now(UTC)
-                record.worker_id = str(uuid4())
+                record.worker_id = worker_id
                 record.heartbeat_at = datetime.now(UTC)
                 record.pid = None
                 record.updated_at = datetime.now(UTC)
                 session.commit()
+        threading.Thread(
+            target=self._heartbeat_loop,
+            args=(job_id, worker_id, stop),
+            name=f"storage-heartbeat-{job_id}",
+            daemon=True,
+        ).start()
+
+    def _heartbeat_loop(
+        self, job_id: UUID, worker_id: str, stop: threading.Event
+    ) -> None:
+        interval = min(
+            self.settings.transfer_progress_interval_seconds,
+            max(0.2, self.settings.storage_job_stale_after_seconds / 3),
+        )
+        while not stop.wait(interval):
+            self._touch_heartbeat(job_id, worker_id)
+
+    def _touch_heartbeat(self, job_id: UUID, worker_id: str) -> None:
+        with self.session_factory() as session:
+            record = StorageRepository(session).get_job(job_id)
+            if (
+                record is None
+                or record.status != TransferStatus.RUNNING.value
+                or record.worker_id != worker_id
+            ):
+                stop = self._heartbeat_stops.pop(job_id, None)
+                if stop is not None:
+                    stop.set()
+                return
+            record.heartbeat_at = datetime.now(UTC)
+            record.updated_at = datetime.now(UTC)
+            session.commit()
 
     def _set_rclone_pid(self, job_id: UUID, pid: int | None) -> None:
         with self.session_factory() as session:
@@ -1197,8 +1334,37 @@ class StorageService:
         with self.session_factory() as session:
             record = StorageRepository(session).get_job(job_id)
             if record is not None:
-                record.transferred_bytes = progress.bytes_transferred
+                record.current_file_transferred_bytes = max(
+                    record.current_file_transferred_bytes,
+                    progress.bytes_transferred,
+                )
+                record.transferred_bytes = (
+                    record.completed_transferred_bytes
+                    + record.current_file_transferred_bytes
+                )
                 record.current_step = progress.current_path or "transferring"
+                record.heartbeat_at = datetime.now(UTC)
+                record.updated_at = datetime.now(UTC)
+                session.commit()
+
+    def _set_current_file(self, job_id: UUID, total_bytes: int) -> None:
+        del total_bytes
+        with self.session_factory() as session:
+            record = StorageRepository(session).get_job(job_id)
+            if record is not None:
+                record.current_file_transferred_bytes = 0
+                record.transferred_bytes = record.completed_transferred_bytes
+                record.heartbeat_at = datetime.now(UTC)
+                record.updated_at = datetime.now(UTC)
+                session.commit()
+
+    def _complete_current_file(self, job_id: UUID, size: int) -> None:
+        with self.session_factory() as session:
+            record = StorageRepository(session).get_job(job_id)
+            if record is not None:
+                record.completed_transferred_bytes += size
+                record.current_file_transferred_bytes = 0
+                record.transferred_bytes = record.completed_transferred_bytes
                 record.heartbeat_at = datetime.now(UTC)
                 record.updated_at = datetime.now(UTC)
                 session.commit()
@@ -1220,7 +1386,10 @@ class StorageService:
                 record.succeeded_item_count += succeeded
                 record.failed_item_count += failed
                 record.skipped_item_count += skipped
-                record.transferred_bytes += transferred
+                record.transferred_bytes = (
+                    record.completed_transferred_bytes
+                    + record.current_file_transferred_bytes
+                )
                 record.updated_at = datetime.now(UTC)
                 session.commit()
 
@@ -1232,6 +1401,7 @@ class StorageService:
         retry_count: int,
         classification: str | None,
         backoff_seconds: float = 0.0,
+        exit_code: int | None = None,
     ) -> None:
         with self.session_factory() as session:
             transfer = session.scalar(
@@ -1240,8 +1410,11 @@ class StorageService:
                 )
             )
             if transfer is not None:
+                transfer.status = TransferStatus.RUNNING.value
                 transfer.attempt_count = attempt
                 transfer.retry_count = retry_count
+                if exit_code is not None:
+                    transfer.rclone_exit_code = exit_code
                 transfer.started_at = transfer.started_at or datetime.now(UTC)
                 if classification:
                     transfer.error_summary = (
@@ -1288,6 +1461,10 @@ class StorageService:
         manifest: Path | None,
         error: str | None = None,
     ) -> None:
+        self._worker_ids.pop(job_id, None)
+        stop = self._heartbeat_stops.pop(job_id, None)
+        if stop is not None:
+            stop.set()
         with self.session_factory() as session:
             record = StorageRepository(session).get_job(job_id)
             if record is not None:
@@ -1352,7 +1529,11 @@ class StorageService:
             sum(item["transfer_status"] == "completed" for item in items),
             sum(item["transfer_status"] == "failed" for item in items),
             sum(item["transfer_status"] == "skipped" for item in items),
-            sum(int(item["size"]) for item in items),
+            sum(
+                int(item["size"])
+                for item in items
+                if item["transfer_status"] != "skipped"
+            ),
             sum(
                 int(item["size"])
                 for item in items
@@ -1381,6 +1562,8 @@ class StorageService:
             "local_sha256": digest,
             "remote_hash_type": None,
             "remote_hash": None,
+            "remote_size": None,
+            "remote_modified_at": None,
             "transfer_status": status,
             "verification_status": verification,
             "retry_count": 0,
@@ -1455,20 +1638,14 @@ def _remote_signature(entry: StorageEntry) -> tuple[object, ...]:
 
 def _remote_file_identical(
     entry: StorageEntry,
-    relative: str,
     local_path: Path,
-    local_sha256: str,
-    manifest_hashes: dict[str, str],
 ) -> bool:
-    if entry.hash_type and entry.hash_value:
-        algorithm = entry.hash_type.casefold().replace("-", "")
-        if algorithm in hashlib.algorithms_available:
-            return _hash_matches(local_path, entry.hash_type, entry.hash_value)
-    manifest_hash = manifest_hashes.get(relative)
-    return (
-        manifest_hash is not None
-        and manifest_hash.casefold() == local_sha256.casefold()
-    )
+    if not entry.hash_type or not entry.hash_value:
+        return False
+    algorithm = entry.hash_type.casefold().replace("-", "")
+    if algorithm not in hashlib.algorithms_available:
+        return False
+    return _hash_matches(local_path, entry.hash_type, entry.hash_value)
 
 
 def _stable_hash(value: object) -> str:
@@ -1520,3 +1697,34 @@ def _pid_exists(pid: int) -> bool:
     except (OSError, ProcessLookupError):
         return False
     return True
+
+
+def _is_expected_rclone_process(pid: int, executable: str) -> bool:
+    """Return whether ``pid`` still belongs to the configured rclone binary."""
+    if pid <= 0:
+        return False
+    expected = Path(executable).stem.casefold()
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                return False
+            return any(
+                line.split(",", 1)[0].strip('"').casefold() == f"{expected}.exe"
+                or line.split(",", 1)[0].strip('"').casefold() == expected
+                for line in result.stdout.splitlines()
+            )
+        command_line = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="ignore")
+        return any(
+            Path(part).stem.casefold() == expected
+            for part in command_line.split("\0")
+            if part
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False

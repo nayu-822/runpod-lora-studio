@@ -232,12 +232,14 @@ RunPod内だけに一時保存するもの:
 - `rclone copy`の失敗を検知できる
 - `rclone sync`を通常処理で使用しない
 
-Phase 5のレビュー対応を完了し、完了扱いへ更新する。Alembic 0007でモデル、モデル転送、汎用ストレージ転送ジョブ、転送項目、プロジェクト別保存設定を追加した。rcloneは引数配列・`shell=False`で実行し、設定ファイルをログへ出力しない。モデル取得はサイズ・SHA-256検証付きの`.part`コピー、既存キャッシュ再利用、失敗時の再試行を行う。
+Phase 5のレビュー対応を完了し、完了扱いへ更新する。Alembic 0007でモデル、モデル転送、汎用ストレージ転送ジョブ、転送項目、プロジェクト別保存設定を追加し、0008でworker heartbeatとrclone子PID、0009で累積転送進捗を追加した。rcloneは引数配列・`shell=False`で実行し、設定ファイルをログへ出力しない。モデル取得は保存済みSHA-256、remote識別情報、転送前後remote情報を検証し、安全な置換・ロールバックと指数バックオフを行う。
 
 - completedスナップショットのみを再検証してGoogle Driveへ転送する
 - 転送前ドライランと`fail_if_exists`／`skip_identical`／`copy_missing`／`overwrite_changed`の衝突規則を提供する
 - 転送後にファイルサイズ、manifest、設定、snapshot content hashを検証する
-- 成功・失敗・スキップ件数、進捗、キャンセル要求、stale状態をDBへ保存する
+- `skip_identical`はremoteの比較可能なハッシュとサイズが一致した場合だけ適用し、古いmanifestのlocal SHA-256だけではスキップしない
+- 成功・失敗・スキップ件数、完了済み／現在ファイルの累積進捗、キャンセル要求、stale状態をDBへ保存する。スキップは転送バイト数へ含めない
+- rclone子PID、worker ID、Future状態をheartbeatと併せて確認し、実行中のrcloneをstaleにしない。workerは進捗出力とは独立した定期heartbeatを送る
 - 通常処理で`rclone sync`を使わず、remoteの無関係なファイルを削除しない
 - rclone.conf、remote名、相対パス、モデル拡張子、サイズ上限を検証する
 
@@ -246,7 +248,7 @@ Phase 5のレビュー対応を完了し、完了扱いへ更新する。Alembic
 - Google Driveから許可されたモデルを一覧・検索し、ローカルへ安全に取得・再利用・再検証できる
 - completedスナップショットをドライラン、衝突判定、転送、manifest検証付きで保存できる
 - 転送をキャンセル・再試行でき、再起動後に実行中プロセスの不在をstaleとして検出できる
-- 0007を空DBおよび0006適用済みDBへ適用でき、既存Phase 4スナップショットを変更しない
+- 0009を空DB、0006適用済みDB、0007／0008適用済みDBへ適用でき、既存モデル・スナップショット・転送ジョブを変更しない
 
 ## Phase 6: SDXL LoRA学習実行
 

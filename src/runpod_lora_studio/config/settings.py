@@ -122,7 +122,7 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     storage_use_checksum: bool = True
     storage_remote_hash_fallback: Literal[
         "size_and_manifest", "existence_only", "error"
-    ] = "size_and_manifest"
+    ] = "error"
     storage_dry_run_default: bool = True
     storage_overwrite_policy: OverwritePolicy = OverwritePolicy.SKIP_IDENTICAL
     storage_verification_policy: VerificationPolicy = (

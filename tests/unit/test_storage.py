@@ -1,18 +1,25 @@
 from __future__ import annotations
 
-from pathlib import Path
+import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from uuid import UUID
 
 import pytest
 
 from runpod_lora_studio.config.settings import AppSettings, ensure_runtime_directories
 from runpod_lora_studio.domain.storage_models import (
+    OverwritePolicy,
+    StorageEntry,
+    StorageKind,
     StorageRemotePath,
     StorageTransferType,
-    StorageKind,
+    TransferProgress,
     TransferStatus,
 )
 from runpod_lora_studio.external.fake_storage import FakeStorageTransferAdapter
+from runpod_lora_studio.external.rclone import CancelToken, ListOptions
 from runpod_lora_studio.persistence.database import create_engine_for_settings
 from runpod_lora_studio.persistence.models import Base
 from runpod_lora_studio.persistence.storage_repository import StorageRepository
@@ -22,8 +29,20 @@ from runpod_lora_studio.services.project_service import (
     ProjectService,
     UserFacingError,
 )
-from runpod_lora_studio.services.storage_service import StorageService
-from runpod_lora_studio.services.storage_service import _error_classification
+from runpod_lora_studio.services.storage_service import (
+    StorageService,
+    _error_classification,
+)
+
+
+class NoHashFakeAdapter(FakeStorageTransferAdapter):
+    def list_entries(
+        self, remote_path: StorageRemotePath, options: ListOptions
+    ) -> tuple[StorageEntry, ...]:
+        return tuple(
+            replace(entry, hash_type=None, hash_value=None)
+            for entry in super().list_entries(remote_path, options)
+        )
 
 
 class MutatingFakeAdapter(FakeStorageTransferAdapter):
@@ -131,6 +150,8 @@ def test_remote_change_during_copy_preserves_existing_model(
     model = service.list_models()[0]
     service.download_model(model.id)
     before = service.get_model(model.id).local_path.read_bytes()  # type: ignore[union-attr]
+    adapter.files["lora-studio/models/sdxl-base.safetensors"] = b"new-content"
+    adapter._modified_at = datetime.now(UTC) + timedelta(seconds=1)
     adapter.mutate_after_copy = True
 
     with pytest.raises(UserFacingError, match="remoteモデルが変更されました"):
@@ -143,7 +164,7 @@ def test_remote_change_during_copy_preserves_existing_model(
     )
 
 
-def test_missing_saved_sha256_forces_a_new_download(
+def test_missing_saved_sha256_is_fully_verified_and_saved(
     test_workspace: Path,
 ) -> None:
     settings = _settings(test_workspace)
@@ -162,7 +183,7 @@ def test_missing_saved_sha256_forces_a_new_download(
 
     service.download_model(model.id)
 
-    assert len(adapter.copy_calls) == calls + 1
+    assert len(adapter.copy_calls) == calls
     assert service.get_model(model.id).local_sha256 is not None
 
 
@@ -178,6 +199,23 @@ def test_missing_saved_sha256_forces_a_new_download(
 )
 def test_retry_error_classification(message: str, classification: str) -> None:
     assert _error_classification(message) == classification
+
+
+def test_retry_backoff_uses_injected_sleeper_and_cancellation(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace)
+    delays: list[float] = []
+    service = StorageService(
+        settings,
+        adapter=FakeStorageTransferAdapter(),
+        sleeper=delays.append,
+    )
+    token = CancelToken()
+
+    service._sleep_before_retry(2.5, token)
+
+    assert delays == [2.5]
 
 
 def test_stale_running_job_is_recovered_idempotently(test_workspace: Path) -> None:
@@ -200,6 +238,75 @@ def test_stale_running_job_is_recovered_idempotently(test_workspace: Path) -> No
     assert service.recover_stale_jobs() == 1
     assert service.recover_stale_jobs() == 0
     assert service.list_jobs()[0].status is TransferStatus.STALE
+
+
+def test_live_rclone_process_is_not_recovered_as_stale(
+    test_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(test_workspace)
+    service = StorageService(settings, adapter=FakeStorageTransferAdapter())
+    with service.session_factory() as session:
+        job = StorageRepository(session).create_job(
+            project_id=None,
+            snapshot_id=None,
+            transfer_type=StorageTransferType.MODEL_DOWNLOAD,
+            source_kind=StorageKind.REMOTE,
+            destination_kind=StorageKind.LOCAL,
+            item_count=1,
+            total_bytes=1,
+        )
+        job.status = TransferStatus.RUNNING.value
+        job.pid = 1234
+        job.heartbeat_at = datetime.now(UTC) - timedelta(seconds=600)
+        session.commit()
+    monkeypatch.setattr(
+        "runpod_lora_studio.services.storage_service._pid_exists", lambda _pid: True
+    )
+    monkeypatch.setattr(
+        "runpod_lora_studio.services.storage_service._is_expected_rclone_process",
+        lambda _pid, _executable: True,
+    )
+
+    assert service.recover_stale_jobs() == 0
+    assert service.list_jobs()[0].status is TransferStatus.RUNNING
+
+    monkeypatch.setattr(
+        "runpod_lora_studio.services.storage_service._is_expected_rclone_process",
+        lambda _pid, _executable: False,
+    )
+    assert service.recover_stale_jobs() == 1
+    assert service.list_jobs()[0].status is TransferStatus.STALE
+
+
+def test_transfer_progress_is_cumulative_and_monotonic(test_workspace: Path) -> None:
+    settings = _settings(test_workspace)
+    service = StorageService(settings, adapter=FakeStorageTransferAdapter())
+    with service.session_factory() as session:
+        job = StorageRepository(session).create_job(
+            project_id=None,
+            snapshot_id=None,
+            transfer_type=StorageTransferType.MODEL_DOWNLOAD,
+            source_kind=StorageKind.REMOTE,
+            destination_kind=StorageKind.LOCAL,
+            item_count=2,
+            total_bytes=12,
+        )
+        session.commit()
+        job_id = UUID(job.id)
+    service._set_job_running(job_id)
+    service._set_current_file(job_id, 10)
+    service._progress_job(job_id, TransferProgress(4, 10, 1, "first"))
+    service._progress_job(job_id, TransferProgress(3, 10, 1, "first"))
+    first = service.list_jobs()[0]
+    assert first.transferred_bytes == 4
+    service._complete_current_file(job_id, 10)
+    service._set_current_file(job_id, 2)
+    service._progress_job(job_id, TransferProgress(2, 2, 1, "second"))
+    second = service.list_jobs()[0]
+    assert second.transferred_bytes == 12
+    assert second.completed_transferred_bytes == 10
+    assert second.current_file_transferred_bytes == 2
+    service._finish_job(job_id, TransferStatus.CANCELED, None)
 
 
 @pytest.mark.parametrize(
@@ -275,3 +382,115 @@ def test_completed_snapshot_upload_is_verified_and_manifested(
     adapter.files[content_key] = b"x" * len(original)
     changed_plan = service.dry_run_snapshot_upload(snapshot.id)
     assert changed_plan.conflict_count > 0
+    assert service.dry_run_snapshot_upload(
+        snapshot.id, overwrite_policy=OverwritePolicy.FAIL_IF_EXISTS
+    ).conflict_count == len(changed_plan.items)
+    assert (
+        service.dry_run_snapshot_upload(
+            snapshot.id, overwrite_policy=OverwritePolicy.COPY_MISSING
+        ).conflict_count
+        > 0
+    )
+    assert (
+        service.dry_run_snapshot_upload(
+            snapshot.id, overwrite_policy=OverwritePolicy.OVERWRITE_CHANGED
+        ).copy_count
+        > 0
+    )
+
+
+def test_old_manifest_sha256_does_not_allow_skip_without_remote_hash(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace)
+    projects = ProjectService(settings)
+    project = projects.create(ProjectInput("no-hash"))
+    from PIL import Image
+
+    source = test_workspace / "source.png"
+    Image.new("RGB", (64, 64), "blue").save(source)
+    from runpod_lora_studio.domain.models import SelectionState
+    from runpod_lora_studio.services.caption_service import CaptionEditingService
+    from runpod_lora_studio.services.image_service import ImageService
+
+    image = (
+        ImageService(settings, projects)
+        .register_uploads(project.id, [source])
+        .successes[0]
+    )
+    ImageService(settings, projects).change_state(
+        project.id, [image.id], SelectionState.ACCEPTED
+    )
+    CaptionEditingService(settings, projects).save_image_caption(
+        project.id, image.id, "blue"
+    )
+    datasets = DatasetSnapshotService(settings, projects)
+    snapshot = datasets.create_snapshot_sync(
+        datasets.preview(project.id), name="no-hash"
+    )
+    adapter = FakeStorageTransferAdapter()
+    service = StorageService(settings, adapter=adapter, datasets=datasets)
+    service.upload_snapshot(snapshot.id)
+    no_hash_adapter = NoHashFakeAdapter()
+    no_hash_adapter.files = adapter.files.copy()
+    service.adapter = no_hash_adapter
+    remote_root = (
+        service.dry_run_snapshot_upload(snapshot.id)
+        .destination.removeprefix("gdrive:")
+        .strip("/")
+    )
+    content_key = next(
+        key
+        for key in no_hash_adapter.files
+        if key.startswith(remote_root + "/")
+        and not key.endswith("transfer-manifest.json")
+    )
+    no_hash_adapter.files[content_key] = b"z" * len(no_hash_adapter.files[content_key])
+
+    plan = service.dry_run_snapshot_upload(snapshot.id)
+    assert plan.skip_count == 0
+    assert plan.conflict_count == len(plan.items)
+
+
+def test_transfer_manifest_contains_remote_metadata_and_verification(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace)
+    projects = ProjectService(settings)
+    project = projects.create(ProjectInput("manifest-fields"))
+    from PIL import Image
+
+    source = test_workspace / "source.png"
+    Image.new("RGB", (64, 64), "green").save(source)
+    from runpod_lora_studio.domain.models import SelectionState
+    from runpod_lora_studio.services.caption_service import CaptionEditingService
+    from runpod_lora_studio.services.image_service import ImageService
+
+    image = (
+        ImageService(settings, projects)
+        .register_uploads(project.id, [source])
+        .successes[0]
+    )
+    ImageService(settings, projects).change_state(
+        project.id, [image.id], SelectionState.ACCEPTED
+    )
+    CaptionEditingService(settings, projects).save_image_caption(
+        project.id, image.id, "green"
+    )
+    datasets = DatasetSnapshotService(settings, projects)
+    snapshot = datasets.create_snapshot_sync(
+        datasets.preview(project.id), name="manifest-fields"
+    )
+    adapter = FakeStorageTransferAdapter()
+    service = StorageService(settings, adapter=adapter, datasets=datasets)
+    service.upload_snapshot(snapshot.id)
+    manifest_key = next(
+        key for key in adapter.files if key.endswith("transfer-manifest.json")
+    )
+    payload = json.loads(adapter.files[manifest_key])
+    item = payload["items"][0]
+    assert item["remote_hash_type"] == "md5"
+    assert item["remote_hash"]
+    assert item["remote_size"] == item["size"]
+    assert item["remote_modified_at"]
+    assert item["verification_status"] == "remote_hash_and_size"

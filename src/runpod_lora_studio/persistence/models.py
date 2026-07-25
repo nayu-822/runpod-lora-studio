@@ -726,6 +726,12 @@ class StorageTransferJobRecord(Base):
     skipped_item_count: Mapped[int] = mapped_column(Integer, nullable=False)
     total_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     transferred_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed_transferred_bytes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    current_file_transferred_bytes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
     cancel_requested: Mapped[bool] = mapped_column(Integer, nullable=False)
     pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(64), nullable=True)

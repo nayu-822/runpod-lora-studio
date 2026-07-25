@@ -240,10 +240,12 @@ DBには`dataset_snapshots`、`dataset_snapshot_items`、`dataset_validation_iss
 
 Phase 5では、rcloneを介してGoogle Driveのモデルを一覧表示し、RunPodのローカルキャッシュへ検証付きで取得できます。モデル一覧は許可拡張子、サイズ上限、ページング、検索条件で絞り込み、既存キャッシュはサイズとSHA-256が一致する場合に再利用します。取得中は固定バッファで`.part`へ保存し、サイズ・ハッシュ検証後に確定名へatomic renameします。
 
+再取得では転送前後のremote名、相対パス、サイズ、更新日時、hash type、hash valueを比較します。転送中にremoteが変化した場合は`verification_failed`として拒否し、既存の正常モデルを維持します。既存モデルを置き換える場合も一時バックアップを作成し、DB commit失敗時は旧ファイルへ復元します。
+
 `rclone.conf`はGitへ保存せず、`RUNPOD_LORA_STUDIO_RCLONE_CONFIG_PATH`で指定します。起動時またはUIから、実行ファイル、設定ファイル、remote、接続、ローカルキャッシュ、転送一時領域を検証します。remote名と相対パスは`..`、絶対パス、制御文字、別remote指定を拒否します。
 
-スナップショットは`completed`かつ再検証に成功したものだけを対象にします。既定の保存先は`<remote>:lora-studio/projects/<project_id>/snapshots/<snapshot_id>/`です。転送前にドライランを実行し、remote上の同名内容、manifest、snapshot `content_sha256`、設定、ポリシーを確認します。衝突ポリシーは`fail_if_exists`、`skip_identical`、`copy_missing`、`overwrite_changed`から選択でき、既定値は安全側の`skip_identical`です。変更されたremote内容に検証可能なmanifestがない場合は自動上書きせず衝突として扱います。
+スナップショットは`completed`かつ再検証に成功したものだけを対象にします。既定の保存先は`<remote>:lora-studio/projects/<project_id>/snapshots/<snapshot_id>/`です。転送前にドライランを実行し、remote上の同名内容、manifest、snapshot `content_sha256`、設定、ポリシーを確認します。衝突ポリシーは`fail_if_exists`、`skip_identical`、`copy_missing`、`overwrite_changed`から選択でき、既定値は安全側の`skip_identical`です。remote hashが取得できない場合の既定方針は`error`で、古いmanifestのlocal SHA-256だけではskip_identicalと判定せず、衝突またはコピー扱いにします。限定的なremoteメタデータ比較を選ぶ場合も完全な内容検証ではありません。
 
-転送後は各ファイルの存在・サイズと`transfer-manifest.json`を検証し、ローカルmanifestへ成功・失敗・スキップ件数、サイズ、ハッシュ、rcloneバージョン、設定スナップショットを記録します。進捗、キャンセル、再試行、アプリ再起動後のstale検出をDBへ保存します。DBトランザクションは短く保ち、画像やモデル全体をbytesへ展開しません。
+転送後はverification levelに応じて各ファイルの存在・サイズ、remote hash、必須manifest、snapshot content hashを検証し、ローカルmanifestへ成功・失敗・スキップ件数、サイズ、ハッシュ、remoteメタデータ、rcloneバージョン、設定スナップショットを記録します。`remote_hash_and_size`はremote hashとサイズの一致、`manifest_metadata_and_size`はmanifestメタデータとサイズ、`existence_only`は存在のみ、`not_verified`は未検証、`verification_failed`は検証失敗を表します。古いtransfer-manifest.jsonのlocal SHA-256だけではremote実体の同一性を確認できないため、skip_identicalや転送後検証の成功には使用しません。進捗は完了済みファイルと現在ファイルを分けた累積値で、スキップは転送バイト数へ含めません。キャンセル、指数バックオフ、rclone子PID、worker ID、heartbeat、アプリ再起動後のstale検出をDBへ保存します。DBトランザクションは短く保ち、画像やモデル全体をbytesへ展開しません。
 
 通常処理では`rclone sync`、remote側の無関係なファイル削除、危険な上書き、秘密情報のログ出力を行いません。Google Drive実通信の手動確認は、rclone設定を配置したRunPodで`rclone version`、`rclone listremotes`、接続確認、モデル一覧、ドライラン、少量のモデル取得、completedスナップショットの転送・再検証の順に実施してください。認証情報がない環境の自動テストはFakeStorageTransferAdapterを使用します。

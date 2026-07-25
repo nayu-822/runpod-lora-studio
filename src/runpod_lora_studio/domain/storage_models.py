@@ -269,6 +269,8 @@ class StorageTransferJob:
     skipped_item_count: int
     total_bytes: int
     transferred_bytes: int
+    completed_transferred_bytes: int
+    current_file_transferred_bytes: int
     cancel_requested: bool
     pid: int | None
     worker_id: str | None
