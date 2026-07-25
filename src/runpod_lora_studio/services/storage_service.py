@@ -580,10 +580,19 @@ class StorageService:
                 )
                 self._complete_current_file(job_id, size)
                 self._update_job(job_id, index, succeeded=1, skipped=0, transferred=0)
-            verification_phase = 1
-            verification_statuses = self._remote_verification_statuses(
-                target, files, project_settings.verification_policy
-            )
+            if (
+                project_settings.verification_policy
+                is VerificationPolicy.SIZE_AND_MANIFEST
+            ):
+                verification_statuses = {
+                    relative: "not_verified"
+                    for relative, _path, _size, _digest in files
+                }
+            else:
+                verification_phase = 1
+                verification_statuses = self._remote_verification_statuses(
+                    target, files, project_settings.verification_policy
+                )
             verified_entries = self._remote_entries(target)
             for item in manifest_items:
                 verification = verification_statuses[item["relative_path"]]
@@ -627,12 +636,47 @@ class StorageService:
             if manifest_result.returncode != 0:
                 raise UserFacingError("転送結果マニフェストの転送に失敗しました")
             verification_phase = 2
-            self._verify_remote_snapshot(
+            verified_statuses = self._verify_remote_snapshot(
                 target,
                 files,
                 record.content_sha256,
                 project_settings.verification_policy,
             )
+            if (
+                project_settings.verification_policy
+                is VerificationPolicy.SIZE_AND_MANIFEST
+            ):
+                for item in manifest_items:
+                    verification = verified_statuses[item["relative_path"]]
+                    item["verification_status"] = verification
+                    self._update_transfer_item(
+                        job_id,
+                        item["relative_path"],
+                        int(item["size"]),
+                        str(item["transfer_status"]),
+                        verification,
+                    )
+                verification_phase = 0
+                manifest = self._write_transfer_manifest(
+                    job_id,
+                    StorageTransferType.SNAPSHOT_UPLOAD,
+                    project_id,
+                    snapshot_id,
+                    target,
+                    manifest_items,
+                    TransferStatus.COMPLETED,
+                    project_settings,
+                    record.content_sha256,
+                )
+                final_manifest_result = self.adapter.copy(
+                    manifest,
+                    target.child("transfer-manifest.json"),
+                    CopyOptions(overwrite_policy=policy, checksum=True),
+                    cancel_token=token,
+                    process_callback=lambda pid: self._set_rclone_pid(job_id, pid),
+                )
+                if final_manifest_result.returncode != 0:
+                    raise UserFacingError("転送マニフェストの確定に失敗しました")
             self._finish_job(job_id, TransferStatus.COMPLETED, manifest)
             return job_id
         except Exception as exc:
@@ -1063,8 +1107,6 @@ class StorageService:
         manifest_item: dict[str, Any] | None,
     ) -> tuple[bool, str]:
         fallback = self.settings.storage_remote_hash_fallback
-        if fallback == "existence_only":
-            return True, "existence_only"
         if fallback == "size_and_manifest":
             return (
                 manifest_item is not None
@@ -1073,23 +1115,36 @@ class StorageService:
             )
         return False, "not_verified"
 
+    def _fallback_verification(
+        self,
+        entry: StorageEntry,
+        local_size: int,
+        manifest_item: dict[str, Any] | None,
+    ) -> tuple[bool, str]:
+        if self.settings.storage_remote_hash_fallback == "existence_only":
+            return True, "existence_only"
+        return self._fallback_identity(entry, local_size, manifest_item)
+
     def _verify_remote_snapshot(
         self,
         target: StorageRemotePath,
         files: list[tuple[str, Path, int, str]],
         expected_content_sha256: str,
         verification_policy: VerificationPolicy,
-    ) -> None:
+    ) -> dict[str, str]:
         entries = self._remote_entries(target)
-        _content, has_manifest, _manifest_hashes = self._remote_snapshot_content(
+        content, has_manifest, _manifest_items = self._remote_snapshot_content(
             target, entries
         )
-        if not has_manifest:
+        if not has_manifest or content is None:
             raise UserFacingError("転送結果マニフェストをremoteで確認できません")
-        self._remote_verification_statuses(target, files, verification_policy)
-        content, _has_manifest, _hashes = self._remote_snapshot_content(target, entries)
+        statuses = self._remote_verification_statuses(
+            target, files, verification_policy, expected_content_sha256
+        )
         if content != expected_content_sha256:
             raise UserFacingError("snapshot content SHA-256が一致しません")
+
+        return statuses
 
     def _legacy_remote_verification_statuses(
         self,
@@ -1120,9 +1175,10 @@ class StorageService:
         target: StorageRemotePath,
         files: list[tuple[str, Path, int, str]],
         verification_policy: VerificationPolicy,
+        expected_content_sha256: str | None = None,
     ) -> dict[str, str]:
         entries = self._remote_entries(target)
-        _content, _has_manifest, manifest_items = self._remote_snapshot_content(
+        content, has_manifest, manifest_items = self._remote_snapshot_content(
             target, entries
         )
         statuses: dict[str, str] = {}
@@ -1135,6 +1191,15 @@ class StorageService:
                 continue
             manifest_item = manifest_items.get(relative)
             if verification_policy is VerificationPolicy.SIZE_AND_MANIFEST:
+                if (
+                    not has_manifest
+                    or content is None
+                    or (
+                        expected_content_sha256 is not None
+                        and content != expected_content_sha256
+                    )
+                ):
+                    raise UserFacingError("有効なtransfer manifestを確認できません")
                 if not self._manifest_metadata_matches(entry, size, manifest_item):
                     raise UserFacingError("remoteメタデータ検証に失敗しました")
                 statuses[relative] = "manifest_metadata_and_size"
@@ -1157,7 +1222,7 @@ class StorageService:
                     raise UserFacingError("remoteハッシュ検証に失敗しました")
                 statuses[relative] = "remote_hash_and_size"
                 continue
-            identical, fallback_status = self._fallback_identity(
+            identical, fallback_status = self._fallback_verification(
                 entry, size, manifest_item
             )
             if not identical:
@@ -1174,7 +1239,7 @@ class StorageService:
         if entry.size_bytes != local_size or entry.modified_at is None:
             return False
         if manifest_item is None:
-            return True
+            return False
         recorded_size = manifest_item.get("remote_size")
         recorded_modified = manifest_item.get("remote_modified_at")
         if recorded_size is None or not recorded_modified:
@@ -1195,12 +1260,16 @@ class StorageService:
             return False
         recorded_hash_type = manifest_item.get("remote_hash_type")
         recorded_hash = manifest_item.get("remote_hash")
-        if entry.hash_type and entry.hash_value:
+        current_hash_type = entry.hash_type
+        current_hash = entry.hash_value
+        if current_hash_type is not None or current_hash is not None:
             return (
                 recorded_hash_type is not None
                 and recorded_hash is not None
-                and str(recorded_hash_type).casefold() == entry.hash_type.casefold()
-                and str(recorded_hash).casefold() == entry.hash_value.casefold()
+                and current_hash_type is not None
+                and current_hash is not None
+                and str(recorded_hash_type).casefold() == current_hash_type.casefold()
+                and str(recorded_hash).casefold() == current_hash.casefold()
             )
         return True
 
@@ -1729,14 +1798,14 @@ def _manifest_verification_level(
         return "verification_failed"
     if "not_verified" in statuses:
         return "not_verified"
+    if "existence_only" in statuses:
+        return VerificationPolicy.EXISTENCE_ONLY
+    if "manifest_metadata_and_size" in statuses:
+        return VerificationPolicy.SIZE_AND_MANIFEST
     if statuses == {"full_checksum"}:
         return VerificationPolicy.FULL_CHECKSUM
     if statuses.issubset({"full_checksum", "remote_hash_and_size"}):
         return VerificationPolicy.REMOTE_HASH_AND_SIZE
-    if "manifest_metadata_and_size" in statuses:
-        return VerificationPolicy.SIZE_AND_MANIFEST
-    if "existence_only" in statuses:
-        return VerificationPolicy.EXISTENCE_ONLY
     return "not_verified"
 
 

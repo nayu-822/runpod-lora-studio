@@ -322,6 +322,73 @@ def test_size_and_manifest_checks_metadata_without_remote_hash(
         )
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "remove_manifest",
+        "remove_item",
+        "remove_size",
+        "remove_modified",
+    ],
+)
+def test_size_and_manifest_requires_complete_manifest_item(
+    test_workspace: Path, mutation: str
+) -> None:
+    service, target, files = _remote_verification_fixture(
+        test_workspace, NoHashFakeAdapter()
+    )
+    adapter = service.adapter
+    if mutation == "remove_manifest":
+        adapter.files.pop("verification/transfer-manifest.json")  # type: ignore[attr-defined]
+    else:
+        payload = json.loads(adapter.files["verification/transfer-manifest.json"])  # type: ignore[attr-defined]
+        item = payload["items"][0]
+        if mutation == "remove_item":
+            payload["items"] = []
+        elif mutation == "remove_size":
+            item.pop("remote_size")
+        else:
+            item.pop("remote_modified_at")
+        adapter.files["verification/transfer-manifest.json"] = json.dumps(
+            payload
+        ).encode()  # type: ignore[attr-defined]
+    with pytest.raises(UserFacingError):
+        service._remote_verification_statuses(
+            target, files, VerificationPolicy.SIZE_AND_MANIFEST
+        )
+
+
+def test_size_and_manifest_requires_matching_hash_metadata_and_content(
+    test_workspace: Path,
+) -> None:
+    service, target, files = _remote_verification_fixture(
+        test_workspace, FakeStorageTransferAdapter()
+    )
+    adapter = service.adapter
+    payload = json.loads(adapter.files["verification/transfer-manifest.json"])  # type: ignore[attr-defined]
+    item = payload["items"][0]
+    item["remote_hash_type"] = "md5"
+    item["remote_hash"] = hashlib.md5(b"abc").hexdigest()
+    adapter.files["verification/transfer-manifest.json"] = json.dumps(payload).encode()  # type: ignore[attr-defined]
+    assert service._remote_verification_statuses(
+        target, files, VerificationPolicy.SIZE_AND_MANIFEST, "content"
+    ) == {"file.bin": "manifest_metadata_and_size"}
+
+    item["remote_hash"] = "0" * 32
+    adapter.files["verification/transfer-manifest.json"] = json.dumps(payload).encode()  # type: ignore[attr-defined]
+    with pytest.raises(UserFacingError):
+        service._remote_verification_statuses(
+            target, files, VerificationPolicy.SIZE_AND_MANIFEST, "content"
+        )
+    item["remote_hash"] = hashlib.md5(b"abc").hexdigest()
+    payload["settings"]["snapshot_content_sha256"] = "other-content"
+    adapter.files["verification/transfer-manifest.json"] = json.dumps(payload).encode()  # type: ignore[attr-defined]
+    with pytest.raises(UserFacingError):
+        service._remote_verification_statuses(
+            target, files, VerificationPolicy.SIZE_AND_MANIFEST, "content"
+        )
+
+
 def test_existence_only_and_remote_hash_fallback_are_explicit(
     test_workspace: Path,
 ) -> None:
@@ -355,6 +422,18 @@ def test_existence_only_and_remote_hash_fallback_are_explicit(
     assert existence_service._remote_verification_statuses(
         existence_target, existence_files, VerificationPolicy.REMOTE_HASH_AND_SIZE
     ) == {"file.bin": "existence_only"}
+    entry = next(
+        entry
+        for entry in existence_service.adapter.list_entries(
+            existence_target, ListOptions(recursive=True)
+        )
+        if entry.remote_path.relative_path.endswith("file.bin")
+    )
+    assert existence_service._fallback_identity(
+        entry,
+        3,
+        {"remote_size": 3, "remote_modified_at": entry.modified_at.isoformat()},
+    ) == (False, "not_verified")
 
 
 @pytest.mark.parametrize(
@@ -371,8 +450,9 @@ def test_existence_only_and_remote_hash_fallback_are_explicit(
         ),
         (
             ["manifest_metadata_and_size", "existence_only"],
-            VerificationPolicy.SIZE_AND_MANIFEST,
+            VerificationPolicy.EXISTENCE_ONLY,
         ),
+        (["full_checksum", "existence_only"], VerificationPolicy.EXISTENCE_ONLY),
         (["existence_only"], VerificationPolicy.EXISTENCE_ONLY),
         (["verification_failed"], "verification_failed"),
         (["not_verified"], "not_verified"),
@@ -608,6 +688,16 @@ def test_old_manifest_sha256_does_not_allow_skip_without_remote_hash(
         service.dry_run_snapshot_upload(snapshot.id)
         .destination.removeprefix("gdrive:")
         .strip("/")
+    )
+    service.settings.storage_remote_hash_fallback = "existence_only"
+    existence_plan = service.dry_run_snapshot_upload(snapshot.id)
+    assert existence_plan.skip_count == 0
+    assert existence_plan.conflict_count == len(existence_plan.items)
+    assert (
+        service.dry_run_snapshot_upload(
+            snapshot.id, overwrite_policy=OverwritePolicy.OVERWRITE_CHANGED
+        ).copy_count
+        > 0
     )
     content_key = next(
         key

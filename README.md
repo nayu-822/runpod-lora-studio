@@ -242,6 +242,8 @@ DBには`dataset_snapshots`、`dataset_snapshot_items`、`dataset_validation_iss
 
 `storage_remote_hash_fallback`は実処理へ反映されます。`error`は失敗、`existence_only`は`existence_only`へ、`size_and_manifest`は`manifest_metadata_and_size`へフォールバックします。設定値はmanifestのsettingsへ、実績は各itemの`verification_status`と全体`verification_level`へ保存します。全体レベルはitem実績から決定し、`not_verified`／`verification_failed`を含むジョブはcompletedにしません。
 
+`size_and_manifest`では有効なtransfer-manifest.jsonと対象itemが必須で、remoteサイズ・更新日時・hashメタデータ・snapshot content SHA-256を照合します。`existence_only`はremote内容の同一性を意味せず、skip_identicalの判定には使用しません。転送後検証でのみ存在確認として成功でき、全体verification levelは最も弱いitemの水準になります。
+
 0009で追加した累積進捗列は既存runningジョブでは0から初期化されます。既存ジョブのheartbeat／PIDは変更せず、再起動時のstale回復対象となった場合は従来どおりstaleへ遷移します。新しい転送は完了済みバイトと現在ファイルバイトを分けて更新します。
 
 ## Phase 5: モデル管理・Google Drive・rclone連携
