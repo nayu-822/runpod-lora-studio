@@ -81,6 +81,11 @@ class StorageTransferAdapter(Protocol):
         self, remote_path: StorageRemotePath, options: ListOptions
     ) -> tuple[StorageEntry, ...]: ...
 
+    def read_remote_file(
+        self,
+        remote_path: StorageRemotePath,
+    ) -> bytes: ...
+
     def dry_run_copy(
         self,
         source: str | Path | StorageRemotePath,

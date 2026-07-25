@@ -38,6 +38,7 @@ class FakeStorageTransferAdapter:
         self.remote_name = remote_name
         self.files = dict(entries or {})
         self.copy_calls: list[tuple[str, str]] = []
+        self.read_remote_file_calls: list[StorageRemotePath] = []
         self._modified_at = datetime.now(UTC)
 
     def validate_environment(self) -> StorageValidationResult:
@@ -188,6 +189,7 @@ class FakeStorageTransferAdapter:
         )
 
     def read_remote_file(self, remote_path: StorageRemotePath) -> bytes:
+        self.read_remote_file_calls.append(remote_path)
         key = remote_path.relative_path.strip("/")
         if key not in self.files:
             raise RuntimeError("missing")

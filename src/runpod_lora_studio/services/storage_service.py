@@ -1096,11 +1096,10 @@ class StorageService:
         manifest_entry = entries.get("transfer-manifest.json")
         if manifest_entry is None:
             return None, False, {}
-        reader = getattr(self.adapter, "read_remote_file", None)
-        if not callable(reader):
-            return None, True, {}
         try:
-            payload = json.loads(reader(target.child("transfer-manifest.json")))
+            payload = json.loads(
+                self.adapter.read_remote_file(target.child("transfer-manifest.json"))
+            )
             settings = payload.get("settings", {})
             value = settings.get("snapshot_content_sha256")
             manifest_items = {
@@ -1177,10 +1176,11 @@ class StorageService:
 
             entries = self._remote_entries(target)
             remote_entry = entries.get("transfer-manifest.json")
-            reader = getattr(self.adapter, "read_remote_file", None)
-            if remote_entry is None or not callable(reader):
+            if remote_entry is None:
                 raise ValueError("remote final manifest is missing")
-            remote_payload = json.loads(reader(target.child("transfer-manifest.json")))
+            remote_payload = json.loads(
+                self.adapter.read_remote_file(target.child("transfer-manifest.json"))
+            )
             if not isinstance(remote_payload, dict):
                 raise ValueError("remote manifest is not an object")
 

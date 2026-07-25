@@ -748,6 +748,7 @@ def test_final_manifest_remote_readback_succeeds(
         content_sha256,
     )
     assert "final-manifest/transfer-manifest.json" in adapter.files
+    assert adapter.read_remote_file_calls == [target.child("transfer-manifest.json")]
 
 
 @pytest.mark.parametrize(
