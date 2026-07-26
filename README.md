@@ -303,9 +303,11 @@ Phase 7Aでは、CUDA/GPU/VRAM、bf16、xformers、bitsandbytes、sd-scriptsの�
 
 ## Phase 7B: 学習実績による推奨補正と履歴比較
 
-Phase 7Bは、完了した学習jobから速度、VRAM使用量、終了理由を収集し、Phase 7Aのルール推奨を補足する決定論的な校正機能です。過去実績だけで設定を決定せず、GPU fingerprint、解像度、precision、optimizer、cache/checkpointingなどが一致する履歴だけを利用します。
+Phase 7Bは、完了した学習jobから速度、VRAM使用量、終了理由を収集し、Phase 7Aのルール推奨を補足する決定論的な校正機能です。過去実績だけで設定を決定せず、GPU fingerprint、VRAMクラス、アーキテクチャ、解像度、batch、gradient accumulation、effective batch、LoRA module/dim/alpha、precision、optimizer、cache/checkpointing、world size、sd-scripts version、xformers可否が一致する履歴だけを利用します。
 
 - 成果は`training_execution_summaries`へジョブ単位で冪等に保存し、OOM・キャンセル・不明失敗は速度校正から除外します。ログ本文や秘密情報は保存せず、許可された証拠コードだけを失敗分類へ記録します。
+- 学習中はheartbeat、進捗、artifact走査とは独立して、既定5秒間隔で`nvidia-smi`を測定します。固定queryでジョブPIDのcompute行だけを対象プロセスとして検証し、PID identityまたはGPU UUIDを確認できない場合はtarget peakを保存せず、全GPUのfree/minimumだけを低信頼で保持します。保存するのは短縮GPU UUID、合計VRAM、開始前・最小free・終了後、target/全GPU/他プロセスpeak、件数・失敗件数・時刻範囲・測定versionです。
 - 校正は`recommendation_calibration_snapshots`と元サマリーの関連テーブルへ保存します。サンプル数、成功数、OOM数、中央値・保守的percentile、信頼度、source fingerprintを表示し、履歴が変化したスナップショットはstaleとして扱います。
-- 時間・VRAMの補正はbaselineを下回る安全性を主張せず、OOM時のbatch低下は提案として表示します。校正の再構築や再収集だけで学習を開始することはありません。UIから履歴の更新、performance再収集、校正再構築を実行できます。
+- メモリ校正はtarget peak、2点以上のサンプル、identity検証、正のcoverage、他プロセス影響50%以下を必須とします。OOMのbatch低下はGPU/VRAMクラス、解像度、batch、gradient accumulation、optimizer、precision、cache/checkpointing、LoRA module/dimが一致するmedium以上の履歴だけで提案し、異なるdimやbatchの履歴では増加も低下も行いません。
+- summary内容fingerprintと校正状態fingerprintを分離し、include/exclude、理由、再分類、force recollect、メモリ集約更新は関連snapshotだけをstaleにします。適用直前にもsnapshotのstaleと推奨設定・現在GPUの互換性を再検証します。校正の再構築や再収集だけで学習を開始することはありません。UIから履歴の更新、performance再収集、校正再構築を実行できます。
 - `failed`、`canceled`、`stale`のいずれでもPID、process group、process identity、worker情報、heartbeatを確認し、終了を確証できないjobは再開しません。プロセスのkillは行いません。

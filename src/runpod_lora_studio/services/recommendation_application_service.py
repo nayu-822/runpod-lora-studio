@@ -32,6 +32,7 @@ from runpod_lora_studio.services.environment_diagnostic_service import (
     ComputeEnvironmentService,
     TrainingEnvironmentService,
 )
+from runpod_lora_studio.services.gpu_memory_metrics import gpu_uuid_fingerprint
 from runpod_lora_studio.services.recommendation_calibration_service import (
     TrainingCalibrationService,
 )
@@ -119,6 +120,9 @@ class RecommendationApplicationService:
         if input_fingerprint_value != request.input_fingerprint:
             raise RecommendationStaleError("recommendation input fingerprint changed")
         current_data, snapshot_repeats = self._current_input(request, base)
+        self._validate_calibration(
+            request, recommendation, base=base, current_data=current_data
+        )
         current_fingerprint = input_fingerprint(
             current_data, engine_version=request.engine_version
         )
@@ -205,6 +209,9 @@ class RecommendationApplicationService:
         self,
         request: RecommendationRequest,
         recommendation: TrainingRecommendation,
+        *,
+        base: TrainingConfigInput | None = None,
+        current_data: RecommendationInput | None = None,
     ) -> None:
         if recommendation.calibration_snapshot_id is None:
             return
@@ -212,6 +219,64 @@ class RecommendationApplicationService:
             recommendation.calibration_snapshot_id, request.project_id
         ):
             raise RecommendationStaleError("calibration snapshot changed or is stale")
+        snapshot = self.calibration_service.get(recommendation.calibration_snapshot_id)
+        if snapshot is None:
+            raise RecommendationStaleError("calibration snapshot is unavailable")
+        pairs = (
+            (snapshot.resolution, recommendation.resolution),
+            (snapshot.batch_size, recommendation.batch_size),
+            (snapshot.network_module, recommendation.network_module),
+            (snapshot.network_dim, recommendation.network_dim),
+            (snapshot.network_alpha, recommendation.network_alpha),
+            (snapshot.optimizer, recommendation.optimizer),
+            (snapshot.mixed_precision, recommendation.mixed_precision),
+            (snapshot.cache_latents, recommendation.cache_latents),
+            (snapshot.gradient_checkpointing, recommendation.gradient_checkpointing),
+        )
+        if any(
+            expected is not None and expected != actual for expected, actual in pairs
+        ):
+            raise RecommendationStaleError(
+                "calibration snapshot is incompatible with recommendation"
+            )
+        if base is not None:
+            base_pairs = (
+                (snapshot.resolution, base.resolution),
+                (snapshot.batch_size, base.batch_size),
+                (snapshot.network_module, base.network_module),
+                (snapshot.network_dim, base.network_dim),
+                (snapshot.network_alpha, base.network_alpha),
+                (snapshot.optimizer, base.optimizer),
+                (snapshot.mixed_precision, base.mixed_precision),
+                (snapshot.cache_latents, base.cache_latents),
+                (snapshot.gradient_checkpointing, base.gradient_checkpointing),
+            )
+            if any(
+                expected is not None and expected != actual
+                for expected, actual in base_pairs
+            ):
+                raise RecommendationStaleError(
+                    "calibration snapshot is incompatible with applied config"
+                )
+        if current_data is not None:
+            gpu = (
+                current_data.environment.gpu_devices[0]
+                if current_data.environment.gpu_devices
+                else None
+            )
+            current_gpu = gpu_uuid_fingerprint(gpu.uuid) if gpu and gpu.uuid else None
+            if current_gpu != snapshot.gpu_identity_fingerprint:
+                raise RecommendationStaleError(
+                    "calibration snapshot does not match current GPU"
+                )
+            if (
+                snapshot.gpu_total_vram_class is not None
+                and gpu is not None
+                and _vram_class(gpu.total_vram_bytes) != snapshot.gpu_total_vram_class
+            ):
+                raise RecommendationStaleError(
+                    "calibration snapshot does not match current VRAM class"
+                )
 
     @staticmethod
     def _validate_risk(warnings: tuple[RecommendationWarning, ...]) -> None:
@@ -253,3 +318,7 @@ def _change_diff(
         name: {"recommended": recommended, "applied": actual}
         for name, (recommended, actual) in pairs.items()
     }
+
+
+def _vram_class(value: int | None) -> str | None:
+    return f"{round(value / 1024**3)}GiB" if value and value > 0 else None

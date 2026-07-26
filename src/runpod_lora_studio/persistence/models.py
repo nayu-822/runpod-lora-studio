@@ -1056,6 +1056,8 @@ class TrainingExecutionSummaryRecord(Base):
     gpu_identity_fingerprint: Mapped[str | None] = mapped_column(
         String(128), nullable=True
     )
+    gpu_architecture: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    gpu_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     gpu_total_vram_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dataset_scale_fingerprint: Mapped[str | None] = mapped_column(
         String(64), nullable=True
@@ -1075,6 +1077,9 @@ class TrainingExecutionSummaryRecord(Base):
     mixed_precision: Mapped[str | None] = mapped_column(String(16), nullable=True)
     cache_latents: Mapped[bool | None] = mapped_column(Integer, nullable=True)
     gradient_checkpointing: Mapped[bool | None] = mapped_column(Integer, nullable=True)
+    world_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sd_scripts_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    xformers_available: Mapped[bool | None] = mapped_column(Integer, nullable=True)
     total_epochs: Mapped[int | None] = mapped_column(Integer, nullable=True)
     planned_total_steps: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completed_steps: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -1093,9 +1098,35 @@ class TrainingExecutionSummaryRecord(Base):
     peak_reserved_vram_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     free_vram_before_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     free_vram_after_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    minimum_free_vram_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    whole_gpu_peak_used_vram_bytes: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    other_process_peak_vram_bytes: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
     memory_sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    memory_failed_sample_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
     memory_confidence: Mapped[str] = mapped_column(
         String(16), nullable=False, default="none"
+    )
+    memory_first_sampled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    memory_last_sampled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    memory_coverage_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    process_identity_verified: Mapped[bool] = mapped_column(
+        Integer, nullable=False, default=False
+    )
+    gpu_identity_verified: Mapped[bool] = mapped_column(
+        Integer, nullable=False, default=False
+    )
+    measurement_version: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="phase7b-memory-v1"
     )
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     oom_detected: Mapped[bool] = mapped_column(Integer, nullable=False, default=False)
@@ -1119,9 +1150,71 @@ class TrainingExecutionSummaryRecord(Base):
     )
     manual_exclusion_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     collector_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    classifier_version: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="phase7b-failure-v1"
+    )
     summary_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    summary_content_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=""
+    )
+    calibration_state_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=""
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class TrainingMemoryAggregateRecord(Base):
+    __tablename__ = "training_memory_aggregates"
+    __table_args__ = (
+        UniqueConstraint("training_job_id", name="uq_training_memory_aggregate_job"),
+        Index("ix_training_memory_aggregates_job", "training_job_id"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    training_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("training_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    gpu_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gpu_uuid_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    gpu_total_vram_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    free_vram_before_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    minimum_free_vram_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    free_vram_after_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    target_process_peak_used_bytes: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    whole_gpu_peak_used_bytes: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    other_process_peak_used_bytes: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    first_sampled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_sampled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    process_identity_verified: Mapped[bool] = mapped_column(
+        Integer, nullable=False, default=False
+    )
+    gpu_identity_verified: Mapped[bool] = mapped_column(
+        Integer, nullable=False, default=False
+    )
+    confidence: Mapped[str] = mapped_column(String(16), nullable=False, default="none")
+    last_sample_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    measurement_version: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="phase7b-memory-v1"
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
@@ -1145,7 +1238,19 @@ class RecommendationCalibrationSnapshotRecord(Base):
     )
     gpu_identity_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
     gpu_total_vram_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    gpu_architecture: Mapped[str | None] = mapped_column(String(128), nullable=True)
     resolution: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    batch_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gradient_accumulation_steps: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    effective_batch_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    network_module: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    network_dim: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    network_alpha: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    world_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sd_scripts_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    xformers_available: Mapped[bool | None] = mapped_column(Integer, nullable=True)
     optimizer: Mapped[str | None] = mapped_column(String(128), nullable=True)
     mixed_precision: Mapped[str | None] = mapped_column(String(16), nullable=True)
     cache_latents: Mapped[bool | None] = mapped_column(Integer, nullable=True)

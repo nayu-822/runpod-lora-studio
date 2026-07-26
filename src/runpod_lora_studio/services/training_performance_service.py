@@ -22,9 +22,12 @@ from runpod_lora_studio.domain.training_performance_models import (
 from runpod_lora_studio.persistence.database import create_session_factory
 from runpod_lora_studio.persistence.models import (
     ComputeEnvironmentSnapshotRecord,
+    RecommendationCalibrationSnapshotRecord,
+    RecommendationCalibrationSourceRecord,
     TrainingConfigRecord,
     TrainingExecutionSummaryRecord,
     TrainingJobRecord,
+    TrainingMemoryAggregateRecord,
     TrainingMetricPointRecord,
     TrainingProgressRecord,
     TrainingRecommendationRecord,
@@ -33,7 +36,7 @@ from runpod_lora_studio.persistence.models import (
 from runpod_lora_studio.persistence.training_repository import utc_now
 from runpod_lora_studio.services.gpu_memory_metrics import (
     GpuMemoryMetricsAdapter,
-    summarize_gpu_memory,
+    gpu_uuid_fingerprint,
 )
 from runpod_lora_studio.services.training_failure_classifier import (
     TrainingFailureClassifier,
@@ -126,8 +129,16 @@ class TrainingPerformanceCollector:
                     if isinstance(parsed_payload, dict):
                         environment_payload = parsed_payload
             metadata = _read_metadata(job.runtime_directory)
-            gpu_fingerprint, gpu_total = _gpu_identity(metadata, environment_payload)
-            memory = self._memory_summary(job.pid)
+            gpu_fingerprint, gpu_total, gpu_architecture, gpu_index = _gpu_identity(
+                metadata, environment_payload
+            )
+            memory = _memory_summary_from_record(
+                session.scalar(
+                    select(TrainingMemoryAggregateRecord).where(
+                        TrainingMemoryAggregateRecord.training_job_id == str(job_id)
+                    )
+                )
+            )
             stdout = _read_tail(
                 job.stdout_log_path, self.settings.training_log_tail_bytes
             )
@@ -178,8 +189,14 @@ class TrainingPerformanceCollector:
             )
             usable_memory = (
                 gpu_fingerprint is not None
+                and memory.target_peak_allocated_bytes is not None
+                and memory.process_identity_verified
+                and memory.gpu_identity_verified
                 and memory.sample_count >= 2
-                and memory.confidence is not CalibrationConfidence.NONE
+                and memory.confidence
+                in {CalibrationConfidence.MEDIUM, CalibrationConfidence.HIGH}
+                and memory.coverage_seconds is not None
+                and memory.coverage_seconds > 0
                 and (
                     memory.other_process_ratio is None
                     or memory.other_process_ratio <= 0.5
@@ -192,6 +209,8 @@ class TrainingPerformanceCollector:
                 metadata=metadata,
                 gpu_fingerprint=gpu_fingerprint,
                 gpu_total=gpu_total,
+                gpu_architecture=gpu_architecture,
+                gpu_index=gpu_index,
                 memory=memory,
                 completed_steps=completed_steps,
                 planned_steps=planned_steps,
@@ -205,6 +224,7 @@ class TrainingPerformanceCollector:
                 settings_fingerprint=settings_fingerprint,
                 recommendation_id=recommendation_id,
                 environment_snapshot_id=environment_snapshot_id,
+                classifier_version=classification.classifier_version,
                 now=utc_now(),
             )
             if existing is None:
@@ -215,17 +235,9 @@ class TrainingPerformanceCollector:
                 )
                 for key, value in _record_values(summary).items():
                     setattr(existing, key, value)
+                _mark_related_calibrations_stale(session, existing.id)
             session.commit()
             return summary
-
-    def _memory_summary(self, pid: int | None) -> GpuMemorySummary:
-        if self.memory_adapter is None:
-            return GpuMemorySummary()
-        try:
-            return summarize_gpu_memory(self.memory_adapter.collect(pid=pid))
-        except Exception:
-            logger.exception("training_memory_collection_failed")
-            return GpuMemorySummary()
 
 
 # The longer name is part of the Phase 7B service contract.
@@ -240,6 +252,8 @@ def _make_summary(
     metadata: dict[str, object],
     gpu_fingerprint: str | None,
     gpu_total: int | None,
+    gpu_architecture: str | None,
+    gpu_index: int | None,
     memory: GpuMemorySummary,
     completed_steps: int | None,
     planned_steps: int | None,
@@ -253,11 +267,13 @@ def _make_summary(
     settings_fingerprint: str,
     recommendation_id: UUID | None,
     environment_snapshot_id: UUID | None,
+    classifier_version: str,
     now: datetime,
 ) -> TrainingExecutionSummary:
     effective_batch = _int_option(
         config.extra_options, "gradient_accumulation_steps", 1
     )
+    world_size = _int_option(config.extra_options, "world_size", 1)
     dataset_fingerprint = _text_option(metadata, "source_dataset_content_sha256")
     speed = median(speed_values) if speed_values else None
     images_per_second = speed * effective_batch if speed is not None else None
@@ -269,6 +285,8 @@ def _make_summary(
         "managed_model_id": UUID(job.managed_model_id),
         "job_result_status": job.status,
         "gpu_identity_fingerprint": gpu_fingerprint,
+        "gpu_architecture": gpu_architecture,
+        "gpu_index": gpu_index,
         "settings_fingerprint": settings_fingerprint,
         "recommendation_id": recommendation_id,
         "environment_snapshot_id": environment_snapshot_id,
@@ -286,6 +304,9 @@ def _make_summary(
         "mixed_precision": config.mixed_precision,
         "cache_latents": bool(config.cache_latents),
         "gradient_checkpointing": bool(config.gradient_checkpointing),
+        "world_size": world_size,
+        "sd_scripts_version": _text_option(metadata, "sd_scripts_version"),
+        "xformers_available": _bool_option(metadata, "xformers_available"),
         "total_epochs": progress.total_epochs if progress else config.epochs,
         "planned_total_steps": planned_steps,
         "completed_steps": completed_steps,
@@ -299,7 +320,17 @@ def _make_summary(
         "free_vram_before_bytes": memory.free_before_bytes,
         "free_vram_after_bytes": memory.free_after_bytes,
         "memory_sample_count": memory.sample_count,
+        "memory_failed_sample_count": memory.failed_sample_count,
         "memory_confidence": memory.confidence,
+        "minimum_free_vram_bytes": memory.whole_gpu_min_free_bytes,
+        "whole_gpu_peak_used_vram_bytes": memory.whole_gpu_peak_used_bytes,
+        "other_process_peak_vram_bytes": memory.other_process_peak_used_bytes,
+        "memory_first_sampled_at": memory.first_sampled_at,
+        "memory_last_sampled_at": memory.last_sampled_at,
+        "memory_coverage_seconds": memory.coverage_seconds,
+        "process_identity_verified": memory.process_identity_verified,
+        "gpu_identity_verified": memory.gpu_identity_verified,
+        "measurement_version": memory.measurement_version,
         "exit_code": job.exit_code,
         "oom_detected": failure_category
         in {
@@ -312,10 +343,54 @@ def _make_summary(
         "usable_for_memory_calibration": usable_memory,
         "exclusion_reasons": exclusion_reasons,
         "collector_version": TrainingPerformanceCollector.version,
+        "classifier_version": classifier_version,
+        "summary_content_fingerprint": "",
+        "calibration_state_fingerprint": "",
+        "calibration_included": True,
+        "manual_exclusion_reason": None,
         "created_at": now,
         "updated_at": now,
     }
-    fingerprint = _fingerprint(values)
+    content_values = {
+        key: value
+        for key, value in values.items()
+        if key
+        not in {
+            "created_at",
+            "updated_at",
+            "summary_content_fingerprint",
+            "calibration_state_fingerprint",
+            "calibration_included",
+            "manual_exclusion_reason",
+            "failure_category",
+            "failure_evidence_codes",
+            "oom_detected",
+            "usable_for_speed_calibration",
+            "usable_for_memory_calibration",
+            "collector_version",
+            "classifier_version",
+        }
+    }
+    content_fingerprint = _fingerprint(content_values)
+    state_fingerprint = _fingerprint(
+        {
+            "summary": content_fingerprint,
+            "included": True,
+            "manual_exclusion_reason": None,
+            "failure_category": failure_category.value,
+            "failure_evidence_codes": evidence_codes,
+            "oom_detected": values["oom_detected"],
+            "usable_for_speed": usable_speed,
+            "usable_for_memory": usable_memory,
+            "collector_version": TrainingPerformanceCollector.version,
+            "classifier_version": classifier_version,
+        }
+    )
+    values["summary_content_fingerprint"] = content_fingerprint
+    values["calibration_state_fingerprint"] = state_fingerprint
+    fingerprint = _fingerprint(
+        {"content": content_fingerprint, "state": state_fingerprint}
+    )
     return TrainingExecutionSummary(
         id=uuid4(), summary_fingerprint=fingerprint, **values
     )
@@ -355,6 +430,8 @@ def _summary_from_record(
 
 _SUMMARY_FIELDS = (
     "gpu_total_vram_bytes",
+    "gpu_architecture",
+    "gpu_index",
     "resolution",
     "batch_size",
     "gradient_accumulation_steps",
@@ -367,6 +444,9 @@ _SUMMARY_FIELDS = (
     "mixed_precision",
     "cache_latents",
     "gradient_checkpointing",
+    "world_size",
+    "sd_scripts_version",
+    "xformers_available",
     "total_epochs",
     "planned_total_steps",
     "completed_steps",
@@ -379,13 +459,26 @@ _SUMMARY_FIELDS = (
     "peak_reserved_vram_bytes",
     "free_vram_before_bytes",
     "free_vram_after_bytes",
+    "minimum_free_vram_bytes",
+    "whole_gpu_peak_used_vram_bytes",
+    "other_process_peak_vram_bytes",
     "memory_sample_count",
+    "memory_failed_sample_count",
+    "memory_first_sampled_at",
+    "memory_last_sampled_at",
+    "memory_coverage_seconds",
+    "process_identity_verified",
+    "gpu_identity_verified",
+    "measurement_version",
     "exit_code",
     "oom_detected",
     "usable_for_speed_calibration",
     "usable_for_memory_calibration",
     "collector_version",
+    "classifier_version",
     "summary_fingerprint",
+    "summary_content_fingerprint",
+    "calibration_state_fingerprint",
     "calibration_included",
     "manual_exclusion_reason",
 )
@@ -450,7 +543,7 @@ def _read_tail(path_value: str | None, limit: int) -> str:
 
 def _gpu_identity(
     metadata: dict[str, object], environment: dict[str, object]
-) -> tuple[str | None, int | None]:
+) -> tuple[str | None, int | None, str | None, int | None]:
     raw = metadata.get("gpu_identity")
     if not isinstance(raw, dict):
         devices = environment.get("gpu_devices")
@@ -459,9 +552,75 @@ def _gpu_identity(
         identity = raw.get("uuid") or raw.get("architecture") or raw.get("name")
         total = raw.get("total_vram_bytes")
         if identity:
-            fingerprint = hashlib.sha256(f"gpu:{identity}".encode()).hexdigest()[:32]
-            return fingerprint, int(total) if isinstance(total, int) else None
-    return None, None
+            fingerprint = (
+                gpu_uuid_fingerprint(str(identity))
+                if raw.get("uuid")
+                else hashlib.sha256(f"gpu:{identity}".encode()).hexdigest()[:32]
+            )
+            architecture = _string_option(raw, "architecture")
+            index = raw.get("index")
+            return (
+                fingerprint,
+                int(total) if isinstance(total, int) else None,
+                architecture,
+                int(index) if isinstance(index, int) else None,
+            )
+    return None, None, None, None
+
+
+def _memory_summary_from_record(
+    record: TrainingMemoryAggregateRecord | None,
+) -> GpuMemorySummary:
+    if record is None:
+        return GpuMemorySummary()
+    coverage = None
+    if record.first_sampled_at and record.last_sampled_at:
+        coverage = max(
+            0.0, (record.last_sampled_at - record.first_sampled_at).total_seconds()
+        )
+    total = record.gpu_total_vram_bytes
+    other_ratio = None
+    if total and record.other_process_peak_used_bytes is not None:
+        other_ratio = record.other_process_peak_used_bytes / total
+    return GpuMemorySummary(
+        gpu_index=record.gpu_index,
+        gpu_uuid_fingerprint=record.gpu_uuid_fingerprint,
+        total_bytes=total,
+        free_before_bytes=record.free_vram_before_bytes,
+        free_after_bytes=record.free_vram_after_bytes,
+        target_peak_allocated_bytes=record.target_process_peak_used_bytes,
+        target_peak_reserved_bytes=record.target_process_peak_used_bytes,
+        whole_gpu_min_free_bytes=record.minimum_free_vram_bytes,
+        whole_gpu_peak_used_bytes=record.whole_gpu_peak_used_bytes,
+        other_process_peak_used_bytes=record.other_process_peak_used_bytes,
+        sample_count=record.sample_count,
+        failed_sample_count=record.failed_sample_count,
+        first_sampled_at=record.first_sampled_at,
+        last_sampled_at=record.last_sampled_at,
+        process_identity_verified=bool(record.process_identity_verified),
+        gpu_identity_verified=bool(record.gpu_identity_verified),
+        coverage_seconds=coverage,
+        measurement_version=record.measurement_version,
+        other_process_ratio=other_ratio,
+        confidence=CalibrationConfidence(record.confidence),
+    )
+
+
+def _mark_related_calibrations_stale(session: Any, summary_id: str) -> None:
+    calibration_ids = session.scalars(
+        select(RecommendationCalibrationSourceRecord.calibration_id).where(
+            RecommendationCalibrationSourceRecord.summary_id == summary_id
+        )
+    ).all()
+    if calibration_ids:
+        session.query(RecommendationCalibrationSnapshotRecord).filter(
+            RecommendationCalibrationSnapshotRecord.id.in_(calibration_ids)
+        ).update({"stale": True}, synchronize_session=False)
+
+
+def _string_option(values: dict[str, object], key: str) -> str | None:
+    value = values.get(key)
+    return str(value) if value is not None else None
 
 
 def _settings_fingerprint(config: TrainingConfigRecord) -> str:
@@ -494,6 +653,11 @@ def _fingerprint(values: dict[str, object]) -> str:
 def _text_option(values: dict[str, object], key: str) -> str | None:
     value = values.get(key)
     return str(value) if value else None
+
+
+def _bool_option(values: dict[str, object], key: str) -> bool | None:
+    value = values.get(key)
+    return value if isinstance(value, bool) else None
 
 
 def _int_option(value: str, key: str, default: int) -> int:

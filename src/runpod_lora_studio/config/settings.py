@@ -152,6 +152,10 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
         default=64 * 1024, ge=1024, le=10 * 1024 * 1024
     )
     training_progress_interval_seconds: float = Field(default=2.0, gt=0.1, le=60.0)
+    training_memory_measurement_interval_seconds: float = Field(
+        default=5.0, gt=0.1, le=300.0
+    )
+    training_memory_max_samples: int = Field(default=20_000, ge=10, le=1_000_000)
     training_progress_read_bytes: int = Field(
         default=256 * 1024, ge=1024, le=16 * 1024 * 1024
     )

@@ -606,6 +606,16 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
                 mixed_precision=summary.mixed_precision,
                 cache_latents=summary.cache_latents,
                 gradient_checkpointing=summary.gradient_checkpointing,
+                gpu_architecture=summary.gpu_architecture,
+                batch_size=summary.batch_size,
+                gradient_accumulation_steps=summary.gradient_accumulation_steps,
+                effective_batch_size=summary.effective_batch_size,
+                network_module=summary.network_module,
+                network_dim=summary.network_dim,
+                network_alpha=summary.network_alpha,
+                world_size=summary.world_size,
+                sd_scripts_version=summary.sd_scripts_version,
+                xformers_available=summary.xformers_available,
             )
             return (
                 f"calibration rebuilt: confidence=`{snapshot.confidence.value}`, "

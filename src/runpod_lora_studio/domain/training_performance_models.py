@@ -44,20 +44,58 @@ class GpuMemorySample:
     process_used_bytes: int | None = None
     process_identity: str | None = None
     other_process_used_bytes: int | None = None
+    gpu_uuid_fingerprint: str | None = None
+    whole_gpu_used_bytes: int | None = None
+    identity_verified: bool = False
+    gpu_identity_verified: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class GpuMemorySummary:
+    gpu_index: int | None = None
+    gpu_uuid_fingerprint: str | None = None
     total_bytes: int | None = None
     free_before_bytes: int | None = None
     free_after_bytes: int | None = None
     target_peak_allocated_bytes: int | None = None
     target_peak_reserved_bytes: int | None = None
     whole_gpu_min_free_bytes: int | None = None
+    whole_gpu_peak_used_bytes: int | None = None
+    other_process_peak_used_bytes: int | None = None
     sample_count: int = 0
     missing_sample_count: int = 0
+    failed_sample_count: int = 0
+    first_sampled_at: datetime | None = None
+    last_sampled_at: datetime | None = None
+    process_identity_verified: bool = False
+    gpu_identity_verified: bool = False
+    coverage_seconds: float | None = None
+    measurement_version: str = "phase7b-memory-v1"
     other_process_ratio: float | None = None
     confidence: CalibrationConfidence = CalibrationConfidence.NONE
+
+
+@dataclass(frozen=True, slots=True)
+class GpuMemoryAggregate:
+    job_id: UUID
+    gpu_index: int | None = None
+    gpu_uuid_fingerprint: str | None = None
+    gpu_total_vram_bytes: int | None = None
+    free_vram_before_bytes: int | None = None
+    minimum_free_vram_bytes: int | None = None
+    free_vram_after_bytes: int | None = None
+    target_process_peak_used_bytes: int | None = None
+    whole_gpu_peak_used_bytes: int | None = None
+    other_process_peak_used_bytes: int | None = None
+    sample_count: int = 0
+    failed_sample_count: int = 0
+    first_sampled_at: datetime | None = None
+    last_sampled_at: datetime | None = None
+    process_identity_verified: bool = False
+    gpu_identity_verified: bool = False
+    confidence: CalibrationConfidence = CalibrationConfidence.NONE
+    last_sample_fingerprint: str | None = None
+    measurement_version: str = "phase7b-memory-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +109,8 @@ class TrainingExecutionSummary:
     job_result_status: str
     gpu_identity_fingerprint: str | None
     settings_fingerprint: str | None
+    gpu_architecture: str | None = None
+    gpu_index: int | None = None
     dataset_scale_fingerprint: str | None = None
     environment_snapshot_id: UUID | None = None
     recommendation_id: UUID | None = None
@@ -87,6 +127,9 @@ class TrainingExecutionSummary:
     mixed_precision: str | None = None
     cache_latents: bool | None = None
     gradient_checkpointing: bool | None = None
+    world_size: int | None = None
+    sd_scripts_version: str | None = None
+    xformers_available: bool | None = None
     total_epochs: int | None = None
     planned_total_steps: int | None = None
     completed_steps: int | None = None
@@ -99,8 +142,18 @@ class TrainingExecutionSummary:
     peak_reserved_vram_bytes: int | None = None
     free_vram_before_bytes: int | None = None
     free_vram_after_bytes: int | None = None
+    minimum_free_vram_bytes: int | None = None
+    whole_gpu_peak_used_vram_bytes: int | None = None
+    other_process_peak_vram_bytes: int | None = None
     memory_sample_count: int = 0
+    memory_failed_sample_count: int = 0
     memory_confidence: CalibrationConfidence = CalibrationConfidence.NONE
+    memory_first_sampled_at: datetime | None = None
+    memory_last_sampled_at: datetime | None = None
+    memory_coverage_seconds: float | None = None
+    process_identity_verified: bool = False
+    gpu_identity_verified: bool = False
+    measurement_version: str = "phase7b-memory-v1"
     exit_code: int | None = None
     oom_detected: bool = False
     failure_category: TrainingFailureCategory = TrainingFailureCategory.NONE
@@ -109,7 +162,10 @@ class TrainingExecutionSummary:
     usable_for_memory_calibration: bool = False
     exclusion_reasons: tuple[str, ...] = ()
     collector_version: str = "phase7b-collector-v1"
+    classifier_version: str = "phase7b-failure-v1"
     summary_fingerprint: str = ""
+    summary_content_fingerprint: str = ""
+    calibration_state_fingerprint: str = ""
     calibration_included: bool = True
     manual_exclusion_reason: str | None = None
     created_at: datetime | None = None
@@ -143,6 +199,16 @@ class TrainingCalibrationSnapshot:
     reason_codes: tuple[str, ...] = ()
     source_summary_ids: tuple[UUID, ...] = ()
     source_summary_fingerprint: str = ""
+    gpu_architecture: str | None = None
+    batch_size: int | None = None
+    gradient_accumulation_steps: int | None = None
+    effective_batch_size: int | None = None
+    network_module: str | None = None
+    network_dim: int | None = None
+    network_alpha: int | None = None
+    world_size: int | None = None
+    sd_scripts_version: str | None = None
+    xformers_available: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

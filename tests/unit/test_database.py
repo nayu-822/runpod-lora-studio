@@ -67,7 +67,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0019_phase7b_training_performance"
+            "0021_phase7b_calibration_compatibility"
         )
 
 
@@ -101,6 +101,44 @@ def test_phase6b_tables_have_job_scoped_constraints(test_workspace: Path) -> Non
     }
     assert "uq_training_metric_step" in metric_unique
     assert "uq_training_artifact_path" in artifact_unique
+
+
+def test_phase7b_memory_and_compatibility_migrations_are_present(
+    test_workspace: Path,
+) -> None:
+    settings = migrate(test_workspace)
+    inspector = inspect(create_engine_for_settings(settings))
+    assert "training_memory_aggregates" in inspector.get_table_names()
+    memory_columns = {
+        column["name"] for column in inspector.get_columns("training_memory_aggregates")
+    }
+    assert {
+        "target_process_peak_used_bytes",
+        "whole_gpu_peak_used_bytes",
+        "other_process_peak_used_bytes",
+        "failed_sample_count",
+        "measurement_version",
+    }.issubset(memory_columns)
+    summary_columns = {
+        column["name"]
+        for column in inspector.get_columns("training_execution_summaries")
+    }
+    assert {
+        "summary_content_fingerprint",
+        "calibration_state_fingerprint",
+        "process_identity_verified",
+        "gpu_identity_verified",
+    }.issubset(summary_columns)
+    calibration_columns = {
+        column["name"]
+        for column in inspector.get_columns("recommendation_calibration_snapshots")
+    }
+    assert {
+        "batch_size",
+        "network_module",
+        "network_dim",
+        "sd_scripts_version",
+    }.issubset(calibration_columns)
 
 
 def test_existing_0001_database_upgrades_to_head(test_workspace: Path) -> None:
@@ -156,7 +194,7 @@ def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0019_phase7b_training_performance"
+            "0021_phase7b_calibration_compatibility"
         )
 
 
@@ -184,7 +222,7 @@ def test_phase4_downgrade_and_reupgrade_preserves_phase3_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0019_phase7b_training_performance"
+            "0021_phase7b_calibration_compatibility"
         )
 
 
@@ -198,7 +236,7 @@ def test_phase5_upgrades_existing_0006_database_to_head(
         assert "managed_models" in tables
         assert "storage_transfer_jobs" in tables
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0019_phase7b_training_performance"
+            "0021_phase7b_calibration_compatibility"
         )
 
 
@@ -219,7 +257,7 @@ def test_phase5_heartbeat_migration_upgrades_existing_0007_database(
             "current_file_transferred_bytes",
         }.issubset(columns)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0019_phase7b_training_performance"
+            "0021_phase7b_calibration_compatibility"
         )
 
 
@@ -267,7 +305,7 @@ def test_phase5_progress_migration_upgrades_existing_0008_database(
         ).one()
         assert row == ("running", 0, 0)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0019_phase7b_training_performance"
+            "0021_phase7b_calibration_compatibility"
         )
 
 
@@ -294,7 +332,7 @@ def test_phase5_progress_downgrade_and_reupgrade(test_workspace: Path) -> None:
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0019_phase7b_training_performance"
+            "0021_phase7b_calibration_compatibility"
         )
 
 

@@ -1749,6 +1749,14 @@ RecommendationContext(
 recommendation_engine_version: 1.0.0
 ```
 
+## Phase 7B: 学習中VRAM測定と校正互換性
+
+学習workerはheartbeat、進捗解析、artifact走査から独立した間隔でGPUメモリを測定する。既定間隔は5秒で、`nvidia-smi`の固定queryと`shell=False`を使用する。ジョブPIDのprocess identity/groupと環境snapshotのGPU UUIDを確認できない測定はtarget process peakに採用せず、全GPUのfree/minimumを低信頼の参考値として扱う。
+
+測定値はjobごとにboundedな集約レコードへ冪等に保存し、再起動後に復元する。終端性能サマリーは単発の終端測定ではなく集約レコードからtarget/全GPU/他プロセスpeak、開始前・最小・終了後free、件数、失敗件数、時刻範囲を読み取る。メモリ校正はtarget identity、サンプル数、confidence、coverage、他プロセス影響、GPU不変性を検証する。
+
+校正の速度・VRAMグループはGPU identity/VRAM class/architecture、resolution、batch、gradient accumulation/effective batch、LoRA module/dim/alpha、optimizer、precision、cache/checkpointing、world size、sd-scripts version、xformers可否を明示的に比較する。OOM補正は同等条件のmedium以上の履歴だけでbatch低下を提案し、低信頼・異なるbatch/dim/GPUの履歴はwarningに留める。summary content fingerprintとcalibration state fingerprintを分離し、履歴の採用、除外、理由、再分類、再収集、集約更新は関連校正をstaleにする。適用直前にもsnapshotと現在の推奨・GPUの互換性を再検証する。
+
 これにより、ツール更新前後で推奨値が変わった理由を追跡できる。
 ## Phase 2B実装補足
 

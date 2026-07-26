@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from uuid import UUID
@@ -65,6 +66,16 @@ class TrainingCalibrationService:
         mixed_precision: str | None = None,
         cache_latents: bool | None = None,
         gradient_checkpointing: bool | None = None,
+        gpu_architecture: str | None = None,
+        batch_size: int | None = None,
+        gradient_accumulation_steps: int | None = None,
+        effective_batch_size: int | None = None,
+        network_module: str | None = None,
+        network_dim: int | None = None,
+        network_alpha: int | None = None,
+        world_size: int | None = None,
+        sd_scripts_version: str | None = None,
+        xformers_available: bool | None = None,
     ) -> TrainingCalibrationSnapshot:
         summaries = self.list_summaries(project_id)
         snapshot = self.builder.build(
@@ -76,6 +87,16 @@ class TrainingCalibrationService:
             mixed_precision=mixed_precision,
             cache_latents=cache_latents,
             gradient_checkpointing=gradient_checkpointing,
+            gpu_architecture=gpu_architecture,
+            batch_size=batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            effective_batch_size=effective_batch_size,
+            network_module=network_module,
+            network_dim=network_dim,
+            network_alpha=network_alpha,
+            world_size=world_size,
+            sd_scripts_version=sd_scripts_version,
+            xformers_available=xformers_available,
             scope_project_id=project_id,
         )
         with self.session_factory() as session:
@@ -86,6 +107,9 @@ class TrainingCalibrationService:
                 )
             )
             if existing is not None:
+                if existing.stale:
+                    existing.stale = False
+                    session.commit()
                 return _snapshot_from_record(existing, session)
             session.add(_snapshot_record(snapshot))
             for summary_id in snapshot.source_summary_ids:
@@ -179,6 +203,8 @@ class RecommendationHistoryService:
                 None if included else (reason or "user_excluded")
             )
             record.updated_at = datetime.now(UTC)
+            _refresh_summary_fingerprints(record)
+            _mark_calibrations_stale(session, record.id)
             session.commit()
 
     def include(self, summary_id: UUID) -> None:
@@ -212,6 +238,32 @@ class RecommendationHistoryService:
                 False if record.oom_detected else record.usable_for_speed_calibration
             )
             record.updated_at = datetime.now(UTC)
+            _refresh_summary_fingerprints(record)
+            _mark_calibrations_stale(session, record.id)
+            session.commit()
+
+    def set_usability(
+        self,
+        summary_id: UUID,
+        *,
+        usable_for_speed: bool | None = None,
+        usable_for_memory: bool | None = None,
+    ) -> None:
+        with self.session_factory() as session:
+            record = session.scalar(
+                select(TrainingExecutionSummaryRecord).where(
+                    TrainingExecutionSummaryRecord.id == str(summary_id)
+                )
+            )
+            if record is None:
+                raise ValueError("training execution summary not found")
+            if usable_for_speed is not None:
+                record.usable_for_speed_calibration = usable_for_speed
+            if usable_for_memory is not None:
+                record.usable_for_memory_calibration = usable_for_memory
+            record.updated_at = datetime.now(UTC)
+            _refresh_summary_fingerprints(record)
+            _mark_calibrations_stale(session, record.id)
             session.commit()
 
 
@@ -225,7 +277,17 @@ def _snapshot_record(
         else None,
         gpu_identity_fingerprint=snapshot.gpu_identity_fingerprint,
         gpu_total_vram_class=snapshot.gpu_total_vram_class,
+        gpu_architecture=snapshot.gpu_architecture,
         resolution=snapshot.resolution,
+        batch_size=snapshot.batch_size,
+        gradient_accumulation_steps=snapshot.gradient_accumulation_steps,
+        effective_batch_size=snapshot.effective_batch_size,
+        network_module=snapshot.network_module,
+        network_dim=snapshot.network_dim,
+        network_alpha=snapshot.network_alpha,
+        world_size=snapshot.world_size,
+        sd_scripts_version=snapshot.sd_scripts_version,
+        xformers_available=snapshot.xformers_available,
         optimizer=snapshot.optimizer,
         mixed_precision=snapshot.mixed_precision,
         cache_latents=snapshot.cache_latents,
@@ -265,7 +327,19 @@ def _snapshot_from_record(
         else None,
         gpu_identity_fingerprint=record.gpu_identity_fingerprint,
         gpu_total_vram_class=record.gpu_total_vram_class,
+        gpu_architecture=record.gpu_architecture,
         resolution=record.resolution,
+        batch_size=record.batch_size,
+        gradient_accumulation_steps=record.gradient_accumulation_steps,
+        effective_batch_size=record.effective_batch_size,
+        network_module=record.network_module,
+        network_dim=record.network_dim,
+        network_alpha=record.network_alpha,
+        world_size=record.world_size,
+        sd_scripts_version=record.sd_scripts_version,
+        xformers_available=bool(record.xformers_available)
+        if record.xformers_available is not None
+        else None,
         optimizer=record.optimizer,
         mixed_precision=record.mixed_precision,
         cache_latents=bool(record.cache_latents)
@@ -291,3 +365,97 @@ def _snapshot_from_record(
         source_summary_ids=tuple(UUID(row.summary_id) for row in source_rows),
         source_summary_fingerprint=record.source_summary_fingerprint,
     )
+
+
+def _refresh_summary_fingerprints(record: TrainingExecutionSummaryRecord) -> None:
+    content = record.summary_content_fingerprint or _hash_record_content(record)
+    record.summary_content_fingerprint = content
+    state = _hash(
+        {
+            "summary": content,
+            "included": bool(record.calibration_included),
+            "manual_exclusion_reason": record.manual_exclusion_reason,
+            "failure_category": record.failure_category,
+            "failure_evidence_codes_json": record.failure_evidence_codes_json,
+            "oom_detected": bool(record.oom_detected),
+            "usable_for_speed": bool(record.usable_for_speed_calibration),
+            "usable_for_memory": bool(record.usable_for_memory_calibration),
+            "collector_version": record.collector_version,
+            "classifier_version": record.classifier_version,
+        }
+    )
+    record.calibration_state_fingerprint = state
+    record.summary_fingerprint = _hash({"content": content, "state": state})
+
+
+def _hash_record_content(record: TrainingExecutionSummaryRecord) -> str:
+    fields = (
+        "training_job_id",
+        "project_id",
+        "training_config_id",
+        "dataset_snapshot_id",
+        "managed_model_id",
+        "job_result_status",
+        "gpu_identity_fingerprint",
+        "gpu_architecture",
+        "gpu_index",
+        "gpu_total_vram_bytes",
+        "settings_fingerprint",
+        "resolution",
+        "batch_size",
+        "gradient_accumulation_steps",
+        "effective_batch_size",
+        "network_module",
+        "network_dim",
+        "network_alpha",
+        "optimizer",
+        "scheduler",
+        "mixed_precision",
+        "cache_latents",
+        "gradient_checkpointing",
+        "world_size",
+        "sd_scripts_version",
+        "xformers_available",
+        "total_epochs",
+        "planned_total_steps",
+        "completed_steps",
+        "elapsed_seconds",
+        "measured_steps_per_second",
+        "measured_images_per_second",
+        "peak_allocated_vram_bytes",
+        "peak_reserved_vram_bytes",
+        "free_vram_before_bytes",
+        "free_vram_after_bytes",
+        "minimum_free_vram_bytes",
+        "whole_gpu_peak_used_vram_bytes",
+        "other_process_peak_vram_bytes",
+        "memory_sample_count",
+        "memory_failed_sample_count",
+        "memory_confidence",
+        "memory_first_sampled_at",
+        "memory_last_sampled_at",
+        "memory_coverage_seconds",
+        "process_identity_verified",
+        "gpu_identity_verified",
+        "measurement_version",
+        "exit_code",
+    )
+    return _hash({name: getattr(record, name) for name in fields})
+
+
+def _hash(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, default=str, sort_keys=True).encode()
+    ).hexdigest()
+
+
+def _mark_calibrations_stale(session: Session, summary_id: str) -> None:
+    calibration_ids = session.scalars(
+        select(RecommendationCalibrationSourceRecord.calibration_id).where(
+            RecommendationCalibrationSourceRecord.summary_id == summary_id
+        )
+    ).all()
+    if calibration_ids:
+        session.query(RecommendationCalibrationSnapshotRecord).filter(
+            RecommendationCalibrationSnapshotRecord.id.in_(calibration_ids)
+        ).update({"stale": True}, synchronize_session=False)

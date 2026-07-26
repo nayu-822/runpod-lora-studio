@@ -11,7 +11,9 @@ from runpod_lora_studio.domain.training_performance_models import (
     TrainingFailureCategory,
 )
 from runpod_lora_studio.services.gpu_memory_metrics import (
+    NvidiaSmiGpuMemoryAdapter,
     StaticGpuMemoryMetricsAdapter,
+    gpu_uuid_fingerprint,
     summarize_gpu_memory,
 )
 from runpod_lora_studio.services.training_calibration_service import (
@@ -33,6 +35,7 @@ def _summary(
     included: bool = True,
     gpu: str = "gpu-a",
     created_offset: int = 0,
+    batch_size: int = 1,
 ) -> TrainingExecutionSummary:
     category = (
         TrainingFailureCategory.CUDA_OUT_OF_MEMORY
@@ -51,9 +54,9 @@ def _summary(
         gpu_identity_fingerprint=gpu,
         settings_fingerprint="settings-a",
         resolution=1024,
-        batch_size=1,
+        batch_size=batch_size,
         gradient_accumulation_steps=1,
-        effective_batch_size=1,
+        effective_batch_size=batch_size,
         optimizer="AdamW8bit",
         mixed_precision="fp16",
         cache_latents=False,
@@ -119,6 +122,54 @@ def test_gpu_memory_metrics_convert_mib_and_return_null_on_invalid_samples() -> 
     )
 
 
+def test_nvidia_smi_attributes_target_pid_per_gpu_and_rejects_over_total(
+    monkeypatch,
+) -> None:
+    adapter = NvidiaSmiGpuMemoryAdapter()
+    global_uuid_a = "GPU-a"
+    global_uuid_b = "GPU-b"
+    queries: list[str] = []
+
+    def fake_query(query: list[str]) -> list[str]:
+        queries.append(query[0])
+        if query[0].startswith("--query-gpu"):
+            return [
+                "0, GPU-a, 16000, 12000",
+                "1, GPU-b, 16000, 11000",
+            ]
+        return [
+            "42, GPU-a, 100",
+            "99, GPU-a, 300",
+            "42, GPU-b, 200",
+            "99, GPU-b, 400",
+            "42, GPU-a, 20000",
+        ]
+
+    monkeypatch.setattr(adapter, "_run_query", fake_query)
+    samples = adapter.collect(
+        pid=42,
+        process_identity_verified=True,
+        expected_gpu_uuid_fingerprints=(
+            gpu_uuid_fingerprint(global_uuid_a),
+            gpu_uuid_fingerprint(global_uuid_b),
+        ),
+    )
+
+    assert queries == [
+        "--query-gpu=index,uuid,memory.total,memory.free",
+        "--query-compute-apps=pid,gpu_uuid,used_memory",
+    ]
+    assert [(item.gpu_index, item.process_used_bytes) for item in samples] == [
+        (0, 100 * 1024**2),
+        (1, 200 * 1024**2),
+    ]
+    assert [item.other_process_used_bytes for item in samples] == [
+        300 * 1024**2,
+        400 * 1024**2,
+    ]
+    assert all(item.identity_verified for item in samples)
+
+
 def test_calibration_is_deterministic_and_excludes_oom_from_speed() -> None:
     first = _summary(speed=2.0, created_offset=1)
     second = _summary(speed=4.0, created_offset=2)
@@ -169,9 +220,19 @@ def test_outlier_filter_and_matcher_preserve_manual_exclusion_and_gpu_boundary()
 def test_oom_feedback_only_suggests_lower_batch_and_keeps_baseline_safety_floor() -> (
     None
 ):
-    summary = _summary(oom=True, speed=None)
+    summary = _summary(oom=True, speed=None, batch_size=2)
     snapshot = RecommendationCalibrationService().build(
-        (summary,), gpu_identity_fingerprint="gpu-a", resolution=1024
+        (summary,),
+        gpu_identity_fingerprint="gpu-a",
+        resolution=1024,
+        batch_size=2,
+        network_module="networks.lora",
+        network_dim=16,
+        network_alpha=16,
+        optimizer="AdamW8bit",
+        mixed_precision="fp16",
+        cache_latents=False,
+        gradient_checkpointing=False,
     )
     recommendation = TrainingRecommendation(
         id=uuid4(),
@@ -207,5 +268,6 @@ def test_oom_feedback_only_suggests_lower_batch_and_keeps_baseline_safety_floor(
         recommendation, snapshot
     )
     assert calibrated.batch_size == recommendation.batch_size
-    assert result.suggested_batch_size == 1
+    assert result.suggested_batch_size == 2
+    assert "baseline_fallback" in result.reason_codes
     assert result.baseline_vram_bytes == recommendation.estimated_vram_bytes

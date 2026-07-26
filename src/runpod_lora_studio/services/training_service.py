@@ -44,22 +44,28 @@ from runpod_lora_studio.external.training_process import (
 )
 from runpod_lora_studio.persistence.database import create_session_factory
 from runpod_lora_studio.persistence.models import (
+    ComputeEnvironmentSnapshotRecord,
     DatasetSnapshotRecord,
     ManagedModelRecord,
     ModelTransferRecord,
     ProjectStorageSettingsRecord,
+    TrainingConfigRecord,
     TrainingJobRecord,
+    TrainingRecommendationRecord,
+    TrainingRecommendationRequestRecord,
 )
 from runpod_lora_studio.persistence.training_repository import (
     TrainingRepository,
     utc_now,
 )
+from runpod_lora_studio.services.gpu_memory_metrics import GpuMemoryMetricsAdapter
 from runpod_lora_studio.services.project_service import UserFacingError
 from runpod_lora_studio.services.training_command import (
     SdScriptsCommandBuilder,
     TrainingCommand,
     TrainingCommandValidationError,
 )
+from runpod_lora_studio.services.training_memory_monitor import TrainingMemoryMonitor
 from runpod_lora_studio.services.training_performance_service import (
     TrainingPerformanceCollector,
 )
@@ -82,6 +88,7 @@ class TrainingService:
         *,
         process_adapter: TrainingProcessAdapter | None = None,
         command_builder: SdScriptsCommandBuilder | None = None,
+        memory_adapter: GpuMemoryMetricsAdapter | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = create_session_factory(settings)
@@ -93,6 +100,7 @@ class TrainingService:
         )
         self.progress_service = TrainingProgressService(settings)
         self.performance_collector = TrainingPerformanceCollector(settings)
+        self.memory_monitor = TrainingMemoryMonitor(settings, adapter=memory_adapter)
         self.resume_service = TrainingResumeService(
             settings, process_adapter=self.process_adapter
         )
@@ -385,6 +393,17 @@ class TrainingService:
                 job_id, worker_id
             )
             environment = _safe_environment()
+            try:
+                self.memory_monitor.capture_before_start(
+                    job_id,
+                    expected_gpu_uuid_fingerprints=self._expected_gpu_fingerprints(
+                        job_id
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "training_memory_before_start_failed job_id=%s", job_id
+                )
             started = self.process_adapter.start(
                 command.arguments,
                 cwd=runtime,
@@ -539,6 +558,8 @@ class TrainingService:
         cancel_sent = False
         kill_deadline: float | None = None
         next_progress_at = 0.0
+        next_memory_at = 0.0
+        expected_gpu_fingerprints = self._expected_gpu_fingerprints(job_id)
         while True:
             exit_code = self.process_adapter.poll(started.pid)
             cancel_requested = self._cancel_requested(job_id)
@@ -567,6 +588,24 @@ class TrainingService:
                 self.progress_service.refresh_job(job_id)
                 next_progress_at = (
                     time.monotonic() + self.settings.training_progress_interval_seconds
+                )
+            if time.monotonic() >= next_memory_at:
+                try:
+                    self.memory_monitor.measure(
+                        job_id,
+                        started,
+                        process_identity_verified=self._process_matches(
+                            job_id, started
+                        ),
+                        expected_gpu_uuid_fingerprints=expected_gpu_fingerprints,
+                    )
+                except Exception:
+                    logger.exception(
+                        "training_memory_measurement_failed job_id=%s", job_id
+                    )
+                next_memory_at = (
+                    time.monotonic()
+                    + self.settings.training_memory_measurement_interval_seconds
                 )
             if exit_code is not None:
                 self._finish_job(job_id, exit_code, cancel_requested)
@@ -603,6 +642,13 @@ class TrainingService:
         # Re-run once after the terminal status is persisted so ETA is cleared
         # according to the final job state and final artifacts are visible.
         self.progress_service.refresh_job(job_id)
+        try:
+            self.memory_monitor.capture_after_process(
+                job_id,
+                expected_gpu_uuid_fingerprints=self._expected_gpu_fingerprints(job_id),
+            )
+        except Exception:
+            logger.exception("training_memory_after_process_failed job_id=%s", job_id)
         try:
             self.performance_collector.collect(job_id)
         except Exception:
@@ -642,6 +688,59 @@ class TrainingService:
                 record.worker_heartbeat = utc_now()
                 record.updated_at = utc_now()
                 session.commit()
+
+    def _expected_gpu_fingerprints(self, job_id: UUID) -> tuple[str, ...]:
+        with self.session_factory() as session:
+            job = session.scalar(
+                select(TrainingJobRecord).where(TrainingJobRecord.id == str(job_id))
+            )
+            if job is None:
+                return ()
+            config = session.scalar(
+                select(TrainingConfigRecord).where(
+                    TrainingConfigRecord.id == job.training_config_id
+                )
+            )
+            if config is None or config.recommendation_id is None:
+                return ()
+            recommendation = session.scalar(
+                select(TrainingRecommendationRecord).where(
+                    TrainingRecommendationRecord.id == config.recommendation_id
+                )
+            )
+            if recommendation is None:
+                return ()
+            request = session.scalar(
+                select(TrainingRecommendationRequestRecord).where(
+                    TrainingRecommendationRequestRecord.id == recommendation.request_id
+                )
+            )
+            if request is None:
+                return ()
+            snapshot = session.scalar(
+                select(ComputeEnvironmentSnapshotRecord).where(
+                    ComputeEnvironmentSnapshotRecord.id
+                    == request.environment_snapshot_id
+                )
+            )
+            if snapshot is None:
+                return ()
+            try:
+                payload = json.loads(snapshot.payload_json)
+            except ValueError:
+                return ()
+            devices = payload.get("gpu_devices") if isinstance(payload, dict) else None
+            if not isinstance(devices, list):
+                return ()
+            from runpod_lora_studio.services.gpu_memory_metrics import (
+                gpu_uuid_fingerprint,
+            )
+
+            return tuple(
+                gpu_uuid_fingerprint(str(device["uuid"]))
+                for device in devices
+                if isinstance(device, dict) and device.get("uuid")
+            )
 
     def _cancel_requested(self, job_id: UUID) -> bool:
         with self.session_factory() as session:

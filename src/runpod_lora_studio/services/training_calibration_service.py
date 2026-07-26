@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Sequence
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from statistics import median
 from typing import Any
@@ -70,7 +70,13 @@ class TrainingPerformanceOutlierFilter:
             summary.calibration_included
             and summary.usable_for_memory_calibration
             and summary.gpu_identity_fingerprint is not None
+            and summary.process_identity_verified
+            and summary.gpu_identity_verified
             and summary.memory_sample_count >= 2
+            and summary.memory_confidence
+            in {CalibrationConfidence.MEDIUM, CalibrationConfidence.HIGH}
+            and summary.memory_coverage_seconds is not None
+            and summary.memory_coverage_seconds > 0
             and summary.peak_reserved_vram_bytes is not None
             and summary.gpu_total_vram_bytes is not None
             and summary.peak_reserved_vram_bytes <= summary.gpu_total_vram_bytes
@@ -87,12 +93,31 @@ class TrainingCalibrationMatcher:
     ) -> bool:
         if summary.gpu_identity_fingerprint != snapshot.gpu_identity_fingerprint:
             return False
+        if (
+            snapshot.gpu_total_vram_class is not None
+            and _vram_class(summary.gpu_total_vram_bytes)
+            != snapshot.gpu_total_vram_class
+        ):
+            return False
         for actual, expected in (
+            (summary.gpu_architecture, snapshot.gpu_architecture),
             (summary.resolution, snapshot.resolution),
+            (summary.batch_size, snapshot.batch_size),
+            (
+                summary.gradient_accumulation_steps,
+                snapshot.gradient_accumulation_steps,
+            ),
+            (summary.effective_batch_size, snapshot.effective_batch_size),
+            (summary.network_module, snapshot.network_module),
+            (summary.network_dim, snapshot.network_dim),
+            (summary.network_alpha, snapshot.network_alpha),
             (summary.optimizer, snapshot.optimizer),
             (summary.mixed_precision, snapshot.mixed_precision),
             (summary.cache_latents, snapshot.cache_latents),
             (summary.gradient_checkpointing, snapshot.gradient_checkpointing),
+            (summary.world_size, snapshot.world_size),
+            (summary.sd_scripts_version, snapshot.sd_scripts_version),
+            (summary.xformers_available, snapshot.xformers_available),
         ):
             if expected is not None and actual != expected:
                 return False
@@ -129,6 +154,16 @@ class RecommendationCalibrationService:
         mixed_precision: str | None = None,
         cache_latents: bool | None = None,
         gradient_checkpointing: bool | None = None,
+        gpu_architecture: str | None = None,
+        batch_size: int | None = None,
+        gradient_accumulation_steps: int | None = None,
+        effective_batch_size: int | None = None,
+        network_module: str | None = None,
+        network_dim: int | None = None,
+        network_alpha: int | None = None,
+        world_size: int | None = None,
+        sd_scripts_version: str | None = None,
+        xformers_available: bool | None = None,
         scope_project_id: UUID | None = None,
         now: datetime | None = None,
     ) -> TrainingCalibrationSnapshot:
@@ -137,6 +172,11 @@ class RecommendationCalibrationService:
             for summary in summaries
             if summary.calibration_included
             and summary.gpu_identity_fingerprint == gpu_identity_fingerprint
+            and (
+                gpu_total_vram_bytes is None
+                or _vram_class(summary.gpu_total_vram_bytes)
+                == _vram_class(gpu_total_vram_bytes)
+            )
             and (resolution is None or summary.resolution == resolution)
             and (optimizer is None or summary.optimizer == optimizer)
             and (mixed_precision is None or summary.mixed_precision == mixed_precision)
@@ -145,16 +185,38 @@ class RecommendationCalibrationService:
                 gradient_checkpointing is None
                 or summary.gradient_checkpointing == gradient_checkpointing
             )
+            and (
+                gpu_architecture is None or summary.gpu_architecture == gpu_architecture
+            )
+            and (batch_size is None or summary.batch_size == batch_size)
+            and (
+                gradient_accumulation_steps is None
+                or summary.gradient_accumulation_steps == gradient_accumulation_steps
+            )
+            and (
+                effective_batch_size is None
+                or summary.effective_batch_size == effective_batch_size
+            )
+            and (network_module is None or summary.network_module == network_module)
+            and (network_dim is None or summary.network_dim == network_dim)
+            and (network_alpha is None or summary.network_alpha == network_alpha)
+            and (world_size is None or summary.world_size == world_size)
+            and (
+                sd_scripts_version is None
+                or summary.sd_scripts_version == sd_scripts_version
+            )
+            and (
+                xformers_available is None
+                or summary.xformers_available == xformers_available
+            )
         )
         speed = self.outlier_filter.filter_speed(matching)
         memory = self.outlier_filter.filter_memory(matching)
         source_ids = tuple(sorted((summary.id for summary in matching), key=str))
         source_fingerprint = _hash(
             [
-                summary.summary_fingerprint
-                for summary in sorted(
-                    matching, key=lambda item: item.summary_fingerprint
-                )
+                _summary_source_token(summary)
+                for summary in sorted(matching, key=_summary_source_token)
             ]
         )
         speeds = sorted(
@@ -181,6 +243,16 @@ class RecommendationCalibrationService:
                 "scope_project_id": str(scope_project_id) if scope_project_id else None,
                 "gpu": gpu_identity_fingerprint,
                 "vram": gpu_total_vram_bytes,
+                "gpu_architecture": gpu_architecture,
+                "batch_size": batch_size,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                "effective_batch_size": effective_batch_size,
+                "network_module": network_module,
+                "network_dim": network_dim,
+                "network_alpha": network_alpha,
+                "world_size": world_size,
+                "sd_scripts_version": sd_scripts_version,
+                "xformers_available": xformers_available,
                 "resolution": resolution,
                 "optimizer": optimizer,
                 "mixed_precision": mixed_precision,
@@ -218,6 +290,16 @@ class RecommendationCalibrationService:
             reason_codes=tuple(reasons),
             source_summary_ids=source_ids,
             source_summary_fingerprint=source_fingerprint,
+            gpu_architecture=gpu_architecture,
+            batch_size=batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            effective_batch_size=effective_batch_size,
+            network_module=network_module,
+            network_dim=network_dim,
+            network_alpha=network_alpha,
+            world_size=world_size,
+            sd_scripts_version=sd_scripts_version,
+            xformers_available=xformers_available,
         )
 
     def is_stale(
@@ -227,7 +309,7 @@ class RecommendationCalibrationService:
     ) -> bool:
         current = _hash(
             [
-                summary.summary_fingerprint
+                _summary_source_token(summary)
                 for summary in sorted(
                     (
                         item
@@ -235,7 +317,7 @@ class RecommendationCalibrationService:
                         if item.calibration_included
                         and self._matches_snapshot(item, snapshot)
                     ),
-                    key=lambda item: item.summary_fingerprint,
+                    key=_summary_source_token,
                 )
             ]
         )
@@ -248,6 +330,11 @@ class RecommendationCalibrationService:
     ) -> bool:
         return (
             summary.gpu_identity_fingerprint == snapshot.gpu_identity_fingerprint
+            and (
+                snapshot.gpu_total_vram_class is None
+                or _vram_class(summary.gpu_total_vram_bytes)
+                == snapshot.gpu_total_vram_class
+            )
             and (
                 snapshot.resolution is None or summary.resolution == snapshot.resolution
             )
@@ -263,6 +350,45 @@ class RecommendationCalibrationService:
             and (
                 snapshot.gradient_checkpointing is None
                 or summary.gradient_checkpointing == snapshot.gradient_checkpointing
+            )
+            and (
+                snapshot.gpu_architecture is None
+                or summary.gpu_architecture == snapshot.gpu_architecture
+            )
+            and (
+                snapshot.batch_size is None or summary.batch_size == snapshot.batch_size
+            )
+            and (
+                snapshot.gradient_accumulation_steps is None
+                or summary.gradient_accumulation_steps
+                == snapshot.gradient_accumulation_steps
+            )
+            and (
+                snapshot.effective_batch_size is None
+                or summary.effective_batch_size == snapshot.effective_batch_size
+            )
+            and (
+                snapshot.network_module is None
+                or summary.network_module == snapshot.network_module
+            )
+            and (
+                snapshot.network_dim is None
+                or summary.network_dim == snapshot.network_dim
+            )
+            and (
+                snapshot.network_alpha is None
+                or summary.network_alpha == snapshot.network_alpha
+            )
+            and (
+                snapshot.world_size is None or summary.world_size == snapshot.world_size
+            )
+            and (
+                snapshot.sd_scripts_version is None
+                or summary.sd_scripts_version == snapshot.sd_scripts_version
+            )
+            and (
+                snapshot.xformers_available is None
+                or summary.xformers_available == snapshot.xformers_available
             )
         )
 
@@ -339,13 +465,37 @@ class CalibratedRecommendationService:
         suggested_batch = baseline_batch
         reasons = list(snapshot.reason_codes)
         warnings = ["empirical calibration is not a quality or safety guarantee"]
-        if snapshot.oom_sample_count:
+        oom_compatible = (
+            snapshot.oom_sample_count > 0
+            and snapshot.confidence
+            in {
+                CalibrationConfidence.MEDIUM,
+                CalibrationConfidence.HIGH,
+            }
+            and snapshot.resolution == recommendation.resolution
+            and snapshot.batch_size == recommendation.batch_size
+            and snapshot.gradient_accumulation_steps
+            == recommendation.gradient_accumulation_steps
+            and snapshot.effective_batch_size
+            == recommendation.batch_size * recommendation.gradient_accumulation_steps
+            and snapshot.network_module == recommendation.network_module
+            and snapshot.network_dim == recommendation.network_dim
+            and snapshot.network_alpha == recommendation.network_alpha
+            and snapshot.optimizer == recommendation.optimizer
+            and snapshot.mixed_precision == recommendation.mixed_precision
+            and snapshot.cache_latents == recommendation.cache_latents
+            and snapshot.gradient_checkpointing == recommendation.gradient_checkpointing
+        )
+        if oom_compatible:
             suggested_batch = max(1, baseline_batch - 1)
             reasons.append("reduce_batch_after_oom")
             warnings.append(
                 "OOM history requires user confirmation before applying a "
                 "lower batch size"
             )
+        elif snapshot.oom_sample_count:
+            reasons.append("oom_history_low_similarity")
+            warnings.append("OOM history did not match the current training settings")
         result = CalibrationRecommendationResult(
             baseline_duration,
             duration,
@@ -408,6 +558,51 @@ def _hash(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, default=str, sort_keys=True).encode()
     ).hexdigest()
+
+
+def _summary_source_token(summary: TrainingExecutionSummary) -> str:
+    content = summary.summary_content_fingerprint or summary.summary_fingerprint
+    if not content:
+        content = _hash(
+            {
+                key: value
+                for key, value in asdict(summary).items()
+                if key
+                not in {
+                    "id",
+                    "training_job_id",
+                    "created_at",
+                    "updated_at",
+                    "summary_fingerprint",
+                    "summary_content_fingerprint",
+                    "calibration_state_fingerprint",
+                    "calibration_included",
+                    "manual_exclusion_reason",
+                    "failure_category",
+                    "failure_evidence_codes",
+                    "oom_detected",
+                    "usable_for_speed_calibration",
+                    "usable_for_memory_calibration",
+                    "collector_version",
+                    "classifier_version",
+                }
+            }
+        )
+    return _hash(
+        {
+            "summary": content,
+            "summary_fingerprint": summary.summary_fingerprint,
+            "calibration_state": summary.calibration_state_fingerprint,
+            "included": summary.calibration_included,
+            "manual_exclusion_reason": summary.manual_exclusion_reason,
+            "failure_category": summary.failure_category.value,
+            "oom_detected": summary.oom_detected,
+            "usable_for_speed": summary.usable_for_speed_calibration,
+            "usable_for_memory": summary.usable_for_memory_calibration,
+            "collector_version": summary.collector_version,
+            "classifier_version": summary.classifier_version,
+        }
+    )
 
 
 class TrainingCalibrationService:

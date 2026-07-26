@@ -544,7 +544,7 @@ Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は�
 
 - `TrainingPerformanceCollector`でジョブ、進捗、metric、設定、環境snapshot、終端ログの限定末尾から、ジョブ単位の`TrainingExecutionSummary`を冪等に収集する。収集失敗は元jobの状態を変更しない
 - `TrainingFailureClassifier`はOOM、system OOM、disk、model/dataset、dependency、cancel、stale、process killed、unknownを証拠コード付きで分類する。ログ本文、秘密、絶対パス、raw nvidia-smi出力は保存しない
-- `NvidiaSmiGpuMemoryAdapter`は固定argv、`shell=False`、timeout、出力上限、MiBからbytesへの検証済み変換を行い、取得不能時はNULL扱いにする。測定点数と他プロセス影響を校正信頼度へ反映する
-- `RecommendationCalibrationService`はGPU/settingsが一致する履歴だけを選択し、outlier除外、中央値、保守的percentile、信頼度、source fingerprintを決定論的に保存する。低信頼・stale・履歴不足時はPhase 7A baselineへフォールバックする
+- `NvidiaSmiGpuMemoryAdapter`は学習中に既定5秒間隔でheartbeat等と独立して動作し、固定argv、`shell=False`、timeout、出力上限、MiBからbytesへの検証済み変換を行う。正のjob PID、callerで検証済みのprocess identity/group、GPU UUIDを使ってtarget processを同定し、確認できないtarget peakはNULL、全GPUfreeは低信頼として保存する。測定は`training_memory_aggregates`へ1 job 1行の冪等集約として復元可能に保存する
+- `RecommendationCalibrationService`はGPU/VRAMクラス/architecture、resolution、batch、gradient accumulation/effective batch、LoRA module/dim/alpha、optimizer、precision、cache/checkpointing、world size、sd-scripts version、xformersが一致する履歴だけを選択し、outlier除外、中央値、保守的percentile、信頼度、source fingerprintを決定論的に保存する。低信頼・stale・履歴不足時はPhase 7A baselineへフォールバックする
 - `CalibratedRecommendationService`は時間・VRAMの比較とOOM後のbatch低下提案を提供するが、baselineの安全制約を緩和せず、推奨適用や学習開始を自動実行しない。UIから履歴再収集・校正再構築・履歴表示を操作できる
-- Alembic `0019_phase7b_training_performance`で性能サマリー、校正snapshot、校正元関連を追加する。Optuna等の自動探索、複数jobの自動起動、lossだけによる品質判定は対象外とする
+- Alembic `0019_phase7b_training_performance`を変更せず、`0020_phase7b_memory_measurements`でメモリ集約・サマリー拡張、`0021_phase7b_calibration_compatibility`で厳密校正条件を追加する。内容fingerprintと校正状態fingerprintを分離し、関連校正だけをstale化する。Optuna等の自動探索、複数jobの自動起動、lossだけによる品質判定は対象外とする
