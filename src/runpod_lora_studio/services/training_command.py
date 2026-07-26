@@ -53,20 +53,17 @@ class SdScriptsCommandBuilder:
     def __init__(
         self,
         *,
+        trusted_trainer_root: Path,
         python_executable: Path | str | None = None,
-        allowed_python_roots: Sequence[Path] | None = None,
-        allowed_trainer_roots: Sequence[Path] | None = None,
+        trusted_python_executables: Sequence[Path] | None = None,
     ) -> None:
+        self.trusted_trainer_root = trusted_trainer_root.resolve()
         self.python_executable = Path(python_executable or sys.executable)
-        self.allowed_python_roots = tuple(
-            path.resolve()
-            for path in (
-                allowed_python_roots or (Path(sys.prefix), Path(sys.executable).parent)
-            )
-        )
-        self.allowed_trainer_roots = tuple(
-            path.resolve() for path in (allowed_trainer_roots or ())
-        )
+        trusted = {Path(sys.executable).resolve()}
+        for executable in trusted_python_executables or ():
+            if executable.is_absolute():
+                trusted.add(executable.resolve())
+        self.trusted_python_executables = frozenset(trusted)
 
     def build(
         self,
@@ -95,9 +92,14 @@ class SdScriptsCommandBuilder:
             dataset_config_path, allowed_dataset_roots, "dataset TOML"
         )
         root = config.sd_scripts_root.resolve()
+        if root != self.trusted_trainer_root:
+            raise TrainingCommandValidationError(
+                "sd-scripts root does not match the configured root"
+            )
         trainer_path = (root / config.trainer_script).resolve()
-        trainer_roots = self.allowed_trainer_roots or (root,)
-        self._ensure_under_any(trainer_path, trainer_roots, "trainer script")
+        self._ensure_under_any(
+            trainer_path, (self.trusted_trainer_root,), "trainer script"
+        )
         if not trainer_path.is_file():
             raise TrainingCommandValidationError("trainer script does not exist")
         output_directory = config.output_directory.resolve()
@@ -172,9 +174,10 @@ class SdScriptsCommandBuilder:
             raise TrainingCommandValidationError(
                 "only an allowed Python executable may be used"
             )
-        self._ensure_under_any(
-            executable, self.allowed_python_roots, "python executable"
-        )
+        if executable not in self.trusted_python_executables:
+            raise TrainingCommandValidationError(
+                "python executable is not a trusted executable"
+            )
         return executable
 
     def _extra_arguments(self, options: dict[str, Any]) -> list[str]:

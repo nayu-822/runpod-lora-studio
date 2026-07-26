@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import shutil
-import sys
 import threading
 import time
 import tomllib
@@ -73,16 +72,9 @@ class TrainingService:
         self.session_factory = create_session_factory(settings)
         self.process_adapter = process_adapter or SubprocessTrainingAdapter()
         self.command_builder = command_builder or SdScriptsCommandBuilder(
+            trusted_trainer_root=settings.training_sd_scripts_root,
             python_executable=settings.training_python_executable,
-            allowed_python_roots=(
-                Path(sys.prefix),
-                Path(sys.executable).parent,
-                settings.training_sd_scripts_root,
-            ),
-            allowed_trainer_roots=(
-                settings.training_sd_scripts_root,
-                settings.workspace_root,
-            ),
+            trusted_python_executables=(settings.training_python_executable,),
         )
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="training"
@@ -579,12 +571,11 @@ class TrainingService:
             data.output_directory.resolve(), self.settings.outputs_dir.resolve()
         ):
             raise UserFacingError("output directoryが許可領域外です")
-        allowed_roots = [self.settings.training_sd_scripts_root.resolve()]
-        if self.settings.workspace_root.exists():
-            allowed_roots.append(self.settings.workspace_root.resolve())
-        root = data.sd_scripts_root.resolve()
-        if not any(_is_under(root, allowed) for allowed in allowed_roots):
-            raise UserFacingError("sd-scripts rootが許可領域外です")
+        configured_root = data.sd_scripts_root.resolve()
+        trusted_root = self.settings.training_sd_scripts_root.resolve()
+        if configured_root != trusted_root:
+            raise UserFacingError("sd-scripts root must match the configured directory")
+        return
 
     def _validate_references(self, session: Any, data: TrainingConfigInput) -> None:
         model = session.scalar(

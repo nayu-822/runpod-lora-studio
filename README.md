@@ -269,5 +269,6 @@ Phase 6Aでは、完成済みデータセットスナップショットと検証
 ### Phase 6Aレビュー対応の設定境界
 
 - Python実行ファイルは`sys.executable`を基準にした検証済み環境から固定し、UI/APIで任意の実行ファイルを指定できない。
+- trainerは`training_sd_scripts_root`内の固定スクリプトだけを実行し、`workspace_root`配下の任意スクリプトは実行しない。Python実行ファイルはresolve後の完全パスで信頼判定し、venv symlinkにも対応する。
 - network moduleは`networks.lora`、optimizerとschedulerはsd-scriptsで確認済みの固定候補だけを許可する。
 - repeatsはPhase 4のdataset TOMLにある各subsetの`num_repeats`を正とする。学習設定では重複指定せず、snapshotの元TOMLは変更しない。

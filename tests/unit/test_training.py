@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -257,7 +258,7 @@ def test_command_builder_uses_argument_array_and_redacts_paths(
         created_at=now,
         updated_at=now,
     )
-    command = SdScriptsCommandBuilder().build(
+    command = SdScriptsCommandBuilder(trusted_trainer_root=root).build(
         config,
         model_path=model,
         dataset_config_path=dataset,
@@ -279,8 +280,22 @@ def test_command_builder_uses_argument_array_and_redacts_paths(
     ):
         with pytest.raises(TrainingCommandValidationError):
             builder_config = replace(config, **{field_name: value})
-            SdScriptsCommandBuilder().build(
+            SdScriptsCommandBuilder(trusted_trainer_root=root).build(
                 builder_config,
+                model_path=model,
+                dataset_config_path=dataset,
+                allowed_model_roots=(test_workspace,),
+                allowed_dataset_roots=(test_workspace,),
+                allowed_output_roots=(test_workspace,),
+            )
+    for untrusted_root in (
+        test_workspace / "other",
+        test_workspace / "runtime" / "jobs",
+        test_workspace / "runtime" / "outputs",
+    ):
+        with pytest.raises(TrainingCommandValidationError):
+            SdScriptsCommandBuilder(trusted_trainer_root=root).build(
+                replace(config, sd_scripts_root=untrusted_root),
                 model_path=model,
                 dataset_config_path=dataset,
                 allowed_model_roots=(test_workspace,),
@@ -290,7 +305,7 @@ def test_command_builder_uses_argument_array_and_redacts_paths(
     for executable in ("/bin/sh", "/bin/bash", "/bin/rm"):
         with pytest.raises(TrainingCommandValidationError):
             SdScriptsCommandBuilder(
-                python_executable=executable
+                trusted_trainer_root=test_workspace, python_executable=executable
             ).validate_python_executable()
 
 
@@ -307,8 +322,26 @@ def test_python_symlink_cannot_escape_allowed_root(test_workspace: Path) -> None
         pytest.skip("symlink creation is not available")
     with pytest.raises(TrainingCommandValidationError):
         SdScriptsCommandBuilder(
-            python_executable=link, allowed_python_roots=(allowed_root,)
+            trusted_trainer_root=allowed_root, python_executable=link
         ).validate_python_executable()
+
+
+def test_resolved_application_python_and_venv_symlink_are_trusted(
+    test_workspace: Path,
+) -> None:
+    builder = SdScriptsCommandBuilder(
+        trusted_trainer_root=test_workspace, python_executable=sys.executable
+    )
+    assert builder.validate_python_executable() == Path(sys.executable).resolve()
+    link = test_workspace / "python"
+    try:
+        link.symlink_to(sys.executable)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is not available")
+    linked_builder = SdScriptsCommandBuilder(
+        trusted_trainer_root=test_workspace, python_executable=link
+    )
+    assert linked_builder.validate_python_executable() == Path(sys.executable).resolve()
 
 
 def test_service_rejects_unapproved_training_values(test_workspace: Path) -> None:
@@ -336,6 +369,8 @@ def test_service_rejects_unapproved_training_values(test_workspace: Path) -> Non
         ):
             with pytest.raises(UserFacingError):
                 service.create_config(input_data(**{field_name: value}))
+        with pytest.raises(UserFacingError):
+            service.create_config(input_data(sd_scripts_root=test_workspace / "other"))
     finally:
         service.close()
 

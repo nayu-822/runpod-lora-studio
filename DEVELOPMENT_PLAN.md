@@ -507,5 +507,6 @@ Phase 4のレビュー対応を完了し、完了扱いへ戻す。Alembic 0006�
 
 成果物のGoogle Drive同期、epoch/loss解析、resume、TensorBoard、Pod自動停止・TerminateはPhase 6Aの対象外とする。
 - Python実行ファイルはアプリ設定の検証済み実行環境に固定し、`/bin/sh`などの任意実行ファイルを受け付けない
+- trainerは`training_sd_scripts_root`内の固定スクリプトだけを実行し、`workspace_root`配下の任意スクリプトは実行しない。Pythonはresolve後の完全パスで信頼判定し、venv symlinkにも対応する
 - network module、optimizer、schedulerは固定許可リストからのみ選択する
 - repeatsはPhase 4のdataset TOMLにある`num_repeats`を正とし、学習設定から重複指定しない
