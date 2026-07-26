@@ -875,6 +875,12 @@ class TrainingJobRecord(Base):
                 "status IN ('queued', 'starting', 'running', 'cancel_requested')"
             ),
         ),
+        Index(
+            "uq_training_jobs_resume_request_fingerprint",
+            "resume_request_fingerprint",
+            unique=True,
+            sqlite_where=text("resume_request_fingerprint IS NOT NULL"),
+        ),
     )
 
     internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -930,6 +936,9 @@ class TrainingJobRecord(Base):
     initial_step: Mapped[int | None] = mapped_column(Integer, nullable=True)
     progress_step_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
     progress_epoch_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    resume_request_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     process_start_time: Mapped[float | None] = mapped_column(Float, nullable=True)
     process_group_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     process_identity: Mapped[str | None] = mapped_column(String(64), nullable=True)

@@ -106,6 +106,7 @@ def _job_from_record(record: TrainingJobRecord) -> TrainingJob:
         initial_step=record.initial_step,
         progress_step_offset=record.progress_step_offset,
         progress_epoch_offset=record.progress_epoch_offset,
+        resume_request_fingerprint=record.resume_request_fingerprint,
     )
 
 

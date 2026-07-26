@@ -5,12 +5,14 @@ import json
 import os
 import shutil
 import tomllib
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from runpod_lora_studio.config.settings import AppSettings
 from runpod_lora_studio.domain.training_models import TrainingJob, TrainingJobStatus
@@ -166,21 +168,36 @@ class TrainingResumeService:
                 f"--resume <resume/{validated.source_relative_path.name}> "
                 f"--output_name {output_name}"
             )
-            return TrainingResumePreview(
-                source_job_id,
-                UUID(artifact.id),
-                UUID(config.id),
-                parent.status,
-                artifact.filename,
-                validated.fingerprint,
+            state_epoch = validated.state_epoch
+            state_step = validated.state_step
+            position_warning = _state_position_warning(
                 progress.current_epoch if progress else None,
                 progress.current_step if progress else None,
-                _config_epochs(parent.config_snapshot),
-                config.epochs,
-                output_name,
-                compatibility,
-                signature,
-                command_summary,
+                state_epoch,
+                state_step,
+            )
+            return TrainingResumePreview(
+                source_job_id=source_job_id,
+                source_artifact_id=UUID(artifact.id),
+                target_config_id=UUID(config.id),
+                source_status=parent.status,
+                source_state_name=artifact.filename,
+                state_fingerprint=validated.fingerprint,
+                current_epoch=progress.current_epoch if progress else None,
+                current_step=progress.current_step if progress else None,
+                source_total_epochs=_config_epochs(parent.config_snapshot),
+                target_total_epochs=config.epochs,
+                output_name=output_name,
+                compatibility=compatibility,
+                signature=signature,
+                command_summary=command_summary,
+                state_epoch=state_epoch,
+                state_step=state_step,
+                initial_epoch=state_epoch,
+                initial_step=state_step,
+                progress_epoch_offset=state_epoch,
+                progress_step_offset=state_step,
+                position_warning=position_warning,
             )
 
     def create_resume_job(
@@ -199,24 +216,38 @@ class TrainingResumeService:
                 raise UserFacingError(
                     "再開できないstateです: " + "; ".join(compatibility.issues)
                 )
+            request_fingerprint = _resume_request_fingerprint(
+                parent.id,
+                artifact.id,
+                config.id,
+                validated.fingerprint,
+                compatibility.target_config_fingerprint,
+            )
+            existing = session.scalar(
+                select(TrainingJobRecord).where(
+                    TrainingJobRecord.resume_request_fingerprint == request_fingerprint,
+                )
+            )
+            if existing is not None:
+                return UUID(existing.id)
             if preview_signature is not None:
                 expected = self._signature(
                     parent, artifact, config, validated, compatibility, session
                 )
                 if preview_signature != expected:
                     raise UserFacingError("再開プレビューが古くなっています")
-            existing = session.scalar(
-                select(TrainingJobRecord).where(
-                    TrainingJobRecord.parent_job_id == str(source_job_id),
-                    TrainingJobRecord.resume_artifact_id == artifact.id,
-                )
-            )
-            if existing is not None:
-                return UUID(existing.id)
+            initial_epoch = validated.state_epoch
+            initial_step = validated.state_step
             progress = session.scalar(
                 select(TrainingProgressRecord).where(
                     TrainingProgressRecord.training_job_id == str(source_job_id)
                 )
+            )
+            position_warning = _state_position_warning(
+                progress.current_epoch if progress else None,
+                progress.current_step if progress else None,
+                initial_epoch,
+                initial_step,
             )
             record = TrainingRepository(session).create_job(config)
             record.parent_job_id = parent.id
@@ -226,14 +257,17 @@ class TrainingResumeService:
             record.resume_validation_status = compatibility.status.value
             record.resume_validation_code = "RESUME_STATE_VALID"
             record.resume_validation_message = (
-                "; ".join(compatibility.issues) or "compatible"
+                "; ".join(
+                    compatibility.issues
+                    + ((position_warning,) if position_warning else ())
+                )
+                or "compatible"
             )
-            record.initial_epoch = (
-                progress.current_epoch if progress else artifact.epoch
-            )
-            record.initial_step = progress.current_step if progress else artifact.step
-            record.progress_step_offset = record.initial_step or 0
-            record.progress_epoch_offset = record.initial_epoch or 0
+            record.initial_epoch = initial_epoch
+            record.initial_step = initial_step
+            record.progress_step_offset = record.initial_step
+            record.progress_epoch_offset = record.initial_epoch
+            record.resume_request_fingerprint = request_fingerprint
             session.add(
                 TrainingResumeValidationRecord(
                     id=str(uuid4()),
@@ -253,7 +287,19 @@ class TrainingResumeService:
                     created_at=utc_now(),
                 )
             )
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                existing = session.scalar(
+                    select(TrainingJobRecord).where(
+                        TrainingJobRecord.resume_request_fingerprint
+                        == request_fingerprint
+                    )
+                )
+                if existing is None:
+                    raise
+                return UUID(existing.id)
             return UUID(record.id)
 
     def prepare_runtime(self, child_job_id: UUID, runtime: Path) -> tuple[Path, str]:
@@ -285,8 +331,24 @@ class TrainingResumeService:
             copied = self._scan_state_path(
                 destination, UUID(artifact.id), UUID(parent.id)
             )
+            copied = replace(
+                copied,
+                state_epoch=validated.state_epoch,
+                state_step=validated.state_step,
+            )
             if copied.fingerprint != validated.fingerprint:
                 raise UserFacingError("再開stateのコピー検証に失敗しました")
+            source_progress = session.scalar(
+                select(TrainingProgressRecord).where(
+                    TrainingProgressRecord.training_job_id == parent.id
+                )
+            )
+            position_warning = _state_position_warning(
+                source_progress.current_epoch if source_progress else None,
+                source_progress.current_step if source_progress else None,
+                copied.state_epoch,
+                copied.state_step,
+            )
             manifest = self._manifest(
                 parent,
                 artifact,
@@ -295,6 +357,9 @@ class TrainingResumeService:
                 session,
                 child.initial_epoch,
                 child.initial_step,
+                child.resume_request_fingerprint,
+                compatibility.target_config_fingerprint,
+                position_warning,
             )
             manifest_path = runtime / "config" / "resume-state-manifest.json"
             manifest_path.write_text(
@@ -377,27 +442,74 @@ class TrainingResumeService:
             expected = metadata.get("resume_state_fingerprint")
             if expected is not None and expected != validated.fingerprint:
                 raise UserFacingError("resume state changed after registration")
+        if validated.state_epoch is None or validated.state_step is None:
+            raise UserFacingError(
+                "resume state epoch/step could not be determined safely"
+            )
         compatibility = self._compatibility(session, parent, config, validated)
         return parent, artifact, config, validated, compatibility
 
     def _source_is_safe(self, parent: TrainingJobRecord) -> bool:
         if parent.status in {status.value for status in ACTIVE_STATUSES}:
             return False
-        if parent.status != TrainingJobStatus.STALE.value:
-            return True
+        if parent.status not in {status.value for status in RESUMABLE_STATUSES}:
+            return False
+
+        process_running = False
         if parent.pid is not None:
-            if self.process_adapter.is_running(parent.pid):
+            try:
+                process_running = self.process_adapter.is_running(parent.pid)
+                process_matches = self.process_adapter.process_matches(
+                    parent.pid, parent.process_group_id, parent.process_identity
+                )
+            except (OSError, RuntimeError, ValueError):
                 return False
-            if parent.process_identity is None:
+            if process_running or process_matches:
                 return False
-            if self.process_adapter.process_matches(
-                parent.pid, parent.process_group_id, parent.process_identity
+
+        terminal_record = parent.finished_at is not None and (
+            parent.exit_code is not None
+            or parent.failure_code is not None
+            or parent.status == TrainingJobStatus.CANCELED.value
+        )
+        if (
+            parent.pid is None
+            and any(
+                value is not None
+                for value in (
+                    parent.worker_id,
+                    parent.process_group_id,
+                    parent.process_identity,
+                    parent.process_start_time,
+                )
+            )
+            and not terminal_record
+        ):
+            return False
+
+        heartbeat = _as_utc(parent.worker_heartbeat)
+        heartbeat_expired = (
+            heartbeat is None
+            or (datetime.now(UTC) - heartbeat).total_seconds()
+            >= self.settings.training_job_stale_after_seconds
+        )
+        if parent.status == TrainingJobStatus.STALE.value and not heartbeat_expired:
+            return False
+        if not terminal_record and parent.status in {
+            TrainingJobStatus.FAILED.value,
+            TrainingJobStatus.CANCELED.value,
+        }:
+            if parent.pid is None and any(
+                value is not None
+                for value in (
+                    parent.worker_id,
+                    parent.process_group_id,
+                    parent.process_identity,
+                    parent.process_start_time,
+                )
             ):
                 return False
-        heartbeat = _as_utc(parent.worker_heartbeat)
-        if heartbeat is not None:
-            age = (datetime.now(UTC) - heartbeat).total_seconds()
-            if age < self.settings.training_job_stale_after_seconds:
+            if not heartbeat_expired:
                 return False
         return True
 
@@ -422,8 +534,14 @@ class TrainingResumeService:
             state.resolve(strict=True).relative_to(output.resolve(strict=True))
         except (OSError, ValueError) as exc:
             raise UserFacingError("stateが許可領域外です") from exc
-        return self._scan_state_path(
+        validated = self._scan_state_path(
             state, UUID(artifact.id), UUID(parent.id), relative
+        )
+        state_epoch, state_step = _state_position(artifact)
+        return replace(
+            validated,
+            state_epoch=state_epoch,
+            state_step=state_step,
         )
 
     def _scan_state_path(
@@ -646,6 +764,9 @@ class TrainingResumeService:
         session: Any,
         initial_epoch: int | None,
         initial_step: int | None,
+        request_fingerprint: str | None,
+        target_config_fingerprint: str | None,
+        position_warning: str | None,
     ) -> dict[str, Any]:
         snapshot = session.scalar(
             select(DatasetSnapshotRecord).where(
@@ -663,6 +784,8 @@ class TrainingResumeService:
             "source_artifact_id": artifact.id,
             "state_relative_path": artifact.relative_path,
             "state_fingerprint": state.fingerprint,
+            "state_epoch": state.state_epoch,
+            "state_step": state.state_step,
             "file_count": len(state.files),
             "total_size": state.total_size,
             "files": [
@@ -688,6 +811,12 @@ class TrainingResumeService:
             "epochs": config.epochs,
             "initial_epoch": initial_epoch,
             "initial_step": initial_step,
+            "progress_epoch_offset": initial_epoch,
+            "progress_step_offset": initial_step,
+            "target_config_id": config.id,
+            "target_config_fingerprint": target_config_fingerprint,
+            "resume_request_fingerprint": request_fingerprint,
+            "position_warning": position_warning,
             "validator_version": VALIDATOR_VERSION,
             "generated_at": datetime.now(UTC).isoformat(),
         }
@@ -854,6 +983,77 @@ def _json_object(value: str | None) -> object:
 
 def _fingerprint_values(values: dict[str, Any]) -> str:
     return _sha256_bytes(_canonical_json(values))
+
+
+def _resume_request_fingerprint(
+    parent_job_id: str,
+    artifact_id: str,
+    target_config_id: str,
+    state_fingerprint: str,
+    target_config_fingerprint: str | None,
+) -> str:
+    return _sha256_bytes(
+        _canonical_json(
+            {
+                "parent_job_id": parent_job_id,
+                "resume_artifact_id": artifact_id,
+                "target_training_config_id": target_config_id,
+                "state_fingerprint": state_fingerprint,
+                "target_config_fingerprint": target_config_fingerprint,
+                "validator_version": VALIDATOR_VERSION,
+            }
+        )
+    )
+
+
+def _state_position(artifact: TrainingArtifactRecord) -> tuple[int | None, int | None]:
+    metadata = _json_object(artifact.metadata_json)
+    values = metadata if isinstance(metadata, dict) else {}
+    epoch = artifact.epoch
+    step = artifact.step
+    if epoch is None:
+        epoch = _metadata_int(values, ("state_epoch", "epoch", "current_epoch"))
+    if step is None:
+        step = _metadata_int(values, ("state_step", "step", "current_step"))
+    return epoch, step
+
+
+def _metadata_int(values: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        value = values.get(key)
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _state_position_warning(
+    parent_epoch: int | None,
+    parent_step: int | None,
+    state_epoch: int | None,
+    state_step: int | None,
+) -> str | None:
+    differences: list[str] = []
+    if state_epoch is None:
+        differences.append("state epoch is unknown")
+    if state_step is None:
+        differences.append("state step is unknown")
+    if (
+        parent_epoch is not None
+        and state_epoch is not None
+        and parent_epoch != state_epoch
+    ):
+        differences.append(f"epoch parent={parent_epoch}, state={state_epoch}")
+    if parent_step is not None and state_step is not None and parent_step != state_step:
+        differences.append(f"step parent={parent_step}, state={state_step}")
+    return (
+        "selected state position differs from parent progress: "
+        + ", ".join(differences)
+        if differences
+        else None
+    )
 
 
 def _canonical_json(value: object) -> bytes:

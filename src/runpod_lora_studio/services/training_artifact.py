@@ -116,19 +116,27 @@ class TrainingArtifactScanner:
             for item in members
         ):
             return None
+        metadata = _read_state_metadata(path, self.max_metadata_size)
+        epoch = _number(path.name, "epoch")
+        if epoch is None:
+            epoch = _metadata_int(metadata, "epoch")
+        step = _state_step(path.name)
+        if step is None:
+            step = _metadata_int(metadata, "step")
         stat = path.stat()
         return DiscoveredArtifact(
             TrainingArtifactType.TRAINING_STATE,
             relative,
             path.name,
-            _number(path.name, "epoch"),
-            _state_step(path.name),
+            epoch,
+            step,
             sum(item.stat().st_size for item in members),
             None,
             datetime.fromtimestamp(stat.st_mtime, UTC),
             TrainingArtifactValidationStatus.VALID,
             "STATE_STRUCTURE_VALID",
             "state directory structure recognized",
+            metadata,
         )
 
     def _safetensors(
@@ -325,6 +333,20 @@ def _metadata_int(metadata: dict[str, Any] | None, key: str) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _read_state_metadata(path: Path, max_size: int) -> dict[str, Any] | None:
+    for filename in ("training_state.json", "state.json", "resume-state-manifest.json"):
+        metadata_path = path / filename
+        try:
+            if not metadata_path.is_file() or metadata_path.stat().st_size > max_size:
+                continue
+            value = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
 
 
 def _matches_state_name(name: str, output_name: str) -> bool:

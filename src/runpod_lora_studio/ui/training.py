@@ -300,11 +300,20 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
                         f"state: `{preview.source_state_name}`",
                         f"fingerprint: `{preview.state_fingerprint[:12]}`",
                         (
+                            f"state epoch/step: `{preview.state_epoch}` / "
+                            f"`{preview.state_step}`"
+                        ),
+                        (
+                            f"offset epoch/step: `{preview.progress_epoch_offset}` / "
+                            f"`{preview.progress_step_offset}`"
+                        ),
+                        (
                             f"epoch/step: `{preview.current_epoch}` / "
                             f"`{preview.current_step}`"
                         ),
                         f"compatibility: `{preview.compatibility.status.value}`",
                         f"不一致: {issues}",
+                        f"position warning: {preview.position_warning or 'なし'}",
                         f"command: `{preview.command_summary}`",
                     ]
                 ),

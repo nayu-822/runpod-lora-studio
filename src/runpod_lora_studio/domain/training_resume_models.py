@@ -39,6 +39,8 @@ class ValidatedResumeState:
     total_size: int
     validator_version: str
     generated_at: datetime
+    state_epoch: int | None = None
+    state_step: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,3 +67,10 @@ class TrainingResumePreview:
     compatibility: ResumeCompatibility
     signature: str
     command_summary: str
+    state_epoch: int | None = None
+    state_step: int | None = None
+    initial_epoch: int | None = None
+    initial_step: int | None = None
+    progress_epoch_offset: int | None = None
+    progress_step_offset: int | None = None
+    position_warning: str | None = None

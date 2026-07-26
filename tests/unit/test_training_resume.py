@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -10,7 +11,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from test_training import _config, _fixture, _wait
 
-from runpod_lora_studio.domain.training_models import TrainingConfig, TrainingJobStatus
+from runpod_lora_studio.domain.training_models import (
+    TrainingConfig,
+    TrainingConfigInput,
+    TrainingJobStatus,
+)
 from runpod_lora_studio.domain.training_progress_models import (
     ParsedTrainingProgress,
     TrainingLogParseResult,
@@ -20,7 +25,10 @@ from runpod_lora_studio.domain.training_progress_models import (
 )
 from runpod_lora_studio.external.training_process import FakeTrainingProcessAdapter
 from runpod_lora_studio.persistence.database import create_engine_for_settings
-from runpod_lora_studio.persistence.models import TrainingJobRecord
+from runpod_lora_studio.persistence.models import (
+    TrainingJobRecord,
+    TrainingProgressRecord,
+)
 from runpod_lora_studio.services.project_service import UserFacingError
 from runpod_lora_studio.services.training_command import SdScriptsCommandBuilder
 from runpod_lora_studio.services.training_progress_service import (
@@ -148,16 +156,40 @@ def test_resume_creates_child_copies_state_and_preserves_parent(
         _wait(service, parent_id, TrainingJobStatus.SUCCEEDED)
 
         parent_output = service.jobs_root / str(parent_id) / "output"
-        source_state = parent_output / "test-lora-1-state"
+        source_state = parent_output / "test-lora-500-state"
         source_state.mkdir()
         (source_state / "optimizer.pt").write_bytes(b"optimizer-state")
         (source_state / "scheduler.pt").write_bytes(b"scheduler-state")
+        (source_state / "training_state.json").write_text(
+            json.dumps({"epoch": 5, "step": 500}), encoding="utf-8"
+        )
         service.rescan_artifacts(parent_id)
         states = service.list_resume_states(parent_id)
         assert len(states) == 1
         artifact_id = UUID(states[0]["id"])
 
         with Session(create_engine_for_settings(settings)) as session:
+            now = datetime.now(UTC)
+            progress = session.scalar(
+                select(TrainingProgressRecord).where(
+                    TrainingProgressRecord.training_job_id == str(parent_id)
+                )
+            )
+            assert progress is not None
+            progress.current_epoch = 10
+            progress.total_epochs = 20
+            progress.current_step = 1000
+            progress.total_steps = 2000
+            progress.progress_ratio = 0.5
+            progress.latest_loss = 0.2
+            progress.smoothed_loss = 0.2
+            progress.learning_rate = 1e-4
+            progress.steps_per_second = 1.0
+            progress.samples_per_second = 1.0
+            progress.elapsed_seconds = 10.0
+            progress.estimated_remaining_seconds = 10.0
+            progress.latest_log_at = now
+            progress.updated_at = now
             record = session.scalar(
                 select(TrainingJobRecord).where(TrainingJobRecord.id == str(parent_id))
             )
@@ -169,14 +201,26 @@ def test_resume_creates_child_copies_state_and_preserves_parent(
 
         preview = service.preview_resume(parent_id, artifact_id)
         assert preview.compatibility.status.value == "compatible"
+        assert preview.state_epoch == 5
+        assert preview.state_step == 500
+        assert preview.initial_epoch == 5
+        assert preview.initial_step == 500
+        assert preview.position_warning is not None
         child_id = service.create_resume_job(
             parent_id, artifact_id, preview_signature=preview.signature
         )
         child = service.get_job(child_id)
         assert child.parent_job_id == parent_id
         assert child.resume_artifact_id == artifact_id
-        assert child.initial_epoch is None
-        assert child.initial_step is None
+        assert child.initial_epoch == 5
+        assert child.initial_step == 500
+        assert child.resume_request_fingerprint is not None
+        assert (
+            service.create_resume_job(
+                parent_id, artifact_id, preview_signature=preview.signature
+            )
+            == child_id
+        )
 
         service.start_job(child_id)
         _wait(service, child_id, TrainingJobStatus.SUCCEEDED)
@@ -192,12 +236,47 @@ def test_resume_creates_child_copies_state_and_preserves_parent(
         )
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert manifest["source_job_id"] == str(parent_id)
+        assert manifest["state_epoch"] == 5
+        assert manifest["state_step"] == 500
+        assert manifest["initial_epoch"] == 5
+        assert manifest["initial_step"] == 500
+        assert manifest["progress_step_offset"] == 500
+        assert (
+            manifest["resume_request_fingerprint"] == child.resume_request_fingerprint
+        )
+        assert manifest["position_warning"] is not None
 
         parent = service.get_job(parent_id)
         assert parent.status is TrainingJobStatus.FAILED
         assert not (
             service.jobs_root / str(parent_id) / "config" / "resume-state-manifest.json"
         ).exists()
+
+        extended_config = service.create_config(
+            TrainingConfigInput(
+                project_id=project_id,
+                dataset_snapshot_id=snapshot_id,
+                managed_model_id=model_id,
+                name="extended-config",
+                output_name="extended-lora",
+                output_directory=settings.outputs_dir,
+                sd_scripts_root=settings.training_sd_scripts_root,
+                epochs=2,
+            )
+        )
+        extended_preview = service.preview_resume(
+            parent_id, artifact_id, extended_config.id
+        )
+        extended_child_id = service.create_resume_job(
+            parent_id,
+            artifact_id,
+            target_config_id=extended_config.id,
+            preview_signature=extended_preview.signature,
+        )
+        assert extended_child_id != child_id
+        assert (
+            service.get_job(extended_child_id).training_config_id == extended_config.id
+        )
     finally:
         service.close()
 
@@ -214,6 +293,9 @@ def test_resume_rejects_active_parent_and_changed_state(test_workspace: Path) ->
         state = output / "test-lora-1-state"
         state.mkdir(parents=True)
         (state / "optimizer.pt").write_bytes(b"state")
+        (state / "training_state.json").write_text(
+            json.dumps({"epoch": 1, "step": 1}), encoding="utf-8"
+        )
         with Session(create_engine_for_settings(settings)) as session:
             record = session.scalar(
                 select(TrainingJobRecord).where(TrainingJobRecord.id == str(parent_id))
@@ -247,3 +329,76 @@ def test_resume_rejects_active_parent_and_changed_state(test_workspace: Path) ->
             service.preview_resume(parent_id, artifact_id)
     finally:
         service.close()
+
+
+def test_all_resumable_statuses_require_process_end_confirmation(
+    test_workspace: Path,
+) -> None:
+    settings, _, _, _ = _fixture(test_workspace)
+    fake = FakeTrainingProcessAdapter(running=True)
+    fake._processes[41000] = (True, None, 41000, "identity")
+    service = TrainingResumeService(settings, process_adapter=fake)
+    try:
+        for status in (
+            TrainingJobStatus.FAILED,
+            TrainingJobStatus.CANCELED,
+            TrainingJobStatus.STALE,
+        ):
+            parent = SimpleNamespace(
+                status=status.value,
+                pid=41000,
+                process_group_id=41000,
+                process_identity="identity",
+                process_start_time=None,
+                worker_id="worker",
+                finished_at=None,
+                exit_code=None,
+                failure_code=None,
+                worker_heartbeat=datetime.now(UTC),
+            )
+            assert not service._source_is_safe(parent)
+
+        finished = SimpleNamespace(
+            status=TrainingJobStatus.FAILED.value,
+            pid=41000,
+            process_group_id=41000,
+            process_identity="identity",
+            process_start_time=None,
+            worker_id="worker",
+            finished_at=datetime.now(UTC),
+            exit_code=3,
+            failure_code="process_exit_nonzero",
+            worker_heartbeat=datetime.now(UTC),
+        )
+        fake._processes[41000] = (False, 3, 41000, "identity")
+        assert service._source_is_safe(finished)
+
+        uncertain = SimpleNamespace(
+            status=TrainingJobStatus.CANCELED.value,
+            pid=None,
+            process_group_id=None,
+            process_identity=None,
+            process_start_time=None,
+            worker_id="worker",
+            finished_at=None,
+            exit_code=None,
+            failure_code=None,
+            worker_heartbeat=datetime.now(UTC),
+        )
+        assert not service._source_is_safe(uncertain)
+
+        no_process_metadata = SimpleNamespace(
+            status=TrainingJobStatus.FAILED.value,
+            pid=None,
+            process_group_id=None,
+            process_identity=None,
+            process_start_time=None,
+            worker_id=None,
+            finished_at=None,
+            exit_code=None,
+            failure_code=None,
+            worker_heartbeat=None,
+        )
+        assert service._source_is_safe(no_process_metadata)
+    finally:
+        del service

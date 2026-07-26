@@ -194,3 +194,4 @@ class TrainingJob:
     initial_step: int | None = None
     progress_step_offset: int | None = None
     progress_epoch_offset: int | None = None
+    resume_request_fingerprint: str | None = None
