@@ -919,6 +919,41 @@ class TrainingEnvironmentSnapshotRecord(Base):
     )
 
 
+class TrainingJobEnvironmentSnapshotRecord(Base):
+    __tablename__ = "training_job_environment_snapshots"
+    __table_args__ = (
+        UniqueConstraint("training_job_id", name="uq_training_job_environment_job"),
+        Index("ix_training_job_environment_job", "training_job_id"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    training_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("training_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    logical_gpu_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    physical_gpu_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gpu_uuid_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    gpu_architecture: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    compute_capability: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    total_vram_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cuda_available: Mapped[bool] = mapped_column(Integer, nullable=False)
+    sd_scripts_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    xformers_available: Mapped[bool | None] = mapped_column(Integer, nullable=True)
+    cuda_visible_devices: Mapped[str] = mapped_column(
+        String(512), nullable=False, default=""
+    )
+    visible_gpu_uuids_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]"
+    )
+    detector_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    detected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    warning_codes_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+
+
 class TrainingRecommendationRequestRecord(Base):
     __tablename__ = "training_recommendation_requests"
     __table_args__ = (
@@ -1041,6 +1076,9 @@ class TrainingExecutionSummaryRecord(Base):
         nullable=False,
     )
     recommendation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    training_job_environment_snapshot_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True
+    )
     environment_snapshot_id: Mapped[str | None] = mapped_column(
         String(36), nullable=True
     )
@@ -1127,6 +1165,12 @@ class TrainingExecutionSummaryRecord(Base):
     )
     measurement_version: Mapped[str] = mapped_column(
         String(32), nullable=False, default="phase7b-memory-v1"
+    )
+    memory_warning_codes_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]"
+    )
+    memory_failure_codes_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]"
     )
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     oom_detected: Mapped[bool] = mapped_column(Integer, nullable=False, default=False)
@@ -1216,6 +1260,8 @@ class TrainingMemoryAggregateRecord(Base):
     measurement_version: Mapped[str] = mapped_column(
         String(32), nullable=False, default="phase7b-memory-v1"
     )
+    warning_codes_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    failure_codes_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )

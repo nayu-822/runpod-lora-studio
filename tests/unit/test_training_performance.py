@@ -3,7 +3,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from runpod_lora_studio.domain.recommendation_models import TrainingRecommendation
+from runpod_lora_studio.domain.recommendation_models import (
+    ComputeEnvironmentInfo,
+    GPUDeviceInfo,
+    TrainingRecommendation,
+)
 from runpod_lora_studio.domain.training_performance_models import (
     CalibrationConfidence,
     GpuMemorySample,
@@ -25,6 +29,10 @@ from runpod_lora_studio.services.training_calibration_service import (
 from runpod_lora_studio.services.training_failure_classifier import (
     TrainingFailureClassifier,
 )
+from runpod_lora_studio.services.training_job_environment_service import (
+    _snapshot_from_info,
+)
+from runpod_lora_studio.services.training_memory_monitor import _select_sample
 
 
 def _summary(
@@ -120,6 +128,56 @@ def test_gpu_memory_metrics_convert_mib_and_return_null_on_invalid_samples() -> 
         summarize_gpu_memory((GpuMemorySample(timestamp, 0, 10, 11),)).total_bytes
         is None
     )
+
+
+def test_execution_snapshot_maps_cuda_visible_devices_to_physical_gpu() -> None:
+    info = ComputeEnvironmentInfo(
+        gpu_devices=(
+            GPUDeviceInfo(index=0, name="A", uuid="GPU-a", total_vram_bytes=10),
+            GPUDeviceInfo(index=2, name="B", uuid="GPU-b", total_vram_bytes=20),
+        ),
+        cuda_available=True,
+    )
+    snapshot = _snapshot_from_info(
+        uuid4(),
+        info,
+        "sd-scripts-test",
+        True,
+        {"CUDA_VISIBLE_DEVICES": "2"},
+        datetime.now(UTC),
+        "test-detector",
+    )
+
+    assert snapshot.logical_gpu_index == 0
+    assert snapshot.physical_gpu_index == 2
+    assert snapshot.gpu_uuid_fingerprint == gpu_uuid_fingerprint("GPU-b")
+    assert snapshot.visible_gpu_uuid_fingerprints == (gpu_uuid_fingerprint("GPU-b"),)
+
+
+def test_gpu_sample_selection_never_falls_back_to_another_gpu() -> None:
+    timestamp = datetime.now(UTC)
+    samples = (
+        GpuMemorySample(
+            timestamp,
+            0,
+            16 * 1024**3,
+            8 * 1024**3,
+            gpu_uuid_fingerprint="a",
+            gpu_identity_verified=True,
+        ),
+        GpuMemorySample(
+            timestamp,
+            1,
+            16 * 1024**3,
+            8 * 1024**3,
+            gpu_uuid_fingerprint="b",
+            gpu_identity_verified=True,
+        ),
+    )
+
+    assert _select_sample(samples, ("b",)) is samples[1]
+    assert _select_sample(samples, ()) is None
+    assert _select_sample(samples, ("missing",)) is None
 
 
 def test_nvidia_smi_attributes_target_pid_per_gpu_and_rejects_over_total(

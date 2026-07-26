@@ -542,6 +542,10 @@ Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は�
 
 ## Phase 7B完了: 学習実績を利用した推奨補正・履歴比較・OOMフィードバック
 
+- 各TrainingJobの開始境界で、推奨の有無に依存しない不変の実行環境snapshotを追加する。論理/物理GPU、UUID fingerprint、architecture/compute capability、total VRAM、CUDA、正規化済みCUDA_VISIBLE_DEVICES、sd-scripts/xformers、detector version、detected_atを保存し、秘密情報やホスト情報は保存しない。
+- GPU UUIDとCUDA_VISIBLE_DEVICESの対応、PID/process identity/groupを検証し、複数GPUやGPU変更時は安全側に倒す。実行時snapshotをsummary/calibrationの正本とし、推奨時snapshotは比較・stale判定だけに使う。手動jobでもtarget process peakを利用可能にする。
+- Alembic `0022_phase7b_job_environment`と`0023_phase7b_memory_failure_codes`を追加する。既存の`0019`〜`0021`は変更しない。固定warning/failure codeとmigration後の再解析でも不変なGPU選択結果を保存する。
+
 - `TrainingPerformanceCollector`でジョブ、進捗、metric、設定、環境snapshot、終端ログの限定末尾から、ジョブ単位の`TrainingExecutionSummary`を冪等に収集する。収集失敗は元jobの状態を変更しない
 - `TrainingFailureClassifier`はOOM、system OOM、disk、model/dataset、dependency、cancel、stale、process killed、unknownを証拠コード付きで分類する。ログ本文、秘密、絶対パス、raw nvidia-smi出力は保存しない
 - `NvidiaSmiGpuMemoryAdapter`は学習中に既定5秒間隔でheartbeat等と独立して動作し、固定argv、`shell=False`、timeout、出力上限、MiBからbytesへの検証済み変換を行う。正のjob PID、callerで検証済みのprocess identity/group、GPU UUIDを使ってtarget processを同定し、確認できないtarget peakはNULL、全GPUfreeは低信頼として保存する。測定は`training_memory_aggregates`へ1 job 1行の冪等集約として復元可能に保存する

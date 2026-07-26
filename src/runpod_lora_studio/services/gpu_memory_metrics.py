@@ -27,7 +27,7 @@ class GpuMemoryMetricsAdapter(Protocol):
 
 
 def gpu_uuid_fingerprint(value: str) -> str:
-    return hashlib.sha256(f"gpu-uuid:{value.strip()}".encode()).hexdigest()[:32]
+    return hashlib.sha256(f"gpu-uuid:{value.strip().lower()}".encode()).hexdigest()[:32]
 
 
 class NvidiaSmiGpuMemoryAdapter:

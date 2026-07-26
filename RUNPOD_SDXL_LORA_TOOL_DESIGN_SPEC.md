@@ -1751,6 +1751,10 @@ recommendation_engine_version: 1.0.0
 
 ## Phase 7B: 学習中VRAM測定と校正互換性
 
+学習開始時にはrecommendation provenanceとは独立したjob execution environment snapshotを作成する。snapshotは論理GPU index、nvidia-smiの物理GPU index、短縮GPU UUID fingerprint、architecture/compute capability、total VRAM、CUDA利用可否、正規化済み`CUDA_VISIBLE_DEVICES`、sd-scripts version、xformers可否、detector version、detected_atだけを保持し、immutableとする。手動設定や旧設定にも同じsnapshot経路を適用する。
+
+`CUDA_VISIBLE_DEVICES`の論理GPUを物理index/UUIDへ解決し、PIDのprocess identity/groupとGPU UUIDを検証する。実行時snapshotのUUIDを測定・summary・校正の正本とし、recommendation時snapshotは差分比較だけに利用する。複数GPUで対象を一意に特定できない場合やGPUが途中で変わった場合は先頭GPUへフォールバックせず、`GPU_IDENTITY_UNAVAILABLE`、`EXPECTED_GPU_NOT_FOUND`、`TARGET_PID_NOT_FOUND`、`PROCESS_IDENTITY_MISMATCH`、`PROCESS_GROUP_MISMATCH`、`AMBIGUOUS_GPU_SELECTION`、`GPU_CHANGED_DURING_JOB`の固定コードを保存する。
+
 学習workerはheartbeat、進捗解析、artifact走査から独立した間隔でGPUメモリを測定する。既定間隔は5秒で、`nvidia-smi`の固定queryと`shell=False`を使用する。ジョブPIDのprocess identity/groupと環境snapshotのGPU UUIDを確認できない測定はtarget process peakに採用せず、全GPUのfree/minimumを低信頼の参考値として扱う。
 
 測定値はjobごとにboundedな集約レコードへ冪等に保存し、再起動後に復元する。終端性能サマリーは単発の終端測定ではなく集約レコードからtarget/全GPU/他プロセスpeak、開始前・最小・終了後free、件数、失敗件数、時刻範囲を読み取る。メモリ校正はtarget identity、サンプル数、confidence、coverage、他プロセス影響、GPU不変性を検証する。

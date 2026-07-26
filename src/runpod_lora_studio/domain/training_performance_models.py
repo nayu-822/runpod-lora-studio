@@ -71,6 +71,8 @@ class GpuMemorySummary:
     gpu_identity_verified: bool = False
     coverage_seconds: float | None = None
     measurement_version: str = "phase7b-memory-v1"
+    warning_codes: tuple[str, ...] = ()
+    failure_codes: tuple[str, ...] = ()
     other_process_ratio: float | None = None
     confidence: CalibrationConfidence = CalibrationConfidence.NONE
 
@@ -96,6 +98,8 @@ class GpuMemoryAggregate:
     confidence: CalibrationConfidence = CalibrationConfidence.NONE
     last_sample_fingerprint: str | None = None
     measurement_version: str = "phase7b-memory-v2"
+    warning_codes: tuple[str, ...] = ()
+    failure_codes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +117,7 @@ class TrainingExecutionSummary:
     gpu_index: int | None = None
     dataset_scale_fingerprint: str | None = None
     environment_snapshot_id: UUID | None = None
+    training_job_environment_snapshot_id: UUID | None = None
     recommendation_id: UUID | None = None
     gpu_total_vram_bytes: int | None = None
     resolution: int | None = None
@@ -154,6 +159,8 @@ class TrainingExecutionSummary:
     process_identity_verified: bool = False
     gpu_identity_verified: bool = False
     measurement_version: str = "phase7b-memory-v1"
+    memory_warning_codes: tuple[str, ...] = ()
+    memory_failure_codes: tuple[str, ...] = ()
     exit_code: int | None = None
     oom_detected: bool = False
     failure_category: TrainingFailureCategory = TrainingFailureCategory.NONE

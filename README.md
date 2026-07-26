@@ -303,6 +303,11 @@ Phase 7Aでは、CUDA/GPU/VRAM、bf16、xformers、bitsandbytes、sd-scriptsの�
 
 ## Phase 7B: 学習実績による推奨補正と履歴比較
 
+学習開始時には推奨結果とは独立して、ジョブ専用の実行環境snapshotを一度だけ保存します。snapshotには論理GPU・物理GPU・GPU UUID fingerprint、architecture/compute capability、total VRAM、CUDA利用可否、正規化済み`CUDA_VISIBLE_DEVICES`、sd-scripts/xformers、検出version、検出時刻だけを記録し、秘密情報やホスト情報は保存しません。手動設定・旧設定・推奨snapshot欠落でも同じ経路で記録します。
+
+- GPU選択は実行時snapshotを基準にし、`CUDA_VISIBLE_DEVICES`の論理番号とnvidia-smiの物理番号/UUIDを対応付けます。複数GPUでは対象PIDのprocess identity/groupとUUIDが一意に検証できた場合だけ実測GPUを採用し、判定不能時に先頭GPUへフォールバックしません。
+- 推奨時snapshotは比較用 provenance に限定します。実行GPUが変わった場合は警告・校正除外またはジョブ失敗コードを保存し、実行時snapshotと測定失敗コード（`GPU_IDENTITY_UNAVAILABLE`、`EXPECTED_GPU_NOT_FOUND`、`TARGET_PID_NOT_FOUND`、`PROCESS_IDENTITY_MISMATCH`、`PROCESS_GROUP_MISMATCH`、`AMBIGUOUS_GPU_SELECTION`、`GPU_CHANGED_DURING_JOB`）を保持します。
+
 Phase 7Bは、完了した学習jobから速度、VRAM使用量、終了理由を収集し、Phase 7Aのルール推奨を補足する決定論的な校正機能です。過去実績だけで設定を決定せず、GPU fingerprint、VRAMクラス、アーキテクチャ、解像度、batch、gradient accumulation、effective batch、LoRA module/dim/alpha、precision、optimizer、cache/checkpointing、world size、sd-scripts version、xformers可否が一致する履歴だけを利用します。
 
 - 成果は`training_execution_summaries`へジョブ単位で冪等に保存し、OOM・キャンセル・不明失敗は速度校正から除外します。ログ本文や秘密情報は保存せず、許可された証拠コードだけを失敗分類へ記録します。

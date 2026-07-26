@@ -25,6 +25,9 @@ from runpod_lora_studio.domain.storage_models import (
     TransferDirection,
     TransferStatus,
 )
+from runpod_lora_studio.domain.training_environment_models import (
+    TrainingJobEnvironmentSnapshot,
+)
 from runpod_lora_studio.domain.training_models import (
     TrainingConfig,
     TrainingConfigInput,
@@ -65,6 +68,9 @@ from runpod_lora_studio.services.training_command import (
     TrainingCommand,
     TrainingCommandValidationError,
 )
+from runpod_lora_studio.services.training_job_environment_service import (
+    TrainingJobEnvironmentService,
+)
 from runpod_lora_studio.services.training_memory_monitor import TrainingMemoryMonitor
 from runpod_lora_studio.services.training_performance_service import (
     TrainingPerformanceCollector,
@@ -79,6 +85,10 @@ from runpod_lora_studio.services.training_resume_service import (
 logger = logging.getLogger("runpod_lora_studio.training")
 
 
+class TrainingEnvironmentMismatchError(UserFacingError):
+    """Raised when a recommendation cannot be used on the execution GPU."""
+
+
 class TrainingService:
     """Persist and execute Phase 6A training jobs outside Gradio callbacks."""
 
@@ -89,6 +99,7 @@ class TrainingService:
         process_adapter: TrainingProcessAdapter | None = None,
         command_builder: SdScriptsCommandBuilder | None = None,
         memory_adapter: GpuMemoryMetricsAdapter | None = None,
+        job_environment_service: TrainingJobEnvironmentService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = create_session_factory(settings)
@@ -101,6 +112,9 @@ class TrainingService:
         self.progress_service = TrainingProgressService(settings)
         self.performance_collector = TrainingPerformanceCollector(settings)
         self.memory_monitor = TrainingMemoryMonitor(settings, adapter=memory_adapter)
+        self.job_environment_service = (
+            job_environment_service or TrainingJobEnvironmentService(settings)
+        )
         self.resume_service = TrainingResumeService(
             settings, process_adapter=self.process_adapter
         )
@@ -393,6 +407,10 @@ class TrainingService:
                 job_id, worker_id
             )
             environment = _safe_environment()
+            job_environment = self.job_environment_service.capture(
+                job_id, environment=environment
+            )
+            self._validate_recommendation_environment(job_id, job_environment)
             try:
                 self.memory_monitor.capture_before_start(
                     job_id,
@@ -413,6 +431,22 @@ class TrainingService:
             )
             self._mark_running(job_id, worker_id, started, command, runtime)
             self._monitor_job(job_id, started)
+        except TrainingEnvironmentMismatchError as exc:
+            logger.warning(
+                "training_environment_mismatch job_id=%s message=%s", job_id, exc
+            )
+            if started is not None and self._process_matches(job_id, started):
+                try:
+                    self.process_adapter.terminate(started.pid)
+                except OSError:
+                    logger.exception(
+                        "training_worker_terminate_failed job_id=%s", job_id
+                    )
+            self._mark_failed(
+                job_id,
+                "gpu_environment_changed_since_recommendation",
+                str(exc),
+            )
         except Exception:
             logger.exception("training_worker_failed job_id=%s", job_id)
             if started is not None and self._process_matches(job_id, started):
@@ -690,57 +724,73 @@ class TrainingService:
                 session.commit()
 
     def _expected_gpu_fingerprints(self, job_id: UUID) -> tuple[str, ...]:
+        snapshot = self.job_environment_service.get(job_id)
+        return snapshot.visible_gpu_uuid_fingerprints if snapshot else ()
+
+    def _validate_recommendation_environment(
+        self, job_id: UUID, job_environment: TrainingJobEnvironmentSnapshot
+    ) -> None:
+        selected = job_environment.gpu_uuid_fingerprint
+        visible = set(job_environment.visible_gpu_uuid_fingerprints)
         with self.session_factory() as session:
             job = session.scalar(
                 select(TrainingJobRecord).where(TrainingJobRecord.id == str(job_id))
             )
             if job is None:
-                return ()
+                return
             config = session.scalar(
                 select(TrainingConfigRecord).where(
                     TrainingConfigRecord.id == job.training_config_id
                 )
             )
             if config is None or config.recommendation_id is None:
-                return ()
+                return
             recommendation = session.scalar(
                 select(TrainingRecommendationRecord).where(
                     TrainingRecommendationRecord.id == config.recommendation_id
                 )
             )
             if recommendation is None:
-                return ()
+                return
             request = session.scalar(
                 select(TrainingRecommendationRequestRecord).where(
                     TrainingRecommendationRequestRecord.id == recommendation.request_id
                 )
             )
             if request is None:
-                return ()
-            snapshot = session.scalar(
+                return
+            expected_record = session.scalar(
                 select(ComputeEnvironmentSnapshotRecord).where(
                     ComputeEnvironmentSnapshotRecord.id
                     == request.environment_snapshot_id
                 )
             )
-            if snapshot is None:
-                return ()
+            if expected_record is None:
+                return
             try:
-                payload = json.loads(snapshot.payload_json)
+                payload = json.loads(expected_record.payload_json)
             except ValueError:
-                return ()
+                return
             devices = payload.get("gpu_devices") if isinstance(payload, dict) else None
-            if not isinstance(devices, list):
-                return ()
-            from runpod_lora_studio.services.gpu_memory_metrics import (
-                gpu_uuid_fingerprint,
+            expected = (
+                {
+                    _gpu_fingerprint_from_payload(device)
+                    for device in devices
+                    if isinstance(device, dict) and device.get("uuid")
+                }
+                if isinstance(devices, list)
+                else set()
             )
-
-            return tuple(
-                gpu_uuid_fingerprint(str(device["uuid"]))
-                for device in devices
-                if isinstance(device, dict) and device.get("uuid")
-            )
+            if not expected:
+                return
+            if selected is not None and selected not in expected:
+                raise TrainingEnvironmentMismatchError(
+                    "execution GPU differs from recommendation snapshot"
+                )
+            if selected is None and visible and not (visible & expected):
+                raise TrainingEnvironmentMismatchError(
+                    "execution GPU differs from recommendation snapshot"
+                )
 
     def _cancel_requested(self, job_id: UUID) -> bool:
         with self.session_factory() as session:
@@ -1079,6 +1129,12 @@ def _safe_environment() -> dict[str, str]:
         "CUDA_VISIBLE_DEVICES",
     }
     return {key: value for key, value in os.environ.items() if key in allowed}
+
+
+def _gpu_fingerprint_from_payload(device: dict[str, object]) -> str:
+    from runpod_lora_studio.services.gpu_memory_metrics import gpu_uuid_fingerprint
+
+    return gpu_uuid_fingerprint(str(device["uuid"]))
 
 
 def _utc(value: datetime | None) -> datetime | None:

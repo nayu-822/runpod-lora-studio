@@ -26,6 +26,7 @@ from runpod_lora_studio.persistence.models import (
     RecommendationCalibrationSourceRecord,
     TrainingConfigRecord,
     TrainingExecutionSummaryRecord,
+    TrainingJobEnvironmentSnapshotRecord,
     TrainingJobRecord,
     TrainingMemoryAggregateRecord,
     TrainingMetricPointRecord,
@@ -107,6 +108,11 @@ class TrainingPerformanceCollector:
                 if recommendation is not None
                 else None
             )
+            job_environment = session.scalar(
+                select(TrainingJobEnvironmentSnapshotRecord).where(
+                    TrainingJobEnvironmentSnapshotRecord.training_job_id == str(job_id)
+                )
+            )
             environment_snapshot_id = (
                 UUID(request.environment_snapshot_id) if request else None
             )
@@ -129,15 +135,49 @@ class TrainingPerformanceCollector:
                     if isinstance(parsed_payload, dict):
                         environment_payload = parsed_payload
             metadata = _read_metadata(job.runtime_directory)
-            gpu_fingerprint, gpu_total, gpu_architecture, gpu_index = _gpu_identity(
-                metadata, environment_payload
-            )
-            memory = _memory_summary_from_record(
-                session.scalar(
-                    select(TrainingMemoryAggregateRecord).where(
-                        TrainingMemoryAggregateRecord.training_job_id == str(job_id)
-                    )
+            if job_environment is not None:
+                metadata = {
+                    **metadata,
+                    "sd_scripts_version": job_environment.sd_scripts_version
+                    or metadata.get("sd_scripts_version"),
+                    "xformers_available": (
+                        job_environment.xformers_available
+                        if job_environment.xformers_available is not None
+                        else metadata.get("xformers_available")
+                    ),
+                }
+            memory_record = session.scalar(
+                select(TrainingMemoryAggregateRecord).where(
+                    TrainingMemoryAggregateRecord.training_job_id == str(job_id)
                 )
+            )
+            memory = _memory_summary_from_record(memory_record)
+            measured_gpu_verified = (
+                memory.gpu_identity_verified and memory.gpu_uuid_fingerprint is not None
+            )
+            gpu_fingerprint = (
+                job_environment.gpu_uuid_fingerprint
+                if job_environment and job_environment.gpu_uuid_fingerprint is not None
+                else memory.gpu_uuid_fingerprint
+                if measured_gpu_verified
+                else None
+            )
+            gpu_total = (
+                job_environment.total_vram_bytes
+                if job_environment and job_environment.total_vram_bytes is not None
+                else memory.total_bytes
+                if measured_gpu_verified
+                else None
+            )
+            gpu_architecture = (
+                job_environment.gpu_architecture if job_environment else None
+            )
+            gpu_index = (
+                job_environment.logical_gpu_index
+                if job_environment and job_environment.logical_gpu_index is not None
+                else memory.gpu_index
+                if measured_gpu_verified
+                else None
             )
             stdout = _read_tail(
                 job.stdout_log_path, self.settings.training_log_tail_bytes
@@ -182,6 +222,15 @@ class TrainingPerformanceCollector:
                 initial_step=job.initial_step,
                 parse_warning=progress.parse_warning if progress else None,
             )
+            if _runtime_gpu_differs_from_recommendation(
+                job_environment, environment_payload
+            ):
+                exclusion_reasons = tuple(
+                    sorted(
+                        set(exclusion_reasons)
+                        | {"gpu_environment_changed_since_recommendation"}
+                    )
+                )
             failure_category = classification.category
             usable_speed = (
                 not exclusion_reasons
@@ -224,6 +273,9 @@ class TrainingPerformanceCollector:
                 settings_fingerprint=settings_fingerprint,
                 recommendation_id=recommendation_id,
                 environment_snapshot_id=environment_snapshot_id,
+                job_environment_snapshot_id=(
+                    UUID(job_environment.id) if job_environment else None
+                ),
                 classifier_version=classification.classifier_version,
                 now=utc_now(),
             )
@@ -267,6 +319,7 @@ def _make_summary(
     settings_fingerprint: str,
     recommendation_id: UUID | None,
     environment_snapshot_id: UUID | None,
+    job_environment_snapshot_id: UUID | None,
     classifier_version: str,
     now: datetime,
 ) -> TrainingExecutionSummary:
@@ -290,6 +343,7 @@ def _make_summary(
         "settings_fingerprint": settings_fingerprint,
         "recommendation_id": recommendation_id,
         "environment_snapshot_id": environment_snapshot_id,
+        "training_job_environment_snapshot_id": job_environment_snapshot_id,
         "dataset_scale_fingerprint": dataset_fingerprint,
         "gpu_total_vram_bytes": gpu_total,
         "resolution": config.resolution,
@@ -331,6 +385,8 @@ def _make_summary(
         "process_identity_verified": memory.process_identity_verified,
         "gpu_identity_verified": memory.gpu_identity_verified,
         "measurement_version": memory.measurement_version,
+        "memory_warning_codes": memory.warning_codes,
+        "memory_failure_codes": memory.failure_codes,
         "exit_code": job.exit_code,
         "oom_detected": failure_category
         in {
@@ -415,6 +471,11 @@ def _summary_from_record(
         environment_snapshot_id=UUID(record.environment_snapshot_id)
         if record.environment_snapshot_id
         else None,
+        training_job_environment_snapshot_id=(
+            UUID(record.training_job_environment_snapshot_id)
+            if record.training_job_environment_snapshot_id
+            else None
+        ),
         dataset_scale_fingerprint=record.dataset_scale_fingerprint,
         **{name: getattr(record, name) for name in _SUMMARY_FIELDS},
         failure_evidence_codes=tuple(
@@ -422,6 +483,8 @@ def _summary_from_record(
         ),
         exclusion_reasons=tuple(json.loads(record.exclusion_reasons_json or "[]")),
         memory_confidence=CalibrationConfidence(record.memory_confidence),
+        memory_warning_codes=_json_tuple(record.memory_warning_codes_json),
+        memory_failure_codes=_json_tuple(record.memory_failure_codes_json),
         failure_category=TrainingFailureCategory(record.failure_category),
         created_at=record.created_at,
         updated_at=record.updated_at,
@@ -502,7 +565,11 @@ def _record_values(summary: TrainingExecutionSummary) -> dict[str, object]:
         "managed_model_id",
     ):
         values[key] = str(values[key])
-    for key in ("recommendation_id", "environment_snapshot_id"):
+    for key in (
+        "recommendation_id",
+        "environment_snapshot_id",
+        "training_job_environment_snapshot_id",
+    ):
         if values[key] is not None:
             values[key] = str(values[key])
     values["failure_category"] = summary.failure_category.value
@@ -513,8 +580,16 @@ def _record_values(summary: TrainingExecutionSummary) -> dict[str, object]:
     values["exclusion_reasons_json"] = json.dumps(
         summary.exclusion_reasons, sort_keys=True
     )
+    values["memory_warning_codes_json"] = json.dumps(
+        summary.memory_warning_codes, sort_keys=True
+    )
+    values["memory_failure_codes_json"] = json.dumps(
+        summary.memory_failure_codes, sort_keys=True
+    )
     values.pop("failure_evidence_codes")
     values.pop("exclusion_reasons")
+    values.pop("memory_warning_codes")
+    values.pop("memory_failure_codes")
     return values
 
 
@@ -601,9 +676,36 @@ def _memory_summary_from_record(
         gpu_identity_verified=bool(record.gpu_identity_verified),
         coverage_seconds=coverage,
         measurement_version=record.measurement_version,
+        warning_codes=_json_tuple(record.warning_codes_json),
+        failure_codes=_json_tuple(record.failure_codes_json),
         other_process_ratio=other_ratio,
         confidence=CalibrationConfidence(record.confidence),
     )
+
+
+def _runtime_gpu_differs_from_recommendation(
+    job_environment: TrainingJobEnvironmentSnapshotRecord | None,
+    recommendation_payload: dict[str, object],
+) -> bool:
+    if job_environment is None:
+        return False
+    devices = recommendation_payload.get("gpu_devices")
+    if not isinstance(devices, list):
+        return False
+    expected = {
+        gpu_uuid_fingerprint(str(device["uuid"]))
+        for device in devices
+        if isinstance(device, dict) and device.get("uuid")
+    }
+    if not expected:
+        return False
+    if job_environment.gpu_uuid_fingerprint is not None:
+        return job_environment.gpu_uuid_fingerprint not in expected
+    try:
+        visible = set(json.loads(job_environment.visible_gpu_uuids_json or "[]"))
+    except (TypeError, ValueError):
+        visible = set()
+    return bool(visible) and not (visible & expected)
 
 
 def _mark_related_calibrations_stale(session: Any, summary_id: str) -> None:
@@ -621,6 +723,16 @@ def _mark_related_calibrations_stale(session: Any, summary_id: str) -> None:
 def _string_option(values: dict[str, object], key: str) -> str | None:
     value = values.get(key)
     return str(value) if value is not None else None
+
+
+def _json_tuple(value: str | None) -> tuple[str, ...]:
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(sorted(str(item) for item in parsed if item))
 
 
 def _settings_fingerprint(config: TrainingConfigRecord) -> str:

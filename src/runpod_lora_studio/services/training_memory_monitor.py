@@ -110,6 +110,7 @@ class TrainingMemoryMonitor:
         expected_gpu_uuid_fingerprints: Sequence[str],
     ) -> GpuMemoryAggregate:
         samples: tuple[GpuMemorySample, ...]
+        measurement_failed = False
         try:
             if pid is not None and pid <= 0:
                 samples = ()
@@ -123,6 +124,7 @@ class TrainingMemoryMonitor:
                 )
         except Exception:
             samples = ()
+            measurement_failed = True
         sample = _select_sample(samples, expected_gpu_uuid_fingerprints)
         with self.session_factory() as session:
             record = session.scalar(
@@ -139,14 +141,39 @@ class TrainingMemoryMonitor:
                 )
                 session.add(record)
             aggregate_changed = False
+            if measurement_failed:
+                _add_codes(record, "failure_codes_json", ("NVIDIA_SMI_QUERY_FAILED",))
             if sample is None:
                 record.failed_sample_count += 1
                 aggregate_changed = True
+                _add_codes(
+                    record,
+                    "failure_codes_json",
+                    _selection_failure_codes(
+                        samples,
+                        pid=pid,
+                        process_group_id=process_group_id,
+                        process_identity_verified=process_identity_verified,
+                        expected=expected_gpu_uuid_fingerprints,
+                    ),
+                )
             else:
                 fingerprint = _sample_fingerprint(sample)
                 if fingerprint != record.last_sample_fingerprint:
-                    _merge_sample(record, sample, fingerprint)
+                    merge_code = _merge_sample(record, sample, fingerprint)
+                    if merge_code:
+                        _add_codes(record, "failure_codes_json", (merge_code,))
                     aggregate_changed = True
+            if pid is not None and not process_identity_verified:
+                _add_codes(record, "warning_codes_json", ("PROCESS_IDENTITY_MISMATCH",))
+            if sample is not None and not sample.gpu_identity_verified:
+                _add_codes(record, "warning_codes_json", ("GPU_IDENTITY_UNAVAILABLE",))
+            if (
+                sample is not None
+                and pid is not None
+                and sample.process_used_bytes is None
+            ):
+                _add_codes(record, "failure_codes_json", ("TARGET_PID_NOT_FOUND",))
             record.sample_count = min(
                 record.sample_count, self.settings.training_memory_max_samples
             )
@@ -191,24 +218,30 @@ def _select_sample(
         for sample in samples
         if sample.identity_verified and sample.gpu_identity_verified
     ]
-    if target:
+    if len(target) == 1:
         return target[0]
+    if len(target) > 1:
+        return None
     expected_set = set(expected)
     matching = [
         sample for sample in samples if sample.gpu_uuid_fingerprint in expected_set
     ]
-    return matching[0] if matching else samples[0]
+    if len(matching) == 1:
+        return matching[0]
+    if expected_set or len(samples) != 1:
+        return None
+    return samples[0]
 
 
 def _merge_sample(
     record: TrainingMemoryAggregateRecord,
     sample: GpuMemorySample,
     fingerprint: str,
-) -> None:
+) -> str | None:
     if record.gpu_index is not None and record.gpu_index != sample.gpu_index:
         record.failed_sample_count += 1
         record.gpu_identity_verified = False
-        return
+        return "GPU_CHANGED_DURING_JOB"
     if (
         record.gpu_uuid_fingerprint is not None
         and sample.gpu_uuid_fingerprint is not None
@@ -216,7 +249,7 @@ def _merge_sample(
     ):
         record.failed_sample_count += 1
         record.gpu_identity_verified = False
-        return
+        return "GPU_CHANGED_DURING_JOB"
     record.gpu_index = sample.gpu_index
     record.gpu_uuid_fingerprint = sample.gpu_uuid_fingerprint
     record.gpu_total_vram_bytes = _max_value(
@@ -253,6 +286,7 @@ def _merge_sample(
         record.gpu_identity_verified or sample.gpu_identity_verified
     )
     record.last_sample_fingerprint = fingerprint
+    return None
 
 
 def _aggregate_from_record(
@@ -278,7 +312,64 @@ def _aggregate_from_record(
         confidence=CalibrationConfidence(record.confidence),
         last_sample_fingerprint=record.last_sample_fingerprint,
         measurement_version=record.measurement_version,
+        warning_codes=_codes_from_json(record.warning_codes_json),
+        failure_codes=_codes_from_json(record.failure_codes_json),
     )
+
+
+def _selection_failure_codes(
+    samples: Sequence[GpuMemorySample],
+    *,
+    pid: int | None,
+    process_group_id: int | None,
+    process_identity_verified: bool,
+    expected: Sequence[str],
+) -> tuple[str, ...]:
+    process_codes: list[str] = []
+    if pid is not None:
+        if process_group_id is None:
+            process_codes.append("PROCESS_GROUP_MISMATCH")
+        if not process_identity_verified:
+            process_codes.append("PROCESS_IDENTITY_MISMATCH")
+    if not samples:
+        if pid is not None:
+            return tuple(process_codes + ["TARGET_PID_NOT_FOUND"])
+        return ("GPU_IDENTITY_UNAVAILABLE",)
+    target_count = sum(
+        sample.identity_verified and sample.gpu_identity_verified for sample in samples
+    )
+    if target_count > 1:
+        return tuple(process_codes + ["AMBIGUOUS_GPU_SELECTION"])
+    expected_set = set(expected)
+    selection_codes: list[str] = []
+    if expected_set and not any(
+        sample.gpu_uuid_fingerprint in expected_set for sample in samples
+    ):
+        selection_codes.append("EXPECTED_GPU_NOT_FOUND")
+    if pid is not None and not any(
+        sample.process_used_bytes is not None for sample in samples
+    ):
+        selection_codes.append("TARGET_PID_NOT_FOUND")
+    return tuple(process_codes + selection_codes) or ("GPU_IDENTITY_UNAVAILABLE",)
+
+
+def _add_codes(
+    record: TrainingMemoryAggregateRecord, field: str, codes: Sequence[str]
+) -> None:
+    if not codes:
+        return
+    current = _codes_from_json(getattr(record, field, "[]"))
+    setattr(record, field, json.dumps(sorted(set(current) | set(codes))))
+
+
+def _codes_from_json(value: str | None) -> tuple[str, ...]:
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(sorted(str(item) for item in parsed if item))
 
 
 def _sample_fingerprint(sample: GpuMemorySample) -> str:

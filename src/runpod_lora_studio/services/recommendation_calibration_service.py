@@ -395,6 +395,7 @@ def _hash_record_content(record: TrainingExecutionSummaryRecord) -> str:
         "training_config_id",
         "dataset_snapshot_id",
         "managed_model_id",
+        "training_job_environment_snapshot_id",
         "job_result_status",
         "gpu_identity_fingerprint",
         "gpu_architecture",
