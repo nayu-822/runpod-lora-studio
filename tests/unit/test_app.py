@@ -7,6 +7,10 @@ from pathlib import Path
 from runpod_lora_studio.app import build_status_markdown, create_app
 from runpod_lora_studio.config.settings import AppSettings
 from runpod_lora_studio.environment import EnvironmentReport, GPUInfo
+from runpod_lora_studio.ui.training import (
+    clear_recommendation_state,
+    mark_recommendation_edited,
+)
 
 
 def _cpu_report(test_workspace: Path) -> EnvironmentReport:
@@ -83,3 +87,19 @@ def test_import_does_not_start_gradio_server() -> None:
     )
 
     assert result.stdout == ""
+
+
+def test_recommendation_state_clear_switches_to_manual_mode() -> None:
+    state, view, mode, button = clear_recommendation_state()
+
+    assert state is None
+    assert view == ""
+    assert mode == "manual"
+    assert button["interactive"] is False
+
+
+def test_recommendation_parameter_edit_marks_recommendation_as_edited() -> None:
+    assert mark_recommendation_edited("recommended") == "recommended_edited"
+    assert mark_recommendation_edited("recommended_edited") == "recommended_edited"
+    assert mark_recommendation_edited("manual") == "manual"
+    assert mark_recommendation_edited(None) == "manual"

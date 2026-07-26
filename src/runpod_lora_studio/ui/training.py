@@ -32,6 +32,18 @@ from runpod_lora_studio.services.training_service import TrainingService
 from runpod_lora_studio.ui.training_controller import TrainingController
 
 
+def clear_recommendation_state(*_: object) -> tuple[None, str, str, object]:
+    return None, "", "manual", gr.update(interactive=False)
+
+
+def mark_recommendation_edited(mode: str | None) -> str:
+    return (
+        "recommended_edited"
+        if mode in {"recommended", "recommended_edited"}
+        else "manual"
+    )
+
+
 def build_training_tab(service: TrainingService, selected_project: gr.State) -> None:
     controller = TrainingController(service)
     compute_diagnostics = ComputeEnvironmentService(service.settings)
@@ -76,6 +88,7 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
     recommend = gr.Button("学習設定を推奨")
     recommendation_view = gr.Markdown()
     recommendation_state = gr.State(value=None)
+    recommendation_mode = gr.State(value="manual")
 
     def recommend_action(
         project_id: str | None,
@@ -85,11 +98,12 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
         quality: str,
         speed: str,
         current_resolution: float,
-    ) -> tuple[str, dict[str, object] | None, object]:
+    ) -> tuple[str, dict[str, object] | None, str, object]:
         if project_id is None or snapshot_choice is None or model_choice is None:
             return (
                 "project, snapshot, and model are required",
                 None,
+                "manual",
                 gr.update(interactive=False),
             )
         try:
@@ -152,17 +166,32 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
                 f"- {warning.severity.value}: {warning.code} — {warning.message}"
                 for warning in recommendation.warnings
             )
-            return "\n".join(lines), state, gr.update(interactive=not blocking_codes)
+            return (
+                "\n".join(lines),
+                state,
+                "recommended",
+                gr.update(interactive=not blocking_codes),
+            )
         except (OSError, ValueError) as exc:
-            return f"recommendation error: {exc}", None, gr.update(interactive=False)
+            return (
+                f"recommendation error: {exc}",
+                None,
+                "manual",
+                gr.update(interactive=False),
+            )
 
     apply_recommendation = gr.Button("推奨値を入力欄へ反映")
     manual_mode = gr.Button("推奨を解除して手動設定")
 
     def apply_action(
         state: dict[str, object] | None,
+        mode: str | None,
     ) -> tuple[object, ...]:
-        if not state or not state.get("recommendation_id"):
+        if (
+            mode not in {"recommended", "recommended_edited"}
+            or not state
+            or not state.get("recommendation_id")
+        ):
             return (gr.update(),) * 11 + ("recommendation result is missing",)
         try:
             recommendation = application_service.preview(
@@ -216,7 +245,7 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
         except (OSError, ValueError) as exc:
             return f"診断エラー: {exc}"
 
-    diagnose.click(
+    diagnose_event = diagnose.click(
         diagnose_action,
         inputs=[selected_project, concept_type, quality_profile, speed_profile],
         outputs=[diagnostic_view],
@@ -292,11 +321,16 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
             speed_profile,
             resolution,
         ],
-        outputs=[recommendation_view, recommendation_state, apply_recommendation],
+        outputs=[
+            recommendation_view,
+            recommendation_state,
+            recommendation_mode,
+            apply_recommendation,
+        ],
     )
     apply_recommendation.click(
         apply_action,
-        inputs=[recommendation_state],
+        inputs=[recommendation_state, recommendation_mode],
         outputs=[
             resolution,
             batch_size,
@@ -312,8 +346,13 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
         ],
     )
     manual_mode.click(
-        lambda: (None, "", gr.update(interactive=False)),
-        outputs=[recommendation_state, recommendation_view, apply_recommendation],
+        lambda: (None, "", "manual", gr.update(interactive=False)),
+        outputs=[
+            recommendation_state,
+            recommendation_view,
+            recommendation_mode,
+            apply_recommendation,
+        ],
     )
     jobs_table = gr.Dataframe(
         headers=[
@@ -387,19 +426,26 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
     def save_action(
         project_id: str | None,
         state: dict[str, object] | None,
+        mode: str | None,
         *values: Any,
     ) -> str | None:
         if not project_id:
             return "プロジェクトを選択してください"
         try:
             base = controller.config_input(project_id, values)
-            if state and state.get("recommendation_id"):
+            if mode in {"recommended", "recommended_edited"}:
+                if not state or not state.get("recommendation_id"):
+                    return (
+                        "recommendation state is missing; generate a new recommendation"
+                    )
                 config = application_service.apply(
                     UUID(str(state["recommendation_id"])),
                     base,
                     input_fingerprint_value=str(state["input_fingerprint"]),
                 )
                 return str(config.id)
+            if state:
+                return "recommendation state and mode are inconsistent"
             return controller.save_config(project_id, values)
         except (UserFacingError, ValueError) as exc:
             return f"エラー: {exc}"
@@ -471,15 +517,20 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
         except (UserFacingError, ValueError) as exc:
             return f"エラー: {exc}"
 
-    selected_project.change(
+    project_change = selected_project.change(
         choices, inputs=[selected_project], outputs=[snapshot, model]
     )
-
-    def clear_recommendation_state(*_: object) -> tuple[None, str, object]:
-        return None, "", gr.update(interactive=False)
+    project_change.then(
+        clear_recommendation_state,
+        outputs=[
+            recommendation_state,
+            recommendation_view,
+            recommendation_mode,
+            apply_recommendation,
+        ],
+    )
 
     for recommendation_input in (
-        selected_project,
         snapshot,
         model,
         concept_type,
@@ -487,18 +538,49 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
         speed_profile,
         resolution,
     ):
-        recommendation_input.change(
+        recommendation_input.input(
             clear_recommendation_state,
             inputs=[recommendation_input],
-            outputs=[recommendation_state, recommendation_view, apply_recommendation],
+            outputs=[
+                recommendation_state,
+                recommendation_view,
+                recommendation_mode,
+                apply_recommendation,
+            ],
         )
-    diagnose.click(
+    diagnose_event.then(
         clear_recommendation_state,
-        outputs=[recommendation_state, recommendation_view, apply_recommendation],
+        outputs=[
+            recommendation_state,
+            recommendation_view,
+            recommendation_mode,
+            apply_recommendation,
+        ],
     )
+    for recommendation_parameter in (
+        batch_size,
+        epochs,
+        learning_rate,
+        optimizer,
+        scheduler,
+        network_module,
+        network_dim,
+        network_alpha,
+        mixed_precision,
+        seed,
+        save_every,
+        cache_latents,
+        gradient_checkpointing,
+    ):
+        recommendation_parameter.input(
+            mark_recommendation_edited,
+            inputs=[recommendation_mode],
+            outputs=[recommendation_mode],
+        )
     save_inputs = [
         selected_project,
         recommendation_state,
+        recommendation_mode,
         snapshot,
         model,
         name,
