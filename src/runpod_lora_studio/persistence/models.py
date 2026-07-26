@@ -982,8 +982,216 @@ class TrainingRecommendationRecord(Base):
     warnings_json: Mapped[str] = mapped_column(Text, nullable=False)
     settings_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     engine_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    calibration_snapshot_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True
+    )
+    calibration_applied: Mapped[bool] = mapped_column(
+        Integer, nullable=False, default=False
+    )
+    calibration_confidence: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
+    calibration_reason_codes_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]"
+    )
+    baseline_duration_seconds: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    calibrated_duration_seconds: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    baseline_vram_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    calibrated_vram_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    baseline_batch_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    calibrated_batch_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    calibration_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
+    )
+
+
+class TrainingExecutionSummaryRecord(Base):
+    __tablename__ = "training_execution_summaries"
+    __table_args__ = (
+        UniqueConstraint("training_job_id", name="uq_execution_summary_job"),
+        UniqueConstraint(
+            "summary_fingerprint", name="uq_execution_summary_fingerprint"
+        ),
+        Index("ix_execution_summaries_project", "project_id"),
+        Index(
+            "ix_execution_summaries_gpu_settings",
+            "gpu_identity_fingerprint",
+            "settings_fingerprint",
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    training_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("training_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    training_config_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("training_configs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    recommendation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    environment_snapshot_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True
+    )
+    dataset_snapshot_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("dataset_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    managed_model_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("managed_models.id", ondelete="RESTRICT"), nullable=False
+    )
+    job_result_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    gpu_identity_fingerprint: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    gpu_total_vram_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dataset_scale_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    settings_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resolution: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    batch_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gradient_accumulation_steps: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    effective_batch_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    network_module: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    network_dim: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    network_alpha: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    optimizer: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    scheduler: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    mixed_precision: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    cache_latents: Mapped[bool | None] = mapped_column(Integer, nullable=True)
+    gradient_checkpointing: Mapped[bool | None] = mapped_column(Integer, nullable=True)
+    total_epochs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    planned_total_steps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completed_steps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    resume_initial_step: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    resume_step_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    elapsed_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    measured_steps_per_second: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    measured_images_per_second: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    peak_allocated_vram_bytes: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    peak_reserved_vram_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    free_vram_before_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    free_vram_after_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    memory_sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    memory_confidence: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="none"
+    )
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    oom_detected: Mapped[bool] = mapped_column(Integer, nullable=False, default=False)
+    failure_category: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="none"
+    )
+    failure_evidence_codes_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]"
+    )
+    usable_for_speed_calibration: Mapped[bool] = mapped_column(
+        Integer, nullable=False, default=False
+    )
+    usable_for_memory_calibration: Mapped[bool] = mapped_column(
+        Integer, nullable=False, default=False
+    )
+    exclusion_reasons_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]"
+    )
+    calibration_included: Mapped[bool] = mapped_column(
+        Integer, nullable=False, default=True
+    )
+    manual_exclusion_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    collector_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    summary_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class RecommendationCalibrationSnapshotRecord(Base):
+    __tablename__ = "recommendation_calibration_snapshots"
+    __table_args__ = (
+        UniqueConstraint("calibration_fingerprint", name="uq_calibration_fingerprint"),
+        Index("ix_calibration_snapshots_scope", "scope_project_id"),
+        Index(
+            "ix_calibration_snapshots_match", "gpu_identity_fingerprint", "resolution"
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    scope_project_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True
+    )
+    gpu_identity_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    gpu_total_vram_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    resolution: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    optimizer: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    mixed_precision: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    cache_latents: Mapped[bool | None] = mapped_column(Integer, nullable=True)
+    gradient_checkpointing: Mapped[bool | None] = mapped_column(Integer, nullable=True)
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    successful_sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    oom_sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    median_steps_per_second: Mapped[float | None] = mapped_column(Float, nullable=True)
+    lower_percentile_steps_per_second: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    median_peak_vram_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    upper_percentile_peak_vram_bytes: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    confidence: Mapped[str] = mapped_column(String(16), nullable=False)
+    calibration_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    calibration_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_summary_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    reason_codes_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    stale: Mapped[bool] = mapped_column(Integer, nullable=False, default=False)
+
+
+class RecommendationCalibrationSourceRecord(Base):
+    __tablename__ = "recommendation_calibration_sources"
+    __table_args__ = (
+        UniqueConstraint("calibration_id", "summary_id", name="uq_calibration_source"),
+        Index("ix_calibration_sources_summary", "summary_id"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    calibration_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("recommendation_calibration_snapshots.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    summary_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("training_execution_summaries.id", ondelete="CASCADE"),
+        nullable=False,
     )
 
 

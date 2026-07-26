@@ -60,6 +60,9 @@ from runpod_lora_studio.services.training_command import (
     TrainingCommand,
     TrainingCommandValidationError,
 )
+from runpod_lora_studio.services.training_performance_service import (
+    TrainingPerformanceCollector,
+)
 from runpod_lora_studio.services.training_progress_service import (
     TrainingProgressService,
 )
@@ -89,6 +92,7 @@ class TrainingService:
             trusted_python_executables=(settings.training_python_executable,),
         )
         self.progress_service = TrainingProgressService(settings)
+        self.performance_collector = TrainingPerformanceCollector(settings)
         self.resume_service = TrainingResumeService(
             settings, process_adapter=self.process_adapter
         )
@@ -599,6 +603,12 @@ class TrainingService:
         # Re-run once after the terminal status is persisted so ETA is cleared
         # according to the final job state and final artifacts are visible.
         self.progress_service.refresh_job(job_id)
+        try:
+            self.performance_collector.collect(job_id)
+        except Exception:
+            # Performance history is auxiliary; never change the terminal job
+            # state when collection or classification is unavailable.
+            logger.exception("training_performance_collection_failed job_id=%s", job_id)
 
     def _mark_failed(self, job_id: UUID, code: str, message: str) -> None:
         try:

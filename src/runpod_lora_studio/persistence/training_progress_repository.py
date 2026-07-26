@@ -8,6 +8,7 @@ from typing import cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from runpod_lora_studio.domain.training_progress_models import (
@@ -209,14 +210,33 @@ class TrainingProgressRepository:
             "last_verified_at": now,
         }
         if record is None:
-            record = TrainingArtifactRecord(
+            candidate = TrainingArtifactRecord(
                 id=str(uuid4()),
                 training_job_id=str(job_id),
                 relative_path=str(artifact.relative_path),
                 discovered_at=now,
                 **values,
             )
-            self.session.add(record)
+            self.session.add(candidate)
+            try:
+                self.session.flush()
+                record = candidate
+            except IntegrityError:
+                # A terminal refresh and an explicit rescan can overlap.  The
+                # artifact key is idempotent, so recover the concurrent row and
+                # apply the newest validation values without changing job state.
+                self.session.rollback()
+                record = self.session.scalar(
+                    select(TrainingArtifactRecord).where(
+                        TrainingArtifactRecord.training_job_id == str(job_id),
+                        TrainingArtifactRecord.relative_path
+                        == str(artifact.relative_path),
+                    )
+                )
+                if record is None:
+                    raise
+                for key, value in values.items():
+                    setattr(record, key, value)
         else:
             for key, value in values.items():
                 setattr(record, key, value)

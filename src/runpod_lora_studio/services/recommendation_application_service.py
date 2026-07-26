@@ -32,6 +32,9 @@ from runpod_lora_studio.services.environment_diagnostic_service import (
     ComputeEnvironmentService,
     TrainingEnvironmentService,
 )
+from runpod_lora_studio.services.recommendation_calibration_service import (
+    TrainingCalibrationService,
+)
 from runpod_lora_studio.services.recommendation_fingerprint import input_fingerprint
 from runpod_lora_studio.services.recommendation_persistence_service import (
     RecommendationPersistenceService,
@@ -57,6 +60,7 @@ class RecommendationApplicationService:
         compute_service: ComputeEnvironmentService | None = None,
         training_environment_service: TrainingEnvironmentService | None = None,
         dataset_statistics: DatasetStatisticsService | None = None,
+        calibration_service: TrainingCalibrationService | None = None,
     ) -> None:
         self.settings = settings
         self.training_service = training_service or TrainingService(settings)
@@ -66,6 +70,9 @@ class RecommendationApplicationService:
             training_environment_service or TrainingEnvironmentService(settings)
         )
         self.dataset_statistics = dataset_statistics or DatasetStatisticsService(
+            settings
+        )
+        self.calibration_service = calibration_service or TrainingCalibrationService(
             settings
         )
 
@@ -81,6 +88,7 @@ class RecommendationApplicationService:
         if request.status is not RecommendationStatus.COMPLETED:
             raise ValueError("recommendation request is not applicable")
         self._validate_warning_gate(recommendation)
+        self._validate_calibration(request, recommendation)
         if (
             input_fingerprint_value is not None
             and input_fingerprint_value != request.input_fingerprint
@@ -101,6 +109,7 @@ class RecommendationApplicationService:
         if request.status is not RecommendationStatus.COMPLETED:
             raise ValueError("recommendation request is not applicable")
         self._validate_warning_gate(recommendation)
+        self._validate_calibration(request, recommendation)
         if base.project_id != request.project_id:
             raise ValueError("recommendation project does not match current project")
         if base.dataset_snapshot_id != request.dataset_snapshot_id:
@@ -191,6 +200,18 @@ class RecommendationApplicationService:
         ]
         if blocking:
             raise ValueError("blocking recommendation warnings: " + ", ".join(blocking))
+
+    def _validate_calibration(
+        self,
+        request: RecommendationRequest,
+        recommendation: TrainingRecommendation,
+    ) -> None:
+        if recommendation.calibration_snapshot_id is None:
+            return
+        if self.calibration_service.is_stale(
+            recommendation.calibration_snapshot_id, request.project_id
+        ):
+            raise RecommendationStaleError("calibration snapshot changed or is stale")
 
     @staticmethod
     def _validate_risk(warnings: tuple[RecommendationWarning, ...]) -> None:

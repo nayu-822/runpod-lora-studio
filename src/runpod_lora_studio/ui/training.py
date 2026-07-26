@@ -22,6 +22,10 @@ from runpod_lora_studio.services.recommendation_application_service import (
     RecommendationApplicationService,
     RecommendationStaleError,
 )
+from runpod_lora_studio.services.recommendation_calibration_service import (
+    RecommendationHistoryService,
+    TrainingCalibrationService,
+)
 from runpod_lora_studio.services.recommendation_persistence_service import (
     RecommendationPersistenceService,
 )
@@ -50,6 +54,8 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
     training_diagnostics = TrainingEnvironmentService(service.settings)
     dataset_statistics = DatasetStatisticsService(service.settings)
     recommendation_service = RecommendationPersistenceService(service.settings)
+    history_service = RecommendationHistoryService(service.settings)
+    calibration_service = TrainingCalibrationService(service.settings)
     application_service = RecommendationApplicationService(
         service.settings,
         training_service=service,
@@ -517,6 +523,99 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
         except (UserFacingError, ValueError) as exc:
             return f"エラー: {exc}"
 
+    performance_view = gr.Markdown(label="Phase 7B performance")
+    history_table = gr.Dataframe(
+        headers=[
+            "job",
+            "status",
+            "GPU",
+            "resolution",
+            "steps/sec",
+            "peak VRAM",
+            "OOM",
+            "included",
+            "exclusion",
+        ],
+        value=[],
+        interactive=False,
+        label="Phase 7B learning performance history",
+    )
+    with gr.Row():
+        recollect_performance = gr.Button("performanceを再収集")
+        rebuild_calibration = gr.Button("calibrationを再構築")
+        refresh_history = gr.Button("performance履歴を更新")
+
+    def performance_action(current_job: str | None) -> str:
+        if not current_job:
+            return "jobを選択してください"
+        try:
+            summary = service.performance_collector.collect(
+                UUID(current_job.strip()), force=True
+            )
+            return "\n".join(
+                [
+                    "#### empirical training performance",
+                    f"- status: `{summary.job_result_status}` / "
+                    f"failure: `{summary.failure_category.value}`",
+                    f"- steps/sec: `{summary.measured_steps_per_second}` / "
+                    f"elapsed: `{summary.elapsed_seconds}`",
+                    f"- peak VRAM: `{summary.peak_reserved_vram_bytes}` bytes / "
+                    f"samples: `{summary.memory_sample_count}`",
+                    f"- OOM: `{summary.oom_detected}` / "
+                    f"speed calibration: `{summary.usable_for_speed_calibration}`",
+                    f"- exclusion: `{', '.join(summary.exclusion_reasons) or 'none'}`",
+                ]
+            )
+        except (OSError, ValueError) as exc:
+            return f"performance collection error: {exc}"
+
+    def history_action(project_id: str | None) -> list[list[str]]:
+        summaries = history_service.list(UUID(project_id) if project_id else None)
+        return [
+            [
+                str(item.training_job_id),
+                item.job_result_status,
+                item.gpu_identity_fingerprint or "unknown",
+                str(item.resolution or ""),
+                str(item.measured_steps_per_second or ""),
+                str(item.peak_reserved_vram_bytes or ""),
+                str(item.oom_detected),
+                str(item.calibration_included),
+                ", ".join(item.exclusion_reasons) or "",
+            ]
+            for item in summaries
+        ]
+
+    def rebuild_calibration_action(
+        project_id: str | None, current_job: str | None
+    ) -> str:
+        if not project_id or not current_job:
+            return "projectとjobを選択してください"
+        try:
+            summary = service.performance_collector.collect(
+                UUID(current_job.strip()), force=True
+            )
+            if not summary.gpu_identity_fingerprint:
+                return "GPU identityが取得できないためbaselineを維持します"
+            snapshot = calibration_service.build_for_project(
+                UUID(project_id),
+                gpu_identity_fingerprint=summary.gpu_identity_fingerprint,
+                gpu_total_vram_bytes=summary.gpu_total_vram_bytes,
+                resolution=summary.resolution,
+                optimizer=summary.optimizer,
+                mixed_precision=summary.mixed_precision,
+                cache_latents=summary.cache_latents,
+                gradient_checkpointing=summary.gradient_checkpointing,
+            )
+            return (
+                f"calibration rebuilt: confidence=`{snapshot.confidence.value}`, "
+                f"samples=`{snapshot.sample_count}`, "
+                f"OOM=`{snapshot.oom_sample_count}`; "
+                "再構築だけでは学習を開始しません"
+            )
+        except (OSError, ValueError) as exc:
+            return f"calibration error: {exc}"
+
     project_change = selected_project.change(
         choices, inputs=[selected_project], outputs=[snapshot, model]
     )
@@ -620,6 +719,17 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
     cancel.click(cancel_action, inputs=[job_id], outputs=[message])
     reparse.click(reparse_action, inputs=[job_id], outputs=[message])
     rescan.click(rescan_action, inputs=[job_id], outputs=[message])
+    recollect_performance.click(
+        performance_action, inputs=[job_id], outputs=[performance_view]
+    )
+    refresh_history.click(
+        history_action, inputs=[selected_project], outputs=[history_table]
+    )
+    rebuild_calibration.click(
+        rebuild_calibration_action,
+        inputs=[selected_project, job_id],
+        outputs=[performance_view],
+    )
 
     gr.Markdown("### Phase 6C 学習stateからの安全な再開")
     with gr.Row():

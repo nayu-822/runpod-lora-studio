@@ -300,4 +300,12 @@ Phase 7Aでは、CUDA/GPU/VRAM、bf16、xformers、bitsandbytes、sd-scriptsの�
 - 推奨エンジンはルールベースで、concept type、quality/speed profile、実効画像数、解像度、VRAM安全マージンからbatch、dim/alpha、epoch、optimizer、scheduler、precision、cache/checkpointingを決めます。gradient accumulationはPhase 7Aでは1に固定します。
 - VRAM見積もりはtotal/free VRAMを区別し、安全マージンを差し引いて判定します。GPU未検出、bf16非対応、依存不足、空caption、重複、未確認類似グループなどは警告として表示し、blocking警告がある推奨は適用できません。
 - 「推奨設定を適用」はDBから推奨とrequestを再読込し、関連付け、入力fingerprint、snapshot/modelの状態、現在の診断、ユーザー編集後の危険度を再検証してから、既存の`TrainingConfigInput`検証を通して保存します。blocking warningがある推奨はUIだけでなくサービス側でも拒否します。free VRAMは安定fingerprintには含めず、適用直前に再診断します。手動設定は推奨provenanceを持たずに保存できます。dataset snapshotのrepeatsは変更せず、推奨ID、エンジンバージョン、各項目の`recommended`/`applied`差分を設定へ記録します。UI stateには推奨本体を保持せず、IDとfingerprintだけを保持します。Phase 7Bの自動探索や学習中適応は対象外です。
+
+## Phase 7B: 学習実績による推奨補正と履歴比較
+
+Phase 7Bは、完了した学習jobから速度、VRAM使用量、終了理由を収集し、Phase 7Aのルール推奨を補足する決定論的な校正機能です。過去実績だけで設定を決定せず、GPU fingerprint、解像度、precision、optimizer、cache/checkpointingなどが一致する履歴だけを利用します。
+
+- 成果は`training_execution_summaries`へジョブ単位で冪等に保存し、OOM・キャンセル・不明失敗は速度校正から除外します。ログ本文や秘密情報は保存せず、許可された証拠コードだけを失敗分類へ記録します。
+- 校正は`recommendation_calibration_snapshots`と元サマリーの関連テーブルへ保存します。サンプル数、成功数、OOM数、中央値・保守的percentile、信頼度、source fingerprintを表示し、履歴が変化したスナップショットはstaleとして扱います。
+- 時間・VRAMの補正はbaselineを下回る安全性を主張せず、OOM時のbatch低下は提案として表示します。校正の再構築や再収集だけで学習を開始することはありません。UIから履歴の更新、performance再収集、校正再構築を実行できます。
 - `failed`、`canceled`、`stale`のいずれでもPID、process group、process identity、worker情報、heartbeatを確認し、終了を確証できないjobは再開しません。プロセスのkillは行いません。

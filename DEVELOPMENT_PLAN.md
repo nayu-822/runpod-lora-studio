@@ -539,3 +539,12 @@ Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は�
 - `RuleBasedRecommendationEngine`と`TrainingMemoryEstimator`で、許可済みoptimizer/scheduler/network moduleの範囲内から1件の決定論的推奨を生成する。GPUがない場合や安全VRAMを超える場合はblocking warningを付ける
 - 推奨の適用は`RecommendationApplicationService`へ一元化し、DBからrequest/recommendationを再読込して関連付け、入力fingerprint、snapshot/model、現在の診断、ユーザー編集後のblocking riskを再検証してから既存の`TrainingService`のconfig検証を通して保存する。学習開始とは分離し、manual configはprovenanceなしで保存する。dataset snapshotは変更せず、推奨ID・engine version・各項目の`recommended`/`applied`差分をtraining configへ記録する。UI stateには推奨本体を保持せず、推奨ID・request ID・fingerprint・警告要約だけを保持する
 - Alembic `0016_phase7a_recommendation_snapshots`、`0017_phase7a_recommendation_metadata`、`0018_phase7a_recommendation_input_config`で環境・推奨・適用 provenanceと再検証用の入力設定を保存する。free VRAMは安定fingerprintから除外し、適用直前に再診断する。Optuna等の自動探索、学習中適応、Phase 7B機能は対象外とする
+
+## Phase 7B完了: 学習実績を利用した推奨補正・履歴比較・OOMフィードバック
+
+- `TrainingPerformanceCollector`でジョブ、進捗、metric、設定、環境snapshot、終端ログの限定末尾から、ジョブ単位の`TrainingExecutionSummary`を冪等に収集する。収集失敗は元jobの状態を変更しない
+- `TrainingFailureClassifier`はOOM、system OOM、disk、model/dataset、dependency、cancel、stale、process killed、unknownを証拠コード付きで分類する。ログ本文、秘密、絶対パス、raw nvidia-smi出力は保存しない
+- `NvidiaSmiGpuMemoryAdapter`は固定argv、`shell=False`、timeout、出力上限、MiBからbytesへの検証済み変換を行い、取得不能時はNULL扱いにする。測定点数と他プロセス影響を校正信頼度へ反映する
+- `RecommendationCalibrationService`はGPU/settingsが一致する履歴だけを選択し、outlier除外、中央値、保守的percentile、信頼度、source fingerprintを決定論的に保存する。低信頼・stale・履歴不足時はPhase 7A baselineへフォールバックする
+- `CalibratedRecommendationService`は時間・VRAMの比較とOOM後のbatch低下提案を提供するが、baselineの安全制約を緩和せず、推奨適用や学習開始を自動実行しない。UIから履歴再収集・校正再構築・履歴表示を操作できる
+- Alembic `0019_phase7b_training_performance`で性能サマリー、校正snapshot、校正元関連を追加する。Optuna等の自動探索、複数jobの自動起動、lossだけによる品質判定は対象外とする

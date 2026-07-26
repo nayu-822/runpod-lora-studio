@@ -119,6 +119,24 @@ class RecommendationPersistenceService:
                         ),
                         settings_fingerprint=recommendation.settings_fingerprint,
                         engine_version=recommendation.engine_version,
+                        calibration_snapshot_id=(
+                            str(recommendation.calibration_snapshot_id)
+                            if recommendation.calibration_snapshot_id
+                            else None
+                        ),
+                        calibration_applied=recommendation.calibration_applied,
+                        calibration_confidence=recommendation.calibration_confidence,
+                        calibration_reason_codes_json=json.dumps(
+                            recommendation.calibration_reason_codes,
+                            ensure_ascii=False,
+                        ),
+                        baseline_duration_seconds=recommendation.baseline_duration_seconds,
+                        calibrated_duration_seconds=recommendation.calibrated_duration_seconds,
+                        baseline_vram_bytes=recommendation.baseline_vram_bytes,
+                        calibrated_vram_bytes=recommendation.calibrated_vram_bytes,
+                        baseline_batch_size=recommendation.baseline_batch_size,
+                        calibrated_batch_size=recommendation.calibrated_batch_size,
+                        calibration_fingerprint=recommendation.calibration_fingerprint,
                         created_at=recommendation.created_at,
                     )
                 )
@@ -242,4 +260,21 @@ def _recommendation_from_record(
         resolution=int(settings.get("resolution", 1024)),
         save_every_n_epochs=int(settings.get("save_every_n_epochs", 1)),
         seed=int(settings.get("seed", 42)),
+        calibration_snapshot_id=(
+            UUID(record.calibration_snapshot_id)
+            if record.calibration_snapshot_id
+            else None
+        ),
+        calibration_applied=bool(record.calibration_applied),
+        calibration_confidence=record.calibration_confidence,
+        calibration_reason_codes=tuple(
+            json.loads(record.calibration_reason_codes_json or "[]")
+        ),
+        baseline_duration_seconds=record.baseline_duration_seconds,
+        calibrated_duration_seconds=record.calibrated_duration_seconds,
+        baseline_vram_bytes=record.baseline_vram_bytes,
+        calibrated_vram_bytes=record.calibrated_vram_bytes,
+        baseline_batch_size=record.baseline_batch_size,
+        calibrated_batch_size=record.calibrated_batch_size,
+        calibration_fingerprint=record.calibration_fingerprint,
     )

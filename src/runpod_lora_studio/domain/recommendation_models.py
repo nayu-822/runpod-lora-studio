@@ -178,6 +178,17 @@ class TrainingRecommendation:
     resolution: int = 1024
     save_every_n_epochs: int = 1
     seed: int = 42
+    calibration_snapshot_id: UUID | None = None
+    calibration_applied: bool = False
+    calibration_confidence: str | None = None
+    calibration_reason_codes: tuple[str, ...] = ()
+    baseline_duration_seconds: float | None = None
+    calibrated_duration_seconds: float | None = None
+    baseline_vram_bytes: int | None = None
+    calibrated_vram_bytes: int | None = None
+    baseline_batch_size: int | None = None
+    calibrated_batch_size: int | None = None
+    calibration_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

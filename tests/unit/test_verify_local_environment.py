@@ -145,7 +145,7 @@ def test_migration_check_requires_current_to_equal_head(test_workspace: Path) ->
     check = _check_migration(settings)
 
     assert check.ok
-    assert "current=0018_phase7a_recommendation_input_config" in check.detail
+    assert "current=0019_phase7b_training_performance" in check.detail
 
 
 def test_migration_check_rejects_unmigrated_database(test_workspace: Path) -> None:
