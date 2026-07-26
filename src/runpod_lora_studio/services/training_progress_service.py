@@ -167,13 +167,14 @@ class TrainingProgressService:
             stderr_state = _state_from_dict(previous_values.get("stderr_parser"))
             stdout_remainder = "" if stdout.reset else stdout_state.remainder
             stderr_remainder = "" if stderr.reset else stderr_state.remainder
+            parse_now = datetime.now(UTC)
             stdout_result = self.parser.parse_stream(
                 stdout.data,
                 replace(aggregate_state, remainder=stdout_remainder),
                 total_epochs=config.epochs,
                 estimated_total_steps=_estimated_total_steps(runtime, config),
                 started_at=job.started_at,
-                now=datetime.now(UTC),
+                now=parse_now,
                 source="stdout",
             )
             stderr_result = self.parser.parse_stream(
@@ -182,7 +183,7 @@ class TrainingProgressService:
                 total_epochs=config.epochs,
                 estimated_total_steps=_estimated_total_steps(runtime, config),
                 started_at=job.started_at,
-                now=datetime.now(UTC),
+                now=parse_now,
                 source="stderr",
             )
             result = self.parser.merge(
@@ -192,7 +193,7 @@ class TrainingProgressService:
                 total_epochs=config.epochs,
                 estimated_total_steps=_estimated_total_steps(runtime, config),
                 started_at=job.started_at,
-                now=datetime.now(UTC),
+                now=parse_now,
             )
             progress = result.progress
             warning_values = list(progress.warnings)

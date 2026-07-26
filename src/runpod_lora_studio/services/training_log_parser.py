@@ -103,13 +103,14 @@ class TrainingLogParser:
     ) -> TrainingLogParseResult:
         baseline = state or TrainingLogParserState()
         if stdout and stderr:
+            parse_now = now or datetime.now(UTC)
             stdout_result = self.parse_stream(
                 stdout,
                 baseline,
                 total_epochs=total_epochs,
                 estimated_total_steps=estimated_total_steps,
                 started_at=started_at,
-                now=now,
+                now=parse_now,
                 source="stdout",
             )
             stderr_result = self.parse_stream(
@@ -118,7 +119,7 @@ class TrainingLogParser:
                 total_epochs=total_epochs,
                 estimated_total_steps=estimated_total_steps,
                 started_at=started_at,
-                now=now,
+                now=parse_now,
                 source="stderr",
             )
             return _merge_parse_results(
@@ -128,7 +129,7 @@ class TrainingLogParser:
                 total_epochs=total_epochs,
                 estimated_total_steps=estimated_total_steps,
                 started_at=started_at,
-                now=now,
+                now=parse_now,
             )
         return self.parse_stream(
             stdout or stderr,
@@ -173,6 +174,7 @@ class TrainingLogParser:
             line = ANSI_RE.sub("", raw_line).strip()
             if not line:
                 continue
+            metric_allowed = True
             epoch_match = EPOCH_RE.search(line)
             if epoch_match:
                 new_epoch, reported_total = int(epoch_match[1]), int(epoch_match[2])
@@ -180,6 +182,7 @@ class TrainingLogParser:
                     warnings.append(
                         f"{source}: epoch decreased; log rotation or restart suspected"
                     )
+                    metric_allowed = False
                 else:
                     epoch, total_epoch_value = new_epoch, reported_total
             match = STEP_RE.search(line)
@@ -195,11 +198,12 @@ class TrainingLogParser:
                     warnings.append(
                         f"{source}: step decreased; log rotation or restart suspected"
                     )
+                    metric_allowed = False
                 else:
                     step, total_step = new_step, reported_total
                     total_step_from_log = True
             match = LOSS_RE.search(line)
-            if match:
+            if match and metric_allowed:
                 parsed = _finite_float(match[1])
                 if parsed is not None:
                     loss = parsed
@@ -209,7 +213,7 @@ class TrainingLogParser:
                         )
                     )
             match = LR_RE.search(line)
-            if match:
+            if match and metric_allowed:
                 parsed = _finite_float(match[1])
                 if parsed is not None:
                     learning_rate = parsed
@@ -224,14 +228,50 @@ class TrainingLogParser:
                         )
                     )
             match = SPEED_RE.search(line)
-            if match:
-                speed = _finite_float(match[1])
+            if match and metric_allowed:
+                parsed = _finite_float(match[1])
+                if parsed is not None:
+                    speed = parsed
+                    events.append(
+                        TrainingMetricEvent(
+                            "steps_per_second",
+                            parsed,
+                            epoch,
+                            step,
+                            logged_at,
+                            f"{source}:log",
+                        )
+                    )
             match = TIME_RE.search(line)
-            if match:
-                elapsed = _finite_float(match[1])
+            if match and metric_allowed:
+                parsed = _finite_float(match[1])
+                if parsed is not None:
+                    elapsed = parsed
+                    events.append(
+                        TrainingMetricEvent(
+                            "elapsed_seconds",
+                            parsed,
+                            epoch,
+                            step,
+                            logged_at,
+                            f"{source}:log",
+                        )
+                    )
             match = REMAINING_RE.search(line)
-            if match:
-                remaining = _finite_float(match[1])
+            if match and metric_allowed:
+                parsed = _finite_float(match[1])
+                if parsed is not None:
+                    remaining = parsed
+                    events.append(
+                        TrainingMetricEvent(
+                            "remaining_seconds",
+                            parsed,
+                            epoch,
+                            step,
+                            logged_at,
+                            f"{source}:log",
+                        )
+                    )
         current_time = now or datetime.now(UTC)
         if elapsed is None and started_at is not None:
             reference = _utc_datetime(started_at)
@@ -324,56 +364,80 @@ def _merge_parse_results(
     now: datetime | None = None,
 ) -> TrainingLogParseResult:
     """Merge stream results without making the result depend on read order."""
-    ordered = sorted(
-        results,
-        key=lambda result: _stream_priority(result.source),
-    )
+    ordered = tuple(sorted(results, key=lambda result: _stream_priority(result.source)))
 
-    def changed(field: str) -> list[object]:
-        return [
-            getattr(result.state, field)
-            for result in ordered
-            if getattr(result.state, field) != getattr(baseline, field)
+    def values_for(field: str) -> list[int]:
+        values = [getattr(baseline, field)] + [
+            getattr(result.state, field) for result in ordered
         ]
+        return [value for value in values if isinstance(value, int)]
 
-    def first_changed(field: str) -> object:
-        values = changed(field)
-        return values[0] if values else getattr(baseline, field)
-
-    step_values = [value for value in changed("current_step") if isinstance(value, int)]
-    current_step = max(step_values, default=baseline.current_step)
-    total_step_values = [
-        value for value in changed("total_steps") if isinstance(value, int)
-    ]
-    total_steps = max(total_step_values, default=baseline.total_steps)
+    step_values = values_for("current_step")
+    current_step = max(step_values, default=None)
+    total_step_values = values_for("total_steps")
+    total_steps = max(total_step_values, default=None)
     if total_steps is None:
         total_steps = estimated_total_steps
-    current_epoch_value = first_changed("current_epoch")
-    total_epoch_value = first_changed("total_epochs") or total_epochs
-    latest_loss_value = first_changed("latest_loss")
-    learning_rate_value = first_changed("learning_rate")
-    speed_value = first_changed("speed")
-    elapsed_value = first_changed("elapsed_seconds")
-    remaining_value = first_changed("remaining_seconds")
-    elapsed = elapsed_value if isinstance(elapsed_value, float) else None
+
+    epoch_values = values_for("current_epoch")
+    current_epoch = max(epoch_values, default=None)
+    total_epoch_values = values_for("total_epochs")
+    total_epoch = max(total_epoch_values, default=total_epochs)
+
+    warnings = list(baseline.warnings)
+    for result in results:
+        warnings.extend(result.progress.warnings)
+    for result in ordered:
+        result_epoch = result.state.current_epoch
+        result_step = result.state.current_step
+        if (
+            current_epoch is not None
+            and result_epoch == current_epoch
+            and result_step is not None
+            and result_step != baseline.current_step
+            and current_step is not None
+            and result_step < current_step
+        ):
+            warnings.append(
+                f"{result.source}: epoch/step values are inconsistent; "
+                "the greatest step was retained"
+            )
+
+    all_events = tuple(
+        event for result in results for event in result.progress.metric_events
+    )
+    events = _deduplicate_metric_events(all_events)
+    latest_loss = _select_latest_metric(
+        events, "loss", baseline.latest_loss, baseline.current_step
+    )
+    learning_rate = _select_latest_metric(
+        events, "learning_rate", baseline.learning_rate, baseline.current_step
+    )
+    speed = _select_latest_metric(
+        events, "steps_per_second", baseline.speed, baseline.current_step
+    )
+    elapsed = _select_latest_metric(
+        events, "elapsed_seconds", baseline.elapsed_seconds, baseline.current_step
+    )
+    remaining = _select_latest_metric(
+        events,
+        "remaining_seconds",
+        baseline.remaining_seconds,
+        baseline.current_step,
+    )
     if elapsed is None and started_at is not None:
         current_time = now or datetime.now(UTC)
         reference = _utc_datetime(started_at)
         elapsed = max(0.0, (current_time - reference).total_seconds())
-    current_epoch = (
-        current_epoch_value if isinstance(current_epoch_value, int) else None
-    )
-    total_epoch = total_epoch_value if isinstance(total_epoch_value, int) else None
-    latest_loss = latest_loss_value if isinstance(latest_loss_value, float) else None
-    learning_rate = (
-        learning_rate_value if isinstance(learning_rate_value, float) else None
-    )
-    speed = speed_value if isinstance(speed_value, float) else None
-    remaining = remaining_value if isinstance(remaining_value, float) else None
-    total_steps_source_value = first_changed("total_steps_source")
+
     total_steps_source = (
-        total_steps_source_value
-        if isinstance(total_steps_source_value, TrainingProgressSource)
+        TrainingProgressSource.LOG
+        if any(
+            state.total_steps_source is TrainingProgressSource.LOG
+            for state in (baseline, *(result.state for result in results))
+        )
+        else TrainingProgressSource.ESTIMATED
+        if total_steps is not None
         else TrainingProgressSource.UNKNOWN
     )
     if current_step is not None and total_steps and total_steps > 0:
@@ -389,20 +453,6 @@ def _merge_parse_results(
     else:
         ratio = None
         progress_source = TrainingProgressSource.UNKNOWN
-    warnings = list(baseline.warnings)
-    for result in results:
-        warnings.extend(result.progress.warnings)
-    events: list[TrainingMetricEvent] = []
-    seen: set[tuple[str, int]] = set()
-    for result in ordered:
-        for event in result.progress.metric_events:
-            if event.step is None:
-                events.append(event)
-                continue
-            key = (event.name, event.step)
-            if key not in seen:
-                seen.add(key)
-                events.append(event)
     next_state = TrainingLogParserState(
         current_epoch=current_epoch,
         total_epochs=total_epoch,
@@ -429,13 +479,71 @@ def _merge_parse_results(
             remaining,
             ratio,
             progress_source,
-            tuple(events),
+            events,
             next_state.warnings,
             next_state,
         ),
         next_state,
         "aggregate",
     )
+
+
+def _deduplicate_metric_events(
+    events: tuple[TrainingMetricEvent, ...],
+) -> tuple[TrainingMetricEvent, ...]:
+    selected: dict[tuple[str, int], TrainingMetricEvent] = {}
+    without_step: list[TrainingMetricEvent] = []
+    for event in events:
+        if event.step is None:
+            without_step.append(event)
+            continue
+        key = (event.name, event.step)
+        previous = selected.get(key)
+        if previous is None or _event_rank(event) > _event_rank(previous):
+            selected[key] = event
+    return tuple(
+        sorted(
+            (*selected.values(), *without_step),
+            key=lambda event: (
+                event.step if event.step is not None else -1,
+                event.name,
+                _event_rank(event),
+            ),
+        )
+    )
+
+
+def _select_latest_metric(
+    events: tuple[TrainingMetricEvent, ...],
+    metric_name: str,
+    baseline_value: float | None,
+    baseline_step: int | None,
+) -> float | None:
+    candidates = [
+        event
+        for event in events
+        if event.name == metric_name
+        and (baseline_step is None or event.step is None or event.step >= baseline_step)
+    ]
+    if not candidates:
+        return baseline_value
+    return max(candidates, key=_event_rank).value
+
+
+def _event_rank(event: TrainingMetricEvent) -> tuple[int, float, int, str, float]:
+    return (
+        event.step if event.step is not None else -1,
+        _event_timestamp(event.logged_at),
+        -_stream_priority(event.source),
+        event.source,
+        event.value,
+    )
+
+
+def _event_timestamp(value: datetime | None) -> float:
+    if value is None:
+        return float("-inf")
+    return _utc_datetime(value).timestamp()
 
 
 def _stream_priority(source: str) -> int:

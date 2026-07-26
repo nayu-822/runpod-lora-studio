@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import struct
+from datetime import UTC, datetime
 from pathlib import Path
 
 from runpod_lora_studio.domain.training_progress_models import (
@@ -79,9 +80,85 @@ def test_parser_deduplicates_same_step_metrics_across_streams() -> None:
         b"steps: 10/20\nloss=0.3\n",
     )
     assert result.progress.current_step == 10
+    assert result.progress.latest_loss == 0.2
     assert [(event.name, event.step) for event in result.progress.metric_events] == [
         ("loss", 10)
     ]
+
+
+def test_parser_selects_metrics_from_the_greatest_step() -> None:
+    parser = TrainingLogParser()
+    stdout = b"steps: 100/1000 loss=0.30 lr=1e-4 1.0it/s\n"
+    stderr = b"steps: 101/1000 loss=0.20 lr=2e-4 2.0it/s\n"
+
+    result = parser.parse(stdout, stderr)
+    reversed_result = parser.parse(stderr, stdout)
+
+    assert result.progress.current_step == 101
+    assert result.progress.latest_loss == 0.20
+    assert result.progress.learning_rate == 2e-4
+    assert result.progress.speed == 2.0
+    assert reversed_result.progress.current_step == 101
+    assert reversed_result.progress.latest_loss == 0.20
+    assert reversed_result.progress.learning_rate == 2e-4
+    assert reversed_result.progress.speed == 2.0
+
+
+def test_parser_keeps_metric_without_competing_stream_value() -> None:
+    parser = TrainingLogParser()
+    result = parser.parse(
+        b"steps: 101/1000\n",
+        b"steps: 101/1000 loss=0.20\n",
+    )
+    assert result.progress.current_step == 101
+    assert result.progress.latest_loss == 0.20
+
+
+def test_parser_same_step_metric_conflict_is_deterministic() -> None:
+    parser = TrainingLogParser()
+    now = datetime.now(UTC)
+    stdout = parser.parse_stream(
+        b"steps: 101/1000 loss=0.30\n", now=now, source="stdout"
+    )
+    stderr = parser.parse_stream(
+        b"steps: 101/1000 loss=0.20\n", now=now, source="stderr"
+    )
+    first = parser.merge(TrainingLogParserState(), stdout, stderr, now=now)
+    second = parser.merge(TrainingLogParserState(), stderr, stdout, now=now)
+    assert first.progress.latest_loss == 0.30
+    assert second.progress.latest_loss == 0.30
+    assert [event.value for event in first.progress.metric_events] == [0.30]
+    assert [event.value for event in second.progress.metric_events] == [0.30]
+
+
+def test_parser_preserves_baseline_when_new_step_is_older() -> None:
+    parser = TrainingLogParser()
+    baseline = TrainingLogParserState(
+        current_step=101,
+        total_steps=1000,
+        latest_loss=0.20,
+        total_steps_source=TrainingProgressSource.LOG,
+    )
+    result = parser.parse(b"steps: 100/1000 loss=0.30\n", state=baseline)
+    assert result.progress.current_step == 101
+    assert result.progress.latest_loss == 0.20
+
+
+def test_parser_selects_greatest_epoch_and_warns_on_epoch_step_conflict() -> None:
+    parser = TrainingLogParser()
+    result = parser.parse(
+        b"epoch 3/10 steps: 100/1000\n",
+        b"epoch 2/10 steps: 101/1000\n",
+    )
+    reversed_result = parser.parse(
+        b"epoch 2/10 steps: 101/1000\n",
+        b"epoch 3/10 steps: 100/1000\n",
+    )
+    assert result.progress.current_epoch == 3
+    assert result.progress.current_step == 101
+    assert reversed_result.progress.current_epoch == 3
+    assert reversed_result.progress.current_step == 101
+    assert any("epoch/step" in warning for warning in result.progress.warnings)
 
 
 def test_rotation_resets_only_the_rotated_stream_remainder() -> None:
