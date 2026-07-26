@@ -1,10 +1,25 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from uuid import UUID
+
+
+def parse_non_negative_integer(value: object) -> int | None:
+    """Parse only an ASCII decimal, non-negative integer value."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
 
 
 class ResumeValidationStatus(StrEnum):
@@ -29,6 +44,14 @@ class ResumeStateFile:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidatedStatePosition:
+    epoch: int
+    step: int
+    epoch_source: str
+    step_source: str
+
+
+@dataclass(frozen=True, slots=True)
 class ValidatedResumeState:
     source_job_id: UUID
     source_artifact_id: UUID
@@ -41,6 +64,7 @@ class ValidatedResumeState:
     generated_at: datetime
     state_epoch: int | None = None
     state_step: int | None = None
+    state_position: ValidatedStatePosition | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,3 +98,5 @@ class TrainingResumePreview:
     progress_epoch_offset: int | None = None
     progress_step_offset: int | None = None
     position_warning: str | None = None
+    state_epoch_source: str | None = None
+    state_step_source: str | None = None

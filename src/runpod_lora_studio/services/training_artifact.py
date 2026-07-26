@@ -13,6 +13,7 @@ from runpod_lora_studio.domain.training_progress_models import (
     TrainingArtifactType,
     TrainingArtifactValidationStatus,
 )
+from runpod_lora_studio.domain.training_resume_models import parse_non_negative_integer
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,7 +117,10 @@ class TrainingArtifactScanner:
             for item in members
         ):
             return None
-        metadata = _read_state_metadata(path, self.max_metadata_size)
+        metadata_files, metadata_error = read_state_metadata_files(
+            path, self.max_metadata_size
+        )
+        metadata = _state_metadata_snapshot(metadata_files)
         epoch = _number(path.name, "epoch")
         if epoch is None:
             epoch = _metadata_int(metadata, "epoch")
@@ -124,6 +128,16 @@ class TrainingArtifactScanner:
         if step is None:
             step = _metadata_int(metadata, "step")
         stat = path.stat()
+        validation_status = TrainingArtifactValidationStatus.VALID
+        validation_code = "STATE_STRUCTURE_VALID"
+        validation_message = "state directory structure recognized"
+        position_error = _state_position_error(path.name, epoch, step, metadata)
+        if metadata_error or position_error:
+            validation_status = TrainingArtifactValidationStatus.INVALID
+            validation_code = metadata_error or "STATE_POSITION_CONFLICT"
+            validation_message = (
+                position_error or metadata_error or "state metadata invalid"
+            )
         return DiscoveredArtifact(
             TrainingArtifactType.TRAINING_STATE,
             relative,
@@ -133,9 +147,9 @@ class TrainingArtifactScanner:
             sum(item.stat().st_size for item in members),
             None,
             datetime.fromtimestamp(stat.st_mtime, UTC),
-            TrainingArtifactValidationStatus.VALID,
-            "STATE_STRUCTURE_VALID",
-            "state directory structure recognized",
+            validation_status,
+            validation_code,
+            validation_message,
             metadata,
         )
 
@@ -328,24 +342,89 @@ def _number(name: str, label: str) -> int | None:
 def _metadata_int(metadata: dict[str, Any] | None, key: str) -> int | None:
     if not metadata:
         return None
-    value = metadata.get(key)
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
+    return parse_non_negative_integer(metadata.get(key))
 
 
-def _read_state_metadata(path: Path, max_size: int) -> dict[str, Any] | None:
+def read_state_metadata_files(
+    path: Path, max_size: int
+) -> tuple[dict[str, dict[str, Any]], str | None]:
+    result: dict[str, dict[str, Any]] = {}
     for filename in ("training_state.json", "state.json", "resume-state-manifest.json"):
         metadata_path = path / filename
         try:
-            if not metadata_path.is_file() or metadata_path.stat().st_size > max_size:
+            if not metadata_path.is_file():
                 continue
+            if metadata_path.stat().st_size > max_size:
+                return result, "STATE_METADATA_TOO_LARGE"
             value = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
-            continue
+            return result, "STATE_METADATA_INVALID"
         if isinstance(value, dict):
-            return value
+            result[filename] = value
+        else:
+            return result, "STATE_METADATA_NOT_OBJECT"
+    return result, None
+
+
+def _state_metadata_snapshot(
+    metadata_files: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not metadata_files:
+        return None
+    snapshot: dict[str, Any] = {"state_metadata_files": metadata_files}
+    for filename in ("training_state.json", "state.json", "resume-state-manifest.json"):
+        values = metadata_files.get(filename)
+        if values is None:
+            continue
+        for key in (
+            "state_epoch",
+            "epoch",
+            "current_epoch",
+            "state_step",
+            "step",
+            "current_step",
+        ):
+            if key in values and key not in snapshot:
+                snapshot[key] = values[key]
+    return snapshot
+
+
+def _state_position_error(
+    name: str,
+    epoch: int | None,
+    step: int | None,
+    metadata: dict[str, Any] | None,
+) -> str | None:
+    if not metadata:
+        return None
+    values = metadata.get("state_metadata_files")
+    if not isinstance(values, dict):
+        return None
+    epochs: list[tuple[str, int]] = []
+    steps: list[tuple[str, int]] = []
+    for filename, raw in values.items():
+        if not isinstance(raw, dict):
+            continue
+        for key in ("state_epoch", "epoch", "current_epoch"):
+            if key in raw:
+                parsed = parse_non_negative_integer(raw[key])
+                if parsed is None:
+                    return f"STATE_POSITION_INVALID: {filename}.{key}"
+                epochs.append((f"{filename}.{key}", parsed))
+        for key in ("state_step", "step", "current_step"):
+            if key in raw:
+                parsed = parse_non_negative_integer(raw[key])
+                if parsed is None:
+                    return f"STATE_POSITION_INVALID: {filename}.{key}"
+                steps.append((f"{filename}.{key}", parsed))
+    if epoch is not None:
+        epochs.append(("state directory/artifact epoch", epoch))
+    if step is not None:
+        steps.append(("state directory/artifact step", step))
+    for label, candidates in (("epoch", epochs), ("step", steps)):
+        if len({value for _, value in candidates}) > 1:
+            details = ", ".join(f"{source}={value}" for source, value in candidates)
+            return f"STATE_POSITION_CONFLICT: {label}: {details}"
     return None
 
 

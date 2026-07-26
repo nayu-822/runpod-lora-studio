@@ -934,6 +934,8 @@ class TrainingJobRecord(Base):
     resume_validation_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     initial_epoch: Mapped[int | None] = mapped_column(Integer, nullable=True)
     initial_step: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    initial_epoch_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    initial_step_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
     progress_step_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
     progress_epoch_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
     resume_request_fingerprint: Mapped[str | None] = mapped_column(
@@ -986,6 +988,10 @@ class TrainingResumeValidationRecord(Base):
     target_config_fingerprint: Mapped[str | None] = mapped_column(
         String(64), nullable=True
     )
+    state_epoch: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    state_step: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    state_epoch_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    state_step_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
     compatibility_status: Mapped[str] = mapped_column(String(32), nullable=False)
     compatibility_issues: Mapped[str] = mapped_column(Text, nullable=False)
     validated_at: Mapped[datetime] = mapped_column(

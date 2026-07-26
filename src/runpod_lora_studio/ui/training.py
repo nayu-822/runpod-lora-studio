@@ -304,6 +304,10 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
                             f"`{preview.state_step}`"
                         ),
                         (
+                            f"state source: `{preview.state_epoch_source}` / "
+                            f"`{preview.state_step_source}`"
+                        ),
+                        (
                             f"offset epoch/step: `{preview.progress_epoch_offset}` / "
                             f"`{preview.progress_step_offset}`"
                         ),

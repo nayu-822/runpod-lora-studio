@@ -288,8 +288,8 @@ Phase 6Bでは、workerのメモリ状態を正とせず、SQLiteに保存した
 
 Phase 6Cでは、`failed`、`canceled`、またはプロセス終了を安全に確認した`stale` jobに登録されたtraining stateを検証し、新しい子jobとして再開します。stateはjob専用output配下の通常ディレクトリだけを対象に、symlinkを拒否し、ファイルをストリームコピーしてSHA-256を再検証します。pickle、torch、YAMLなどのstate deserializeは行いません。
 
-- Alembic `0013_phase6c_training_resume`で親子job、resume artifact、検証状態、初期epoch/stepと進捗オフセットを保存し、`0014_phase6c_resume_request_fingerprint`でtarget configを含む再開要求の一意性を保証します。親jobのstatus、progress、metric、artifactは変更しません。
+- Alembic `0013_phase6c_training_resume`で親子job、resume artifact、検証状態、初期epoch/stepと進捗オフセットを保存し、`0014_phase6c_resume_request_fingerprint`でtarget configを含む再開要求の一意性を、`0015_phase6c_state_position_provenance`で検証済み位置と出所を保証します。親jobのstatus、progress、metric、artifactは変更しません。
 - dataset snapshot/content/TOML、モデル、trainer、LoRA構成、optimizer/scheduler、precision、cache、gradient checkpoint、resolution、batch、repeats、seed、sd-scripts root、信頼済みPython、command builder versionを再開前に比較します。epochの延長は許可しますが、縮小やmetadata欠落は拒否します。
 - childの`runtime/resume/source-state`へatomicにコピーし、`config/resume-state-manifest.json`を作成してから、固定された`--resume`引数で起動します。開始直前にも同じ検証を再実行します。
-- 選択したstate artifactのepoch/stepを初期値とoffsetの唯一の基準にします。artifactまたは検証済みstate metadataから位置を安全に特定できないstateは再開を拒否します。親jobの最新progressはoffsetに使用せず、値が異なる場合はpreviewとmanifestへwarningを保存します。再開元の進捗・metricをchildへコピーせず、child outputだけをartifact走査します。
+- 選択したstate artifactのepoch/stepを初期値とoffsetの唯一の基準にします。artifact、state directory名、`training_state.json`、`state.json`、`resume-state-manifest.json`の値は厳格な非負整数として検証し、複数情報源の不一致、target epochsまたは推定total stepsを超える値、上限超過を拒否します。採用値と出所をpreview、DB、manifest、fingerprintへ保存します。親jobの最新progressはoffsetに使用せず、値が異なる場合はpreviewとmanifestへwarningを保存します。再開元の進捗・metricをchildへコピーせず、child outputだけをartifact走査します。
 - `failed`、`canceled`、`stale`のいずれでもPID、process group、process identity、worker情報、heartbeatを確認し、終了を確証できないjobは再開しません。プロセスのkillは行いません。

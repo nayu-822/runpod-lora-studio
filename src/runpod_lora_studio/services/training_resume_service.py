@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import tomllib
 from dataclasses import replace
@@ -27,6 +28,8 @@ from runpod_lora_studio.domain.training_resume_models import (
     ResumeValidationStatus,
     TrainingResumePreview,
     ValidatedResumeState,
+    ValidatedStatePosition,
+    parse_non_negative_integer,
 )
 from runpod_lora_studio.external.training_process import (
     SubprocessTrainingAdapter,
@@ -48,8 +51,9 @@ from runpod_lora_studio.persistence.training_repository import (
     utc_now,
 )
 from runpod_lora_studio.services.project_service import UserFacingError
+from runpod_lora_studio.services.training_artifact import read_state_metadata_files
 
-VALIDATOR_VERSION = "phase6c-v1"
+VALIDATOR_VERSION = "phase6c-v2"
 RESUMABLE_STATUSES = frozenset(
     {TrainingJobStatus.FAILED, TrainingJobStatus.CANCELED, TrainingJobStatus.STALE}
 )
@@ -122,6 +126,13 @@ class TrainingResumeService:
             )
             if parent is None:
                 return
+            config = session.scalar(
+                select(TrainingConfigRecord).where(
+                    TrainingConfigRecord.id == parent.training_config_id
+                )
+            )
+            if config is None:
+                return
             rows = session.scalars(
                 select(TrainingArtifactRecord).where(
                     TrainingArtifactRecord.training_job_id == str(job_id),
@@ -133,7 +144,12 @@ class TrainingResumeService:
             ).all()
             for artifact in rows:
                 try:
-                    validated = self._validate_state_path(parent, artifact)
+                    validated = self._validate_state_path(
+                        parent,
+                        artifact,
+                        target_total_epochs=config.epochs,
+                        estimated_total_steps=None,
+                    )
                 except UserFacingError:
                     continue
                 metadata = _json_object(artifact.metadata_json)
@@ -198,6 +214,16 @@ class TrainingResumeService:
                 progress_epoch_offset=state_epoch,
                 progress_step_offset=state_step,
                 position_warning=position_warning,
+                state_epoch_source=(
+                    validated.state_position.epoch_source
+                    if validated.state_position
+                    else None
+                ),
+                state_step_source=(
+                    validated.state_position.step_source
+                    if validated.state_position
+                    else None
+                ),
             )
 
     def create_resume_job(
@@ -265,6 +291,16 @@ class TrainingResumeService:
             )
             record.initial_epoch = initial_epoch
             record.initial_step = initial_step
+            record.initial_epoch_source = (
+                validated.state_position.epoch_source
+                if validated.state_position
+                else None
+            )
+            record.initial_step_source = (
+                validated.state_position.step_source
+                if validated.state_position
+                else None
+            )
             record.progress_step_offset = record.initial_step
             record.progress_epoch_offset = record.initial_epoch
             record.resume_request_fingerprint = request_fingerprint
@@ -276,6 +312,18 @@ class TrainingResumeService:
                     target_training_config_id=config.id,
                     source_state_relative_path=artifact.relative_path,
                     source_state_fingerprint=validated.fingerprint,
+                    state_epoch=validated.state_epoch,
+                    state_step=validated.state_step,
+                    state_epoch_source=(
+                        validated.state_position.epoch_source
+                        if validated.state_position
+                        else None
+                    ),
+                    state_step_source=(
+                        validated.state_position.step_source
+                        if validated.state_position
+                        else None
+                    ),
                     source_job_config_fingerprint=compatibility.source_config_fingerprint,
                     target_config_fingerprint=compatibility.target_config_fingerprint,
                     compatibility_status=compatibility.status.value,
@@ -333,8 +381,10 @@ class TrainingResumeService:
             )
             copied = replace(
                 copied,
+                fingerprint=_state_fingerprint(copied.files, validated.state_position),
                 state_epoch=validated.state_epoch,
                 state_step=validated.state_step,
+                state_position=validated.state_position,
             )
             if copied.fingerprint != validated.fingerprint:
                 raise UserFacingError("再開stateのコピー検証に失敗しました")
@@ -436,7 +486,17 @@ class TrainingResumeService:
             raise UserFacingError("stateがparent jobの成果物ではありません")
         if artifact.artifact_type != TrainingArtifactType.TRAINING_STATE.value:
             raise UserFacingError("training state以外は再開に使用できません")
-        validated = self._validate_state_path(parent, artifact)
+        progress = session.scalar(
+            select(TrainingProgressRecord).where(
+                TrainingProgressRecord.training_job_id == parent.id
+            )
+        )
+        validated = self._validate_state_path(
+            parent,
+            artifact,
+            target_total_epochs=config.epochs,
+            estimated_total_steps=progress.total_steps if progress else None,
+        )
         metadata = _json_object(artifact.metadata_json)
         if isinstance(metadata, dict):
             expected = metadata.get("resume_state_fingerprint")
@@ -514,7 +574,12 @@ class TrainingResumeService:
         return True
 
     def _validate_state_path(
-        self, parent: TrainingJobRecord, artifact: TrainingArtifactRecord
+        self,
+        parent: TrainingJobRecord,
+        artifact: TrainingArtifactRecord,
+        *,
+        target_total_epochs: int,
+        estimated_total_steps: int | None,
     ) -> ValidatedResumeState:
         if artifact.validation_status != TrainingArtifactValidationStatus.VALID.value:
             raise UserFacingError("stateのvalidation statusが再開可能ではありません")
@@ -537,11 +602,21 @@ class TrainingResumeService:
         validated = self._scan_state_path(
             state, UUID(artifact.id), UUID(parent.id), relative
         )
-        state_epoch, state_step = _state_position(artifact)
+        position = validate_state_position(
+            artifact,
+            state,
+            target_total_epochs=target_total_epochs,
+            estimated_total_steps=estimated_total_steps,
+            max_epoch=self.settings.training_resume_max_epoch,
+            max_step=self.settings.training_resume_max_step,
+        )
+        fingerprint = _state_fingerprint(validated.files, position)
         return replace(
             validated,
-            state_epoch=state_epoch,
-            state_step=state_step,
+            fingerprint=fingerprint,
+            state_epoch=position.epoch,
+            state_step=position.step,
+            state_position=position,
         )
 
     def _scan_state_path(
@@ -779,13 +854,19 @@ class TrainingResumeService:
             )
         )
         return {
-            "manifest_version": "phase6c-v1",
+            "manifest_version": "phase6c-v2",
             "source_job_id": parent.id,
             "source_artifact_id": artifact.id,
             "state_relative_path": artifact.relative_path,
             "state_fingerprint": state.fingerprint,
             "state_epoch": state.state_epoch,
             "state_step": state.state_step,
+            "state_epoch_source": (
+                state.state_position.epoch_source if state.state_position else None
+            ),
+            "state_step_source": (
+                state.state_position.step_source if state.state_position else None
+            ),
             "file_count": len(state.files),
             "total_size": state.total_size,
             "files": [
@@ -1006,27 +1087,158 @@ def _resume_request_fingerprint(
     )
 
 
-def _state_position(artifact: TrainingArtifactRecord) -> tuple[int | None, int | None]:
-    metadata = _json_object(artifact.metadata_json)
-    values = metadata if isinstance(metadata, dict) else {}
-    epoch = artifact.epoch
-    step = artifact.step
-    if epoch is None:
-        epoch = _metadata_int(values, ("state_epoch", "epoch", "current_epoch"))
-    if step is None:
-        step = _metadata_int(values, ("state_step", "step", "current_step"))
-    return epoch, step
+def validate_state_position(
+    artifact: TrainingArtifactRecord,
+    state_path: Path,
+    *,
+    target_total_epochs: int,
+    estimated_total_steps: int | None,
+    max_epoch: int,
+    max_step: int,
+) -> ValidatedStatePosition:
+    """Resolve and strictly validate all available state position sources."""
+    candidates: dict[str, dict[str, int]] = {}
+
+    def add_candidate(source: str, field: str, raw: object) -> None:
+        parsed = parse_non_negative_integer(raw)
+        if parsed is None:
+            raise UserFacingError(f"STATE_POSITION_INVALID: {source}.{field}")
+        candidates.setdefault(source, {})[field] = parsed
+
+    if artifact.epoch is not None:
+        add_candidate("artifact", "epoch", artifact.epoch)
+    if artifact.step is not None:
+        add_candidate("artifact", "step", artifact.step)
+
+    epoch_match = re.search(r"(?:^|-)epoch[-_ ]?([0-9]+)", state_path.name, re.I)
+    step_match = re.search(r"-([0-9]+)-state$", state_path.name, re.I)
+    if epoch_match:
+        add_candidate("directory", "epoch", epoch_match.group(1))
+    if step_match:
+        add_candidate("directory", "step", step_match.group(1))
+
+    metadata_files, metadata_error = read_state_metadata_files(state_path, 256 * 1024)
+    if metadata_error:
+        raise UserFacingError(metadata_error)
+    for filename, values in metadata_files.items():
+        _add_metadata_candidate(candidates, filename, values, add_candidate)
+
+    artifact_metadata = _json_object(artifact.metadata_json)
+    if isinstance(artifact_metadata, dict):
+        nested = artifact_metadata.get("state_metadata_files")
+        if isinstance(nested, dict):
+            for filename, values in nested.items():
+                if isinstance(values, dict):
+                    _add_metadata_candidate(
+                        candidates,
+                        f"artifact metadata:{filename}",
+                        values,
+                        add_candidate,
+                    )
+        _add_metadata_candidate(
+            candidates, "artifact metadata", artifact_metadata, add_candidate
+        )
+
+    epoch = _consistent_position_value(candidates, "epoch")
+    step = _consistent_position_value(candidates, "step")
+    if epoch is None or step is None:
+        raise UserFacingError("STATE_POSITION_MISSING: epoch and step are required")
+    if epoch > max_epoch or epoch > target_total_epochs:
+        raise UserFacingError("STATE_POSITION_OUT_OF_RANGE: epoch")
+    if step > max_step:
+        raise UserFacingError("STATE_POSITION_OUT_OF_RANGE: step")
+    if estimated_total_steps is not None:
+        if estimated_total_steps < 0:
+            raise UserFacingError("STATE_POSITION_INVALID: estimated total steps")
+        if step > estimated_total_steps:
+            raise UserFacingError("STATE_POSITION_OUT_OF_RANGE: step")
+    return ValidatedStatePosition(
+        epoch=epoch,
+        step=step,
+        epoch_source=_position_source(candidates, "epoch", epoch),
+        step_source=_position_source(candidates, "step", step),
+    )
 
 
-def _metadata_int(values: dict[str, Any], keys: tuple[str, ...]) -> int | None:
-    for key in keys:
-        value = values.get(key)
-        try:
-            if value is not None:
-                return int(value)
-        except (TypeError, ValueError):
+def _add_metadata_candidate(
+    candidates: dict[str, dict[str, int]],
+    source: str,
+    values: dict[str, Any],
+    add_candidate: Any,
+) -> None:
+    for field, keys in (
+        ("epoch", ("state_epoch", "epoch", "current_epoch")),
+        ("step", ("state_step", "step", "current_step")),
+    ):
+        present = [(key, values[key]) for key in keys if key in values]
+        if not present:
             continue
-    return None
+        parsed = [parse_non_negative_integer(value) for _, value in present]
+        if any(value is None for value in parsed) or len(set(parsed)) != 1:
+            raise UserFacingError(f"STATE_POSITION_CONFLICT: {source}.{field}")
+        add_candidate(source, field, parsed[0])
+
+
+def _consistent_position_value(
+    candidates: dict[str, dict[str, int]], field: str
+) -> int | None:
+    values = [
+        source_values[field]
+        for source_values in candidates.values()
+        if field in source_values
+    ]
+    if not values:
+        return None
+    if len(set(values)) != 1:
+        details = ", ".join(
+            f"{source}={source_values[field]}"
+            for source, source_values in candidates.items()
+            if field in source_values
+        )
+        raise UserFacingError(f"STATE_POSITION_CONFLICT: {field}: {details}")
+    return values[0]
+
+
+def _position_source(
+    candidates: dict[str, dict[str, int]], field: str, value: int
+) -> str:
+    for source in ("artifact", "directory"):
+        if candidates.get(source, {}).get(field) == value:
+            return source
+    for source, values in candidates.items():
+        if values.get(field) == value:
+            return source
+    raise UserFacingError(f"STATE_POSITION_MISSING: {field}")
+
+
+def _state_fingerprint(
+    files: tuple[ResumeStateFile, ...], position: ValidatedStatePosition | None
+) -> str:
+    return _sha256_bytes(
+        _canonical_json(
+            {
+                "validator_version": VALIDATOR_VERSION,
+                "position": (
+                    {
+                        "epoch": position.epoch,
+                        "step": position.step,
+                        "epoch_source": position.epoch_source,
+                        "step_source": position.step_source,
+                    }
+                    if position
+                    else None
+                ),
+                "files": [
+                    {
+                        "path": str(item.relative_path).replace("\\", "/"),
+                        "size": item.size,
+                        "sha256": item.sha256,
+                    }
+                    for item in sorted(files, key=lambda item: str(item.relative_path))
+                ],
+            }
+        )
+    )
 
 
 def _state_position_warning(

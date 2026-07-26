@@ -192,6 +192,8 @@ class TrainingJob:
     resume_validation_message: str | None = None
     initial_epoch: int | None = None
     initial_step: int | None = None
+    initial_epoch_source: str | None = None
+    initial_step_source: str | None = None
     progress_step_offset: int | None = None
     progress_epoch_offset: int | None = None
     resume_request_fingerprint: str | None = None

@@ -183,7 +183,12 @@ def _fixture(root: Path) -> tuple[AppSettings, UUID, UUID, UUID]:
 
 
 def _config(
-    service: TrainingService, project_id: UUID, snapshot_id: UUID, model_id: UUID
+    service: TrainingService,
+    project_id: UUID,
+    snapshot_id: UUID,
+    model_id: UUID,
+    *,
+    epochs: int = 1,
 ):
     from runpod_lora_studio.domain.training_models import TrainingConfigInput
 
@@ -196,6 +201,7 @@ def _config(
             output_name="test-lora",
             output_directory=service.settings.outputs_dir,
             sd_scripts_root=service.settings.training_sd_scripts_root,
+            epochs=epochs,
         )
     )
 

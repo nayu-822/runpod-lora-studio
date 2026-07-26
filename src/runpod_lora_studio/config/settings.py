@@ -163,6 +163,8 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     training_artifact_max_count: int = Field(default=500, ge=1, le=10000)
     training_artifact_max_file_size_bytes: int = Field(default=30 * 1024**3, ge=1)
     training_resume_state_max_total_size_bytes: int = Field(default=30 * 1024**3, ge=1)
+    training_resume_max_epoch: int = Field(default=100_000, ge=1)
+    training_resume_max_step: int = Field(default=1_000_000_000, ge=1)
 
     runpod_pod_id: str | None = Field(default=None, validation_alias="RUNPOD_POD_ID")
     # Tokens and credentials added later must use SecretStr and repr=False as well.

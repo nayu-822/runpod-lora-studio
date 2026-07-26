@@ -23,6 +23,9 @@ from runpod_lora_studio.domain.training_progress_models import (
     TrainingMetricEvent,
     TrainingProgressSource,
 )
+from runpod_lora_studio.domain.training_resume_models import (
+    parse_non_negative_integer,
+)
 from runpod_lora_studio.external.training_process import FakeTrainingProcessAdapter
 from runpod_lora_studio.persistence.database import create_engine_for_settings
 from runpod_lora_studio.persistence.models import (
@@ -34,7 +37,10 @@ from runpod_lora_studio.services.training_command import SdScriptsCommandBuilder
 from runpod_lora_studio.services.training_progress_service import (
     _apply_resume_offsets,
 )
-from runpod_lora_studio.services.training_resume_service import TrainingResumeService
+from runpod_lora_studio.services.training_resume_service import (
+    TrainingResumeService,
+    validate_state_position,
+)
 from runpod_lora_studio.services.training_service import TrainingService
 
 
@@ -63,6 +69,132 @@ def test_resume_progress_offsets_local_steps_and_epochs() -> None:
     assert shifted.progress.total_epochs == 8
     assert shifted.progress.metric_events[0].step == 130
     assert shifted.progress.metric_events[0].epoch == 5
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (0, 0),
+        ("0", 0),
+        ("500", 500),
+        (True, None),
+        (False, None),
+        (-1, None),
+        ("-1", None),
+        (1.5, None),
+        ("1.5", None),
+        ("1e3", None),
+        ("", None),
+        ([], None),
+        ({}, None),
+        ("１２", None),
+    ],
+)
+def test_parse_non_negative_integer_is_strict(
+    value: object, expected: int | None
+) -> None:
+    assert parse_non_negative_integer(value) == expected
+
+
+def _position_artifact(
+    *, epoch: object = None, step: object = None, metadata: object = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        epoch=epoch,
+        step=step,
+        metadata_json=json.dumps(metadata) if metadata is not None else None,
+    )
+
+
+def test_state_position_requires_consistent_sources_and_respects_bounds(
+    test_workspace: Path,
+) -> None:
+    state = test_workspace / "test-lora-500-state"
+    state.mkdir()
+    (state / "training_state.json").write_text(
+        json.dumps({"epoch": "5", "step": "500"}), encoding="utf-8"
+    )
+    artifact = _position_artifact(epoch=5, step=500)
+    position = validate_state_position(
+        artifact,
+        state,
+        target_total_epochs=10,
+        estimated_total_steps=1000,
+        max_epoch=100,
+        max_step=10_000,
+    )
+    assert position.epoch == 5
+    assert position.step == 500
+    assert position.epoch_source == "artifact"
+    assert position.step_source == "artifact"
+
+    (state / "state.json").write_text(json.dumps({"state_step": 501}), encoding="utf-8")
+    with pytest.raises(UserFacingError, match="STATE_POSITION_CONFLICT"):
+        validate_state_position(
+            artifact,
+            state,
+            target_total_epochs=10,
+            estimated_total_steps=1000,
+            max_epoch=100,
+            max_step=10_000,
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"epoch": True, "step": 1},
+        {"epoch": 1.5, "step": 1},
+        {"epoch": "1.5", "step": 1},
+        {"epoch": "", "step": 1},
+        {"epoch": "1e3", "step": 1},
+        {"epoch": [], "step": 1},
+        {"epoch": -1, "step": 1},
+    ],
+)
+def test_state_position_rejects_invalid_metadata(
+    test_workspace: Path, metadata: dict[str, object]
+) -> None:
+    state = test_workspace / "test-lora-1-state"
+    state.mkdir()
+    (state / "training_state.json").write_text(json.dumps(metadata), encoding="utf-8")
+    with pytest.raises(UserFacingError, match="STATE_POSITION"):
+        validate_state_position(
+            _position_artifact(),
+            state,
+            target_total_epochs=10,
+            estimated_total_steps=1000,
+            max_epoch=100,
+            max_step=10_000,
+        )
+
+
+def test_state_position_rejects_target_and_estimated_step_overflow(
+    test_workspace: Path,
+) -> None:
+    state = test_workspace / "test-lora-500-state"
+    state.mkdir()
+    (state / "training_state.json").write_text(
+        json.dumps({"epoch": 5, "step": 500}), encoding="utf-8"
+    )
+    with pytest.raises(UserFacingError, match="STATE_POSITION_OUT_OF_RANGE"):
+        validate_state_position(
+            _position_artifact(epoch=5, step=500),
+            state,
+            target_total_epochs=4,
+            estimated_total_steps=1000,
+            max_epoch=100,
+            max_step=10_000,
+        )
+    with pytest.raises(UserFacingError, match="STATE_POSITION_OUT_OF_RANGE"):
+        validate_state_position(
+            _position_artifact(epoch=5, step=500),
+            state,
+            target_total_epochs=10,
+            estimated_total_steps=499,
+            max_epoch=100,
+            max_step=10_000,
+        )
 
 
 def test_resume_command_is_fixed_and_redacts_state_path(test_workspace: Path) -> None:
@@ -150,7 +282,7 @@ def test_resume_creates_child_copies_state_and_preserves_parent(
     fake = FakeTrainingProcessAdapter(running=False, exit_code=0)
     service = TrainingService(settings, process_adapter=fake)
     try:
-        config = _config(service, project_id, snapshot_id, model_id)
+        config = _config(service, project_id, snapshot_id, model_id, epochs=10)
         parent_id = service.create_job(config.id)
         service.start_job(parent_id)
         _wait(service, parent_id, TrainingJobStatus.SUCCEEDED)
@@ -205,6 +337,8 @@ def test_resume_creates_child_copies_state_and_preserves_parent(
         assert preview.state_step == 500
         assert preview.initial_epoch == 5
         assert preview.initial_step == 500
+        assert preview.state_epoch_source == "artifact"
+        assert preview.state_step_source == "artifact"
         assert preview.position_warning is not None
         child_id = service.create_resume_job(
             parent_id, artifact_id, preview_signature=preview.signature
@@ -214,6 +348,8 @@ def test_resume_creates_child_copies_state_and_preserves_parent(
         assert child.resume_artifact_id == artifact_id
         assert child.initial_epoch == 5
         assert child.initial_step == 500
+        assert child.initial_epoch_source == "artifact"
+        assert child.initial_step_source == "artifact"
         assert child.resume_request_fingerprint is not None
         assert (
             service.create_resume_job(
@@ -240,6 +376,8 @@ def test_resume_creates_child_copies_state_and_preserves_parent(
         assert manifest["state_step"] == 500
         assert manifest["initial_epoch"] == 5
         assert manifest["initial_step"] == 500
+        assert manifest["state_epoch_source"] == "artifact"
+        assert manifest["state_step_source"] == "artifact"
         assert manifest["progress_step_offset"] == 500
         assert (
             manifest["resume_request_fingerprint"] == child.resume_request_fingerprint
@@ -261,7 +399,7 @@ def test_resume_creates_child_copies_state_and_preserves_parent(
                 output_name="extended-lora",
                 output_directory=settings.outputs_dir,
                 sd_scripts_root=settings.training_sd_scripts_root,
-                epochs=2,
+                epochs=12,
             )
         )
         extended_preview = service.preview_resume(
