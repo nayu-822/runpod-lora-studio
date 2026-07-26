@@ -83,11 +83,9 @@ class TrainingConfigInput:
     output_directory: Path
     sd_scripts_root: Path
     trainer_script: str = "sdxl_train_network.py"
-    python_executable: str = "python"
     resolution: int = 1024
     batch_size: int = 1
     epochs: int = 1
-    repeats: int = 1
     learning_rate: float = 1e-4
     optimizer: str = "AdamW8bit"
     scheduler: str = "cosine"
@@ -113,11 +111,9 @@ class TrainingConfig:
     output_directory: Path
     sd_scripts_root: Path
     trainer_script: str
-    python_executable: str
     resolution: int
     batch_size: int
     epochs: int
-    repeats: int
     learning_rate: float
     optimizer: str
     scheduler: str
@@ -144,11 +140,9 @@ class TrainingConfig:
             "output_directory": str(self.output_directory),
             "sd_scripts_root": str(self.sd_scripts_root),
             "trainer_script": self.trainer_script,
-            "python_executable": self.python_executable,
             "resolution": self.resolution,
             "batch_size": self.batch_size,
             "epochs": self.epochs,
-            "repeats": self.repeats,
             "learning_rate": self.learning_rate,
             "optimizer": self.optimizer,
             "scheduler": self.scheduler,

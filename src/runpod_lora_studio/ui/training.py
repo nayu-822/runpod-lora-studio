@@ -30,11 +30,27 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
         resolution = gr.Number(value=1024, precision=0, label="resolution")
         batch_size = gr.Number(value=1, precision=0, label="batch size")
         epochs = gr.Number(value=1, precision=0, label="epochs")
-        repeats = gr.Number(value=1, precision=0, label="repeats")
     with gr.Row():
         learning_rate = gr.Number(value=0.0001, label="learning rate")
-        optimizer = gr.Textbox(value="AdamW8bit", label="optimizer")
-        scheduler = gr.Textbox(value="cosine", label="scheduler")
+        optimizer = gr.Dropdown(
+            choices=["AdamW", "AdamW8bit", "Lion", "Prodigy"],
+            value="AdamW8bit",
+            label="optimizer",
+        )
+        scheduler = gr.Dropdown(
+            choices=[
+                "constant",
+                "constant_with_warmup",
+                "cosine",
+                "cosine_with_restarts",
+                "linear",
+            ],
+            value="cosine",
+            label="scheduler",
+        )
+        network_module = gr.Dropdown(
+            choices=["networks.lora"], value="networks.lora", label="network module"
+        )
         network_dim = gr.Number(value=16, precision=0, label="network dim")
         network_alpha = gr.Number(value=16, precision=0, label="network alpha")
     with gr.Row():
@@ -143,10 +159,10 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
         resolution,
         batch_size,
         epochs,
-        repeats,
         learning_rate,
         optimizer,
         scheduler,
+        network_module,
         network_dim,
         network_alpha,
         mixed_precision,

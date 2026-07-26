@@ -67,7 +67,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0010_phase6a_training_jobs"
+            "0011_remove_training_config_overrides"
         )
 
 
@@ -124,7 +124,7 @@ def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0010_phase6a_training_jobs"
+            "0011_remove_training_config_overrides"
         )
 
 
@@ -152,7 +152,7 @@ def test_phase4_downgrade_and_reupgrade_preserves_phase3_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0010_phase6a_training_jobs"
+            "0011_remove_training_config_overrides"
         )
 
 
@@ -166,7 +166,7 @@ def test_phase5_upgrades_existing_0006_database_to_head(
         assert "managed_models" in tables
         assert "storage_transfer_jobs" in tables
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0010_phase6a_training_jobs"
+            "0011_remove_training_config_overrides"
         )
 
 
@@ -187,7 +187,7 @@ def test_phase5_heartbeat_migration_upgrades_existing_0007_database(
             "current_file_transferred_bytes",
         }.issubset(columns)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0010_phase6a_training_jobs"
+            "0011_remove_training_config_overrides"
         )
 
 
@@ -235,7 +235,7 @@ def test_phase5_progress_migration_upgrades_existing_0008_database(
         ).one()
         assert row == ("running", 0, 0)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0010_phase6a_training_jobs"
+            "0011_remove_training_config_overrides"
         )
 
 
@@ -262,7 +262,7 @@ def test_phase5_progress_downgrade_and_reupgrade(test_workspace: Path) -> None:
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0010_phase6a_training_jobs"
+            "0011_remove_training_config_overrides"
         )
 
 
@@ -279,6 +279,14 @@ def test_phase6a_downgrade_removes_training_tables_only(test_workspace: Path) ->
         assert "training_jobs" not in tables
         assert "managed_models" in tables
         command.upgrade(config, "head")
+        columns = {
+            column["name"]
+            for column in inspect(create_engine_for_settings(settings)).get_columns(
+                "training_configs"
+            )
+        }
+        assert "python_executable" not in columns
+        assert "repeats" not in columns
     finally:
         get_settings.cache_clear()
         if old_path is None:

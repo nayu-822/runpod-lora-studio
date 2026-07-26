@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -140,7 +141,9 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     # through the training job environment.
     training_jobs_dir: Path | None = None
     training_sd_scripts_root: Path = Path("/workspace/sd-scripts")
-    training_python_executable: str = "python"
+    training_python_executable: Path = Field(
+        default_factory=lambda: Path(sys.executable)
+    )
     training_heartbeat_interval_seconds: float = Field(default=2.0, gt=0.1, le=60.0)
     training_job_stale_after_seconds: float = Field(default=120.0, gt=0.0)
     training_starting_grace_seconds: float = Field(default=30.0, ge=0.0)

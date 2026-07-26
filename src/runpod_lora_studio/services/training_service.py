@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import shutil
+import sys
 import threading
 import time
+import tomllib
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -69,7 +72,18 @@ class TrainingService:
         self.settings = settings
         self.session_factory = create_session_factory(settings)
         self.process_adapter = process_adapter or SubprocessTrainingAdapter()
-        self.command_builder = command_builder or SdScriptsCommandBuilder()
+        self.command_builder = command_builder or SdScriptsCommandBuilder(
+            python_executable=settings.training_python_executable,
+            allowed_python_roots=(
+                Path(sys.prefix),
+                Path(sys.executable).parent,
+                settings.training_sd_scripts_root,
+            ),
+            allowed_trainer_roots=(
+                settings.training_sd_scripts_root,
+                settings.workspace_root,
+            ),
+        )
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="training"
         )
@@ -336,8 +350,8 @@ class TrainingService:
             config = repository.get_config(UUID(record.training_config_id))
             if config is None:
                 raise UserFacingError("学習設定が見つかりません")
-            model_path, snapshot_toml = self._validate_config_references(
-                session, config
+            model_path, snapshot_toml, dataset_repeats = (
+                self._validate_config_references(session, config)
             )
 
         runtime = self.jobs_root / str(job_id)
@@ -348,10 +362,29 @@ class TrainingService:
         copied_toml = runtime / "config" / "dataset.toml"
         shutil.copy2(snapshot_toml, copied_toml)
         command = self.command_builder.build(
-            config, model_path=model_path, dataset_config_path=copied_toml
+            config,
+            model_path=model_path,
+            dataset_config_path=copied_toml,
+            allowed_model_roots=self._model_roots(),
+            allowed_dataset_roots=(runtime / "config",),
+            allowed_output_roots=(self.settings.outputs_dir,),
         )
         (runtime / "config" / "training-config.json").write_text(
             config.snapshot_json(), encoding="utf-8"
+        )
+        (runtime / "runtime" / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "source_dataset_toml": str(snapshot_toml),
+                    "source_dataset_toml_sha256": _sha256_file(snapshot_toml),
+                    "job_dataset_toml": str(copied_toml),
+                    "job_dataset_toml_sha256": _sha256_file(copied_toml),
+                    "dataset_num_repeats": list(dataset_repeats),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
         )
         with self.session_factory() as session:
             record = TrainingRepository(session).get_job_record(job_id)
@@ -505,6 +538,16 @@ class TrainingService:
             )
 
     def _validate_config_input(self, data: TrainingConfigInput) -> None:
+        if data.network_module not in self.command_builder.allowed_network_modules:
+            raise UserFacingError("network module is not allowed")
+        if data.optimizer not in self.command_builder.allowed_optimizers:
+            raise UserFacingError("optimizer is not allowed")
+        if data.scheduler not in self.command_builder.allowed_schedulers:
+            raise UserFacingError("scheduler is not allowed")
+        try:
+            self.command_builder.validate_python_executable()
+        except TrainingCommandValidationError as exc:
+            raise UserFacingError(str(exc)) from exc
         if not data.name.strip() or len(data.name.strip()) > 200:
             raise UserFacingError("学習設定名が不正です")
         if not _safe_filename(data.output_name):
@@ -515,8 +558,8 @@ class TrainingService:
             raise UserFacingError("resolutionが不正です")
         if not 1 <= data.batch_size <= 64:
             raise UserFacingError("batch sizeが不正です")
-        if not 1 <= data.epochs <= 100000 or not 1 <= data.repeats <= 100000:
-            raise UserFacingError("epochsまたはrepeatsが不正です")
+        if not 1 <= data.epochs <= 100000:
+            raise UserFacingError("epochsが不正です")
         if not 0 < data.learning_rate <= 10:
             raise UserFacingError("learning rateが不正です")
         if data.network_dim <= 0 or data.network_alpha <= 0:
@@ -525,7 +568,7 @@ class TrainingService:
             raise UserFacingError("save every N epochsが不正です")
         if data.mixed_precision not in self.command_builder.allowed_mixed_precision:
             raise UserFacingError("mixed precisionが不正です")
-        for value in (data.python_executable, data.trainer_script):
+        for value in (data.trainer_script,):
             if not value.strip() or any(ord(char) < 32 for char in value):
                 raise UserFacingError("実行ファイル設定が不正です")
         try:
@@ -574,7 +617,7 @@ class TrainingService:
 
     def _validate_config_references(
         self, session: Any, config: TrainingConfig
-    ) -> tuple[Path, Path]:
+    ) -> tuple[Path, Path, tuple[int, ...]]:
         snapshot = session.scalar(
             select(DatasetSnapshotRecord).where(
                 DatasetSnapshotRecord.id == str(config.dataset_snapshot_id)
@@ -633,11 +676,9 @@ class TrainingService:
                 output_directory=config.output_directory,
                 sd_scripts_root=config.sd_scripts_root,
                 trainer_script=config.trainer_script,
-                python_executable=config.python_executable,
                 resolution=config.resolution,
                 batch_size=config.batch_size,
                 epochs=config.epochs,
-                repeats=config.repeats,
                 learning_rate=config.learning_rate,
                 optimizer=config.optimizer,
                 scheduler=config.scheduler,
@@ -652,7 +693,8 @@ class TrainingService:
                 extra_options=config.extra_options,
             )
         )
-        return model_path, dataset_toml
+        dataset_repeats = _read_dataset_repeats(dataset_toml)
+        return model_path, dataset_toml, dataset_repeats
 
     def _tail_log(self, job_id: UUID, stream: str, max_bytes: int | None) -> str:
         if stream not in {"stdout", "stderr"}:
@@ -682,6 +724,12 @@ class TrainingService:
             while len(text.encode("utf-8")) > limit:
                 text = text[1:]
             return text
+
+    def _model_roots(self) -> tuple[Path, ...]:
+        roots = [self.settings.models_dir]
+        if self.settings.model_cache_dir is not None:
+            roots.append(self.settings.model_cache_dir)
+        return tuple(roots)
 
     def _missing(self) -> Any:
         raise UserFacingError("学習設定を取得できません")
@@ -724,6 +772,32 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _read_dataset_repeats(path: Path) -> tuple[int, ...]:
+    try:
+        with path.open("rb") as handle:
+            document = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise UserFacingError("dataset TOML is invalid") from exc
+    datasets = document.get("datasets")
+    if not isinstance(datasets, list) or not datasets:
+        raise UserFacingError("dataset TOML has no datasets")
+    repeats: list[int] = []
+    for dataset in datasets:
+        if not isinstance(dataset, dict):
+            raise UserFacingError("dataset TOML has an invalid dataset")
+        subsets = dataset.get("subsets")
+        if not isinstance(subsets, list) or not subsets:
+            raise UserFacingError("dataset TOML has no subsets")
+        for subset in subsets:
+            if not isinstance(subset, dict):
+                raise UserFacingError("dataset TOML has an invalid subset")
+            value = subset.get("num_repeats")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise UserFacingError("dataset TOML num_repeats is invalid")
+            repeats.append(value)
+    return tuple(repeats)
 
 
 def _safe_environment() -> dict[str, str]:

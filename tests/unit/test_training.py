@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -13,6 +15,7 @@ from sqlalchemy.orm import Session
 from runpod_lora_studio.config.settings import AppSettings, ensure_runtime_directories
 from runpod_lora_studio.domain.training_models import (
     TrainingConfig,
+    TrainingConfigInput,
     TrainingJobStateMachine,
     TrainingJobStatus,
     TrainingJobTransitionError,
@@ -31,7 +34,10 @@ from runpod_lora_studio.services.project_service import (
     ProjectService,
     UserFacingError,
 )
-from runpod_lora_studio.services.training_command import SdScriptsCommandBuilder
+from runpod_lora_studio.services.training_command import (
+    SdScriptsCommandBuilder,
+    TrainingCommandValidationError,
+)
 from runpod_lora_studio.services.training_service import TrainingService
 
 
@@ -70,7 +76,11 @@ def _fixture(root: Path) -> tuple[AppSettings, UUID, UUID, UUID]:
     dataset_toml = snapshot_root / "dataset.toml"
     manifest = snapshot_root / "manifest.json"
     report = snapshot_root / "report.json"
-    dataset_toml.write_text("[general]\nresolution = 1024\n", encoding="utf-8")
+    dataset_toml.write_text(
+        "[general]\nresolution = 1024\n\n[[datasets]]\n\n[[datasets.subsets]]\n"
+        "image_dir = 'images'\nnum_repeats = 2\n",
+        encoding="utf-8",
+    )
     manifest.write_text("{}", encoding="utf-8")
     report.write_text("{}", encoding="utf-8")
     model_id = uuid4()
@@ -229,11 +239,9 @@ def test_command_builder_uses_argument_array_and_redacts_paths(
         output_directory=test_workspace / "output",
         sd_scripts_root=root,
         trainer_script="sdxl_train_network.py",
-        python_executable="python",
         resolution=1024,
         batch_size=1,
         epochs=2,
-        repeats=1,
         learning_rate=1e-4,
         optimizer="AdamW8bit",
         scheduler="cosine",
@@ -250,7 +258,12 @@ def test_command_builder_uses_argument_array_and_redacts_paths(
         updated_at=now,
     )
     command = SdScriptsCommandBuilder().build(
-        config, model_path=model, dataset_config_path=dataset
+        config,
+        model_path=model,
+        dataset_config_path=dataset,
+        allowed_model_roots=(test_workspace,),
+        allowed_dataset_roots=(test_workspace,),
+        allowed_output_roots=(test_workspace,),
     )
     assert "--cache_latents" in command.arguments
     assert "--gradient_checkpointing" in command.arguments
@@ -259,6 +272,72 @@ def test_command_builder_uses_argument_array_and_redacts_paths(
     assert all(
         not (value.startswith("--") and " " in value) for value in command.arguments
     )
+    for field_name, value in (
+        ("network_module", "os"),
+        ("optimizer", "UnknownOptimizer"),
+        ("scheduler", "UnknownScheduler"),
+    ):
+        with pytest.raises(TrainingCommandValidationError):
+            builder_config = replace(config, **{field_name: value})
+            SdScriptsCommandBuilder().build(
+                builder_config,
+                model_path=model,
+                dataset_config_path=dataset,
+                allowed_model_roots=(test_workspace,),
+                allowed_dataset_roots=(test_workspace,),
+                allowed_output_roots=(test_workspace,),
+            )
+    for executable in ("/bin/sh", "/bin/bash", "/bin/rm"):
+        with pytest.raises(TrainingCommandValidationError):
+            SdScriptsCommandBuilder(
+                python_executable=executable
+            ).validate_python_executable()
+
+
+def test_python_symlink_cannot_escape_allowed_root(test_workspace: Path) -> None:
+    outside = test_workspace / "outside" / "python"
+    outside.parent.mkdir()
+    outside.write_bytes(b"not executable")
+    allowed_root = test_workspace / "allowed"
+    allowed_root.mkdir()
+    link = allowed_root / "python"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is not available")
+    with pytest.raises(TrainingCommandValidationError):
+        SdScriptsCommandBuilder(
+            python_executable=link, allowed_python_roots=(allowed_root,)
+        ).validate_python_executable()
+
+
+def test_service_rejects_unapproved_training_values(test_workspace: Path) -> None:
+    settings, project_id, snapshot_id, model_id = _fixture(test_workspace)
+    service = TrainingService(settings, process_adapter=FakeTrainingProcessAdapter())
+
+    def input_data(**overrides: object) -> TrainingConfigInput:
+        values: dict[str, object] = {
+            "project_id": project_id,
+            "dataset_snapshot_id": snapshot_id,
+            "managed_model_id": model_id,
+            "name": "safe",
+            "output_name": "safe-output",
+            "output_directory": settings.outputs_dir,
+            "sd_scripts_root": settings.training_sd_scripts_root,
+        }
+        values.update(overrides)
+        return TrainingConfigInput(**values)  # type: ignore[arg-type]
+
+    try:
+        for field_name, value in (
+            ("network_module", "os"),
+            ("optimizer", "UnknownOptimizer"),
+            ("scheduler", "UnknownScheduler"),
+        ):
+            with pytest.raises(UserFacingError):
+                service.create_config(input_data(**{field_name: value}))
+    finally:
+        service.close()
 
 
 def test_training_job_succeeds_with_fake_process(test_workspace: Path) -> None:
@@ -275,7 +354,17 @@ def test_training_job_succeeds_with_fake_process(test_workspace: Path) -> None:
         assert job.pid == 41000
         assert job.stdout_log_path is not None
         assert job.stdout_log_path.is_relative_to(service.jobs_root)
-        assert fake.start_calls[0][0][0] == "python"
+        assert Path(fake.start_calls[0][0][0]).name.startswith("python")
+        metadata = json.loads(
+            (service.jobs_root / str(job_id) / "runtime" / "metadata.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert metadata["dataset_num_repeats"] == [2]
+        assert (
+            metadata["source_dataset_toml_sha256"]
+            == metadata["job_dataset_toml_sha256"]
+        )
     finally:
         service.close()
 
@@ -364,7 +453,7 @@ def test_invalid_extra_option_and_log_tail_are_safe(test_workspace: Path) -> Non
     try:
         from runpod_lora_studio.domain.training_models import TrainingConfigInput
 
-        with pytest.raises(UserFacingError, match="未知のextra"):
+        with pytest.raises(UserFacingError, match="unknown extra option"):
             service.create_config(
                 TrainingConfigInput(
                     project_id=project_id,

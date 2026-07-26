@@ -497,7 +497,7 @@ Phase 4のレビュー対応を完了し、完了扱いへ戻す。Alembic 0006�
 - content hashが相対パス、TOML、正規化設定の変更を識別できる
 - 容量不足、未確認類似グループ、解像度・縦横比分布をプレビューとレポートへ反映できる
 - SQLite/Alembic 0006、Gradio UI、単体テスト、品質コマンドを確認済みである
-## Phase 6A 完了: SDXL LoRA学習ジョブ基盤とプロセス管理
+## Phase 6A レビュー対応中: SDXL LoRA学習ジョブ基盤とプロセス管理
 
 - 学習設定・学習ジョブ、状態遷移、PID、worker heartbeat、終了結果をSQLiteへ保存
 - `sdxl_train_network.py` の許可リストと型付き追加オプションによる安全なコマンド構築
@@ -506,3 +506,6 @@ Phase 4のレビュー対応を完了し、完了扱いへ戻す。Alembic 0006�
 - 最小限のGradio UIとFake process adapterを追加
 
 成果物のGoogle Drive同期、epoch/loss解析、resume、TensorBoard、Pod自動停止・TerminateはPhase 6Aの対象外とする。
+- Python実行ファイルはアプリ設定の検証済み実行環境に固定し、`/bin/sh`などの任意実行ファイルを受け付けない
+- network module、optimizer、schedulerは固定許可リストからのみ選択する
+- repeatsはPhase 4のdataset TOMLにある`num_repeats`を正とし、学習設定から重複指定しない

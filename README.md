@@ -266,3 +266,8 @@ Phase 5では、rcloneを介してGoogle Driveのモデルを一覧表示し、R
 Phase 6Aでは、完成済みデータセットスナップショットと検証済みローカルモデルを入力に、学習設定・ジョブをSQLiteへ保存し、安全な引数配列で `sdxl_train_network.py` を起動します。ジョブはPID、worker heartbeat、stdout/stderrログ、終了コードを記録し、キャンセル、stale復旧、boundedなログ末尾取得に対応します。
 
 学習コマンドは許可されたtrainerと型付き追加オプションだけを受け付け、`shell=False`、許可ディレクトリ、固定された環境変数を使用します。Phase 6Aの範囲には成果物のGoogle Drive同期、epoch/loss解析、resume、TensorBoard、Pod停止・Terminateは含まれません。
+### Phase 6Aレビュー対応の設定境界
+
+- Python実行ファイルは`sys.executable`を基準にした検証済み環境から固定し、UI/APIで任意の実行ファイルを指定できない。
+- network moduleは`networks.lora`、optimizerとschedulerはsd-scriptsで確認済みの固定候補だけを許可する。
+- repeatsはPhase 4のdataset TOMLにある各subsetの`num_repeats`を正とする。学習設定では重複指定せず、snapshotの元TOMLは変更しない。

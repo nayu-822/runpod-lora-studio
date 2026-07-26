@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import os
+import re
 import shlex
+import shutil
+import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -25,6 +30,13 @@ class SdScriptsCommandBuilder:
     allowed_mixed_precision: ClassVar[frozenset[str]] = frozenset(
         {"no", "fp16", "bf16"}
     )
+    allowed_network_modules: ClassVar[frozenset[str]] = frozenset({"networks.lora"})
+    allowed_optimizers: ClassVar[frozenset[str]] = frozenset(
+        {"AdamW", "AdamW8bit", "Lion", "Prodigy"}
+    )
+    allowed_schedulers: ClassVar[frozenset[str]] = frozenset(
+        {"constant", "constant_with_warmup", "cosine", "cosine_with_restarts", "linear"}
+    )
     extra_option_types: ClassVar[dict[str, type]] = {
         "max_train_steps": int,
         "max_token_length": int,
@@ -38,39 +50,69 @@ class SdScriptsCommandBuilder:
         "no_token_padding": bool,
     }
 
+    def __init__(
+        self,
+        *,
+        python_executable: Path | str | None = None,
+        allowed_python_roots: Sequence[Path] | None = None,
+        allowed_trainer_roots: Sequence[Path] | None = None,
+    ) -> None:
+        self.python_executable = Path(python_executable or sys.executable)
+        self.allowed_python_roots = tuple(
+            path.resolve()
+            for path in (
+                allowed_python_roots or (Path(sys.prefix), Path(sys.executable).parent)
+            )
+        )
+        self.allowed_trainer_roots = tuple(
+            path.resolve() for path in (allowed_trainer_roots or ())
+        )
+
     def build(
         self,
         config: TrainingConfig,
         *,
         model_path: Path,
         dataset_config_path: Path,
+        allowed_model_roots: Sequence[Path],
+        allowed_dataset_roots: Sequence[Path],
+        allowed_output_roots: Sequence[Path],
     ) -> TrainingCommand:
-        self._validate_text(config.python_executable, "python executable")
+        python_executable = self.validate_python_executable()
         self._validate_text(config.trainer_script, "trainer script")
         if config.trainer_script not in self.allowed_trainer_scripts:
-            raise TrainingCommandValidationError("許可されていないtrainer scriptです")
+            raise TrainingCommandValidationError("trainer script is not allowed")
+        if config.network_module not in self.allowed_network_modules:
+            raise TrainingCommandValidationError("network module is not allowed")
+        if config.optimizer not in self.allowed_optimizers:
+            raise TrainingCommandValidationError("optimizer is not allowed")
+        if config.scheduler not in self.allowed_schedulers:
+            raise TrainingCommandValidationError("scheduler is not allowed")
         if config.mixed_precision not in self.allowed_mixed_precision:
-            raise TrainingCommandValidationError("mixed precisionが不正です")
-        if not model_path.is_file() or model_path.stat().st_size <= 0:
-            raise TrainingCommandValidationError("学習元モデルが利用できません")
-        if not dataset_config_path.is_file():
-            raise TrainingCommandValidationError("dataset TOMLが利用できません")
+            raise TrainingCommandValidationError("mixed precision is not allowed")
+        model_path = self._validated_file(model_path, allowed_model_roots, "model")
+        dataset_config_path = self._validated_file(
+            dataset_config_path, allowed_dataset_roots, "dataset TOML"
+        )
         root = config.sd_scripts_root.resolve()
         trainer_path = (root / config.trainer_script).resolve()
-        self._ensure_under(trainer_path, root, "trainer script")
+        trainer_roots = self.allowed_trainer_roots or (root,)
+        self._ensure_under_any(trainer_path, trainer_roots, "trainer script")
         if not trainer_path.is_file():
-            raise TrainingCommandValidationError("trainer scriptが見つかりません")
+            raise TrainingCommandValidationError("trainer script does not exist")
         output_directory = config.output_directory.resolve()
-        if not output_directory.is_dir():
-            output_directory.mkdir(parents=True, exist_ok=True)
+        self._ensure_under_any(
+            output_directory, allowed_output_roots, "output directory"
+        )
+        output_directory.mkdir(parents=True, exist_ok=True)
 
         arguments: list[str] = [
-            config.python_executable,
+            str(python_executable),
             str(trainer_path),
             "--pretrained_model_name_or_path",
-            str(model_path.resolve()),
+            str(model_path),
             "--dataset_config",
-            str(dataset_config_path.resolve()),
+            str(dataset_config_path),
             "--output_dir",
             str(output_directory),
             "--output_name",
@@ -107,33 +149,53 @@ class SdScriptsCommandBuilder:
         arguments.extend(self._extra_arguments(config.extra_options))
         return TrainingCommand(tuple(arguments), self._summary(arguments))
 
+    def validate_python_executable(self) -> Path:
+        raw = str(self.python_executable)
+        self._validate_text(raw, "python executable")
+        candidate = self.python_executable
+        if not candidate.is_absolute():
+            resolved_from_path = shutil.which(str(candidate))
+            if resolved_from_path is None:
+                raise TrainingCommandValidationError("python executable does not exist")
+            candidate = Path(resolved_from_path)
+        try:
+            executable = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise TrainingCommandValidationError(
+                "python executable does not exist"
+            ) from exc
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise TrainingCommandValidationError("python executable is not executable")
+        if not re.fullmatch(
+            r"python(?:3(?:\.\d+)*)?(?:\.exe)?", executable.name, re.IGNORECASE
+        ):
+            raise TrainingCommandValidationError(
+                "only an allowed Python executable may be used"
+            )
+        self._ensure_under_any(
+            executable, self.allowed_python_roots, "python executable"
+        )
+        return executable
+
     def _extra_arguments(self, options: dict[str, Any]) -> list[str]:
         result: list[str] = []
         for name in sorted(options):
             if name not in self.extra_option_types:
-                raise TrainingCommandValidationError(f"未知のextra optionです: {name}")
+                raise TrainingCommandValidationError(f"unknown extra option: {name}")
             value = options[name]
             expected = self.extra_option_types[name]
             if expected is int and (
                 not isinstance(value, int) or isinstance(value, bool)
             ):
-                raise TrainingCommandValidationError(
-                    f"extra optionの型が不正です: {name}"
-                )
+                raise TrainingCommandValidationError(f"invalid extra option: {name}")
             if expected is float and (
                 not isinstance(value, (float, int)) or isinstance(value, bool)
             ):
-                raise TrainingCommandValidationError(
-                    f"extra optionの型が不正です: {name}"
-                )
+                raise TrainingCommandValidationError(f"invalid extra option: {name}")
             if expected is bool and not isinstance(value, bool):
-                raise TrainingCommandValidationError(
-                    f"extra optionの型が不正です: {name}"
-                )
+                raise TrainingCommandValidationError(f"invalid extra option: {name}")
             if expected in (int, float) and value <= 0:
-                raise TrainingCommandValidationError(
-                    f"extra optionの値が不正です: {name}"
-                )
+                raise TrainingCommandValidationError(f"invalid extra option: {name}")
             if expected is bool and not value:
                 continue
             result.append(f"--{name}")
@@ -144,14 +206,22 @@ class SdScriptsCommandBuilder:
     @staticmethod
     def _validate_text(value: str, label: str) -> None:
         if not value.strip() or any(ord(char) < 32 for char in value):
-            raise TrainingCommandValidationError(f"{label}が不正です")
+            raise TrainingCommandValidationError(f"invalid {label}")
+
+    @classmethod
+    def _validated_file(cls, path: Path, roots: Sequence[Path], label: str) -> Path:
+        resolved = path.resolve()
+        cls._ensure_under_any(resolved, roots, label)
+        if not resolved.is_file():
+            raise TrainingCommandValidationError(f"{label} does not exist")
+        if label == "model" and resolved.stat().st_size <= 0:
+            raise TrainingCommandValidationError("model is empty")
+        return resolved
 
     @staticmethod
-    def _ensure_under(path: Path, root: Path, label: str) -> None:
-        try:
-            path.relative_to(root)
-        except ValueError as exc:
-            raise TrainingCommandValidationError(f"{label}が許可領域外です") from exc
+    def _ensure_under_any(path: Path, roots: Sequence[Path], label: str) -> None:
+        if not any(_is_under(path, root.resolve()) for root in roots):
+            raise TrainingCommandValidationError(f"{label} is outside an allowed root")
 
     @staticmethod
     def _summary(arguments: list[str]) -> str:
@@ -171,3 +241,11 @@ class SdScriptsCommandBuilder:
                 continue
             redacted.append(argument)
         return " ".join(shlex.quote(value) for value in redacted)
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
