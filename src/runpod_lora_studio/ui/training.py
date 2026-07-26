@@ -89,6 +89,48 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
     with gr.Row():
         stdout = gr.Textbox(label="stdout末尾", lines=8, interactive=False)
         stderr = gr.Textbox(label="stderr末尾", lines=8, interactive=False)
+    progress_view = gr.Dataframe(
+        headers=[
+            "status",
+            "epoch",
+            "step",
+            "progress",
+            "loss",
+            "smoothed loss",
+            "learning rate",
+            "steps/sec",
+            "elapsed",
+            "ETA",
+            "latest log",
+            "warning",
+            "source",
+        ],
+        value=[],
+        interactive=False,
+        label="training progress",
+    )
+    loss_graph = gr.LinePlot(
+        x="step", y="loss", title="loss history", interactive=False
+    )
+    artifacts_table = gr.Dataframe(
+        headers=[
+            "filename",
+            "type",
+            "epoch",
+            "step",
+            "size",
+            "SHA-256",
+            "validation",
+            "message",
+            "modified",
+        ],
+        value=[],
+        interactive=False,
+        label="training artifacts",
+    )
+    with gr.Row():
+        reparse = gr.Button("進捗を再解析")
+        rescan = gr.Button("成果物を再走査")
 
     def choices(project_id: str | None) -> tuple[object, object]:
         try:
@@ -127,15 +169,44 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
 
     def refresh_action(
         project_id: str | None, current_job: str | None
-    ) -> tuple[list[list[str]], str, str]:
+    ) -> tuple[
+        list[list[str]],
+        str,
+        str,
+        list[list[str]],
+        list[dict[str, object]],
+        list[list[str]],
+    ]:
         rows = controller.job_rows(project_id)
         if not current_job:
-            return rows, "", ""
+            return rows, "", "", [], [], []
         try:
             job_uuid = UUID(current_job.strip())
-            return rows, service.tail_stdout(job_uuid), service.tail_stderr(job_uuid)
+            progress = controller.progress_row(current_job)
+            metrics = controller.metric_rows(current_job)
+            graph = [{"step": step, "loss": value} for step, value, _ in metrics]
+            return (
+                rows,
+                service.tail_stdout(job_uuid),
+                service.tail_stderr(job_uuid),
+                [progress],
+                graph,
+                controller.artifact_rows(current_job),
+            )
         except (UserFacingError, ValueError) as exc:
-            return rows, f"エラー: {exc}", ""
+            return rows, f"エラー: {exc}", "", [], [], []
+
+    def reparse_action(current_job: str | None) -> str:
+        if not current_job:
+            return "jobを選択してください"
+        service.refresh_progress(UUID(current_job.strip()))
+        return "進捗を再解析しました"
+
+    def rescan_action(current_job: str | None) -> str:
+        if not current_job:
+            return "jobを選択してください"
+        service.rescan_artifacts(UUID(current_job.strip()))
+        return "成果物を再走査しました"
 
     def cancel_action(current_job: str | None) -> str:
         if not current_job:
@@ -177,6 +248,15 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
     refresh.click(
         refresh_action,
         inputs=[selected_project, job_id],
-        outputs=[jobs_table, stdout, stderr],
+        outputs=[
+            jobs_table,
+            stdout,
+            stderr,
+            progress_view,
+            loss_graph,
+            artifacts_table,
+        ],
     )
     cancel.click(cancel_action, inputs=[job_id], outputs=[message])
+    reparse.click(reparse_action, inputs=[job_id], outputs=[message])
+    rescan.click(rescan_action, inputs=[job_id], outputs=[message])

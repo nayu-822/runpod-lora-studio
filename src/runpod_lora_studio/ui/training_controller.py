@@ -90,6 +90,56 @@ class TrainingController:
         jobs = self.service.list_jobs(UUID(project_id) if project_id else None)
         return [self.job_row(job) for job in jobs]
 
+    def progress_row(self, job_id: str | None) -> list[str]:
+        if not job_id:
+            return ["", "", "", "", "", "", "", "", "", "", "", "", ""]
+        progress = self.service.get_progress(UUID(job_id))
+        if progress is None:
+            return ["unknown"] + [""] * 12
+        return [
+            progress.parse_status.value,
+            _display_pair(progress.current_epoch, progress.total_epochs),
+            _display_pair(progress.current_step, progress.total_steps),
+            _display_ratio(progress.progress_ratio),
+            _display_number(progress.latest_loss),
+            _display_number(progress.smoothed_loss),
+            _display_number(progress.learning_rate),
+            _display_number(progress.steps_per_second),
+            _display_seconds(progress.elapsed_seconds),
+            _display_seconds(progress.estimated_remaining_seconds),
+            progress.latest_log_at.isoformat() if progress.latest_log_at else "unknown",
+            progress.parse_warning or "",
+            progress.progress_source.value,
+        ]
+
+    def metric_rows(self, job_id: str | None, limit: int = 500) -> list[list[object]]:
+        if not job_id:
+            return []
+        return [
+            [step, value, epoch if epoch is not None else ""]
+            for step, value, epoch in self.service.list_metrics(
+                UUID(job_id), limit=limit
+            )
+        ]
+
+    def artifact_rows(self, job_id: str | None, limit: int = 500) -> list[list[str]]:
+        if not job_id:
+            return []
+        return [
+            [
+                artifact.filename,
+                artifact.artifact_type.value,
+                str(artifact.epoch or ""),
+                str(artifact.step or ""),
+                str(artifact.file_size),
+                (artifact.sha256 or "")[:12],
+                artifact.validation_status.value,
+                artifact.validation_message or "",
+                artifact.modified_at.isoformat() if artifact.modified_at else "",
+            ]
+            for artifact in self.service.list_artifacts(UUID(job_id), limit)
+        ]
+
     @staticmethod
     def job_row(job: TrainingJob) -> list[str]:
         return [
@@ -106,3 +156,24 @@ class TrainingController:
 
 def _choice_id(value: str) -> UUID:
     return UUID(value.split(" | ", 1)[0].strip())
+
+
+def _display_pair(current: int | None, total: int | None) -> str:
+    return (
+        f"{current if current is not None else '?'} / "
+        f"{total if total is not None else '?'}"
+    )
+
+
+def _display_ratio(value: float | None) -> str:
+    return f"{value * 100:.1f}%" if value is not None else "unknown"
+
+
+def _display_number(value: float | None) -> str:
+    return f"{value:.6g}" if value is not None else "unknown"
+
+
+def _display_seconds(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    return f"{max(0.0, value):.1f}s"

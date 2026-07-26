@@ -272,3 +272,13 @@ Phase 6Aでは、完成済みデータセットスナップショットと検証
 - trainerは`training_sd_scripts_root`内の固定スクリプトだけを実行し、`workspace_root`配下の任意スクリプトは実行しない。Python実行ファイルはresolve後の完全パスで信頼判定し、venv symlinkにも対応する。
 - network moduleは`networks.lora`、optimizerとschedulerはsd-scriptsで確認済みの固定候補だけを許可する。
 - repeatsはPhase 4のdataset TOMLにある各subsetの`num_repeats`を正とする。学習設定では重複指定せず、snapshotの元TOMLは変更しない。
+
+## Phase 6B: 学習進捗解析と成果物追跡
+
+Phase 6Bでは、workerのメモリ状態を正とせず、SQLiteに保存した進捗・metric・artifactをGradioへ復元表示します。stdout/stderrはbyte offsetから増分解析し、ANSI制御文字、不正UTF-8、carriage return、未完了行を安全に扱います。
+
+- 総stepはログ明示値を優先し、ない場合だけsnapshot由来のdataset TOMLと`num_repeats`から推定します。推定式は`ceil(sum(image_count * num_repeats) / (batch_size * gradient_accumulation_steps * world_size)) * epochs`です。
+- loss履歴は同一job・metric・stepでupsertし、最大件数を超えた場合は決定的に間引きます。ETAは直近のstep速度から上限付きで計算し、終了jobでは表示しません。
+- 成果物は許可されたoutput directory配下のoutput name一致`.safetensors`と検証済みstate directoryだけを発見します。symlink、一時ファイル、サイズ上限超過、壊れたheaderは採用せず、ファイルを削除・移動しません。
+- safetensorsはheader、tensor、metadata、サイズ・mtime、SHA-256を基本検証します。pickle系ローダーやGPUへのtensorロードは行いません。
+- Phase 6Bの`succeeded`はプロセスのexit code 0を意味し、最終LoRAの品質保証やGoogle Drive同期を意味しません。stateからのresumeはPhase 6C、成果物同期と完了manifestはPhase 9の対象です。

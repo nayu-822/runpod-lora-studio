@@ -927,6 +927,114 @@ class TrainingJobRecord(Base):
     )
 
 
+class TrainingProgressRecord(Base):
+    __tablename__ = "training_progress"
+    __table_args__ = (
+        UniqueConstraint("training_job_id", name="uq_training_progress_job"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    training_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("training_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    current_epoch: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_epochs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    current_step: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_steps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    progress_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    latest_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    smoothed_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    learning_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    steps_per_second: Mapped[float | None] = mapped_column(Float, nullable=True)
+    samples_per_second: Mapped[float | None] = mapped_column(Float, nullable=True)
+    elapsed_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    estimated_remaining_seconds: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    latest_log_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    stdout_offset: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    stderr_offset: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    parser_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    parse_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    parse_warning: Mapped[str | None] = mapped_column(Text, nullable=True)
+    progress_source: Mapped[str] = mapped_column(String(16), nullable=False)
+    parser_state: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class TrainingMetricPointRecord(Base):
+    __tablename__ = "training_metric_points"
+    __table_args__ = (
+        UniqueConstraint(
+            "training_job_id", "metric_name", "step", name="uq_training_metric_step"
+        ),
+        Index(
+            "ix_training_metrics_job_name_step",
+            "training_job_id",
+            "metric_name",
+            "step",
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    training_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("training_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    metric_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    epoch: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    step: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    value: Mapped[float] = mapped_column(Float, nullable=False)
+    logged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class TrainingArtifactRecord(Base):
+    __tablename__ = "training_artifacts"
+    __table_args__ = (
+        UniqueConstraint(
+            "training_job_id", "relative_path", name="uq_training_artifact_path"
+        ),
+        Index("ix_training_artifacts_job", "training_job_id"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    training_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("training_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    artifact_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    epoch: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    step: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    file_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    modified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    validation_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    validation_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    validation_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    discovered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 # Short compatibility name for service and test code.
 InspectionResultRecord = ImageInspectionResultRecord
 

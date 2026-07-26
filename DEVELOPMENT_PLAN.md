@@ -510,3 +510,14 @@ Phase 4のレビュー対応を完了し、完了扱いへ戻す。Alembic 0006�
 - trainerは`training_sd_scripts_root`内の固定スクリプトだけを実行し、`workspace_root`配下の任意スクリプトは実行しない。Pythonはresolve後の完全パスで信頼判定し、venv symlinkにも対応する
 - network module、optimizer、schedulerは固定許可リストからのみ選択する
 - repeatsはPhase 4のdataset TOMLにある`num_repeats`を正とし、学習設定から重複指定しない
+
+## Phase 6B完了: SDXL LoRA学習進捗解析と成果物追跡
+
+- Alembic `0012_phase6b_progress_artifacts`で、training progress、metric history、artifact trackingを追加
+- stdout/stderrの増分reader、offset・rotation・不完全UTF-8・不完全行の復元、sd-scripts/tqdm形式のparserを実装
+- ログ明示step優先、dataset TOMLの`num_repeats`による総step推定、進捗率、平滑化ETA、決定的metric間引きを実装
+- output nameと許可拡張子に基づくartifact発見、state構造検証、safetensors header/metadata/SHA-256基本検証を実装
+- DBから進捗・metric・artifactを再取得できるGradio表示と再解析・再走査操作を追加
+- Phase 6Bの`succeeded`はexit code 0のプロセス結果を維持し、成果物の最終品質保証は行わない
+
+stateからのresumeはPhase 6C、Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は未完了とする。

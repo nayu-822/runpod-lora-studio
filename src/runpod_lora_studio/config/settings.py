@@ -151,6 +151,17 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     training_log_tail_bytes: int = Field(
         default=64 * 1024, ge=1024, le=10 * 1024 * 1024
     )
+    training_progress_interval_seconds: float = Field(default=2.0, gt=0.1, le=60.0)
+    training_progress_read_bytes: int = Field(
+        default=256 * 1024, ge=1024, le=16 * 1024 * 1024
+    )
+    training_metric_max_points: int = Field(default=2000, ge=10, le=100000)
+    training_artifact_scan_interval_seconds: float = Field(
+        default=10.0, gt=0.1, le=300.0
+    )
+    training_artifact_max_depth: int = Field(default=3, ge=1, le=10)
+    training_artifact_max_count: int = Field(default=500, ge=1, le=10000)
+    training_artifact_max_file_size_bytes: int = Field(default=30 * 1024**3, ge=1)
 
     runpod_pod_id: str | None = Field(default=None, validation_alias="RUNPOD_POD_ID")
     # Tokens and credentials added later must use SecretStr and repr=False as well.

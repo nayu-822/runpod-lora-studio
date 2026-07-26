@@ -145,7 +145,7 @@ def test_migration_check_requires_current_to_equal_head(test_workspace: Path) ->
     check = _check_migration(settings)
 
     assert check.ok
-    assert "current=0011_remove_training_config_overrides" in check.detail
+    assert "current=0012_phase6b_progress_artifacts" in check.detail
 
 
 def test_migration_check_rejects_unmigrated_database(test_workspace: Path) -> None:

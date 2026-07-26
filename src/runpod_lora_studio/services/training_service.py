@@ -31,6 +31,10 @@ from runpod_lora_studio.domain.training_models import (
     TrainingJobStateMachine,
     TrainingJobStatus,
 )
+from runpod_lora_studio.domain.training_progress_models import (
+    TrainingArtifact,
+    TrainingProgressSnapshot,
+)
 from runpod_lora_studio.external.training_process import (
     StartedProcess,
     SubprocessTrainingAdapter,
@@ -54,6 +58,9 @@ from runpod_lora_studio.services.training_command import (
     TrainingCommand,
     TrainingCommandValidationError,
 )
+from runpod_lora_studio.services.training_progress_service import (
+    TrainingProgressService,
+)
 
 logger = logging.getLogger("runpod_lora_studio.training")
 
@@ -76,6 +83,7 @@ class TrainingService:
             python_executable=settings.training_python_executable,
             trusted_python_executables=(settings.training_python_executable,),
         )
+        self.progress_service = TrainingProgressService(settings)
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="training"
         )
@@ -252,6 +260,20 @@ class TrainingService:
             # The UI can be imported before the new migration is applied.
             return 0
 
+    def reconcile_progress(self) -> int:
+        """Restore persisted progress for active jobs after application restart."""
+        try:
+            with self.session_factory() as session:
+                job_ids = [
+                    UUID(record.id)
+                    for record in TrainingRepository(session).list_active_records()
+                ]
+        except OperationalError:
+            return 0
+        for job_id in job_ids:
+            self.progress_service.refresh_job(job_id)
+        return len(job_ids)
+
     def _reconcile_stale_jobs(self) -> int:
         now = datetime.now(UTC)
         reconciled = 0
@@ -292,6 +314,23 @@ class TrainingService:
 
     def tail_stderr(self, job_id: UUID, max_bytes: int | None = None) -> str:
         return self._tail_log(job_id, "stderr", max_bytes)
+
+    def get_progress(self, job_id: UUID) -> TrainingProgressSnapshot | None:
+        return self.progress_service.get_progress(job_id)
+
+    def refresh_progress(self, job_id: UUID) -> None:
+        self.progress_service.refresh_job(job_id)
+
+    def list_metrics(
+        self, job_id: UUID, metric_name: str = "loss", limit: int = 500
+    ) -> list[tuple[int, float, int | None]]:
+        return self.progress_service.list_metrics(job_id, metric_name, limit)
+
+    def list_artifacts(self, job_id: UUID, limit: int = 500) -> list[TrainingArtifact]:
+        return self.progress_service.list_artifacts(job_id, limit)
+
+    def rescan_artifacts(self, job_id: UUID) -> None:
+        self.progress_service.rescan_artifacts(job_id)
 
     def _run_job(self, job_id: UUID) -> None:
         worker_id = f"{os.getpid()}:{uuid4().hex}"
@@ -345,6 +384,7 @@ class TrainingService:
             model_path, snapshot_toml, dataset_repeats = (
                 self._validate_config_references(session, config)
             )
+            dataset_image_counts = _read_dataset_image_counts(snapshot_toml)
 
         runtime = self.jobs_root / str(job_id)
         (runtime / "config").mkdir(parents=True, exist_ok=True)
@@ -372,6 +412,7 @@ class TrainingService:
                     "job_dataset_toml": str(copied_toml),
                     "job_dataset_toml_sha256": _sha256_file(copied_toml),
                     "dataset_num_repeats": list(dataset_repeats),
+                    "dataset_image_counts": list(dataset_image_counts),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -426,6 +467,7 @@ class TrainingService:
     def _monitor_job(self, job_id: UUID, started: StartedProcess) -> None:
         cancel_sent = False
         kill_deadline: float | None = None
+        next_progress_at = 0.0
         while True:
             exit_code = self.process_adapter.poll(started.pid)
             cancel_requested = self._cancel_requested(job_id)
@@ -448,12 +490,20 @@ class TrainingService:
                 self.process_adapter.kill(started.pid)
                 kill_deadline = None
             self._heartbeat(job_id)
+            # Progress persistence is deliberately best-effort and independent
+            # from heartbeat/process state.
+            if time.monotonic() >= next_progress_at:
+                self.progress_service.refresh_job(job_id)
+                next_progress_at = (
+                    time.monotonic() + self.settings.training_progress_interval_seconds
+                )
             if exit_code is not None:
                 self._finish_job(job_id, exit_code, cancel_requested)
                 return
             time.sleep(self.settings.training_heartbeat_interval_seconds)
 
     def _finish_job(self, job_id: UUID, exit_code: int, cancel_requested: bool) -> None:
+        self.progress_service.refresh_job(job_id)
         status = (
             TrainingJobStatus.CANCELED
             if cancel_requested
@@ -479,6 +529,9 @@ class TrainingService:
                 )
             record.updated_at = utc_now()
             session.commit()
+        # Re-run once after the terminal status is persisted so ETA is cleared
+        # according to the final job state and final artifacts are visible.
+        self.progress_service.refresh_job(job_id)
 
     def _mark_failed(self, job_id: UUID, code: str, message: str) -> None:
         try:
@@ -789,6 +842,35 @@ def _read_dataset_repeats(path: Path) -> tuple[int, ...]:
                 raise UserFacingError("dataset TOML num_repeats is invalid")
             repeats.append(value)
     return tuple(repeats)
+
+
+def _read_dataset_image_counts(path: Path) -> tuple[int, ...]:
+    try:
+        with path.open("rb") as handle:
+            document = tomllib.load(handle)
+        counts: list[int] = []
+        root = path.parent.resolve()
+        for dataset in document.get("datasets", []):
+            for subset in dataset.get("subsets", []):
+                image_dir = (root / str(subset.get("image_dir", ""))).resolve()
+                if (
+                    not _is_under(image_dir, root)
+                    or image_dir.is_symlink()
+                    or not image_dir.is_dir()
+                ):
+                    counts.append(0)
+                    continue
+                counts.append(
+                    sum(
+                        1
+                        for item in image_dir.iterdir()
+                        if item.is_file()
+                        and item.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+                    )
+                )
+        return tuple(counts)
+    except (OSError, tomllib.TOMLDecodeError, AttributeError, TypeError):
+        return ()
 
 
 def _safe_environment() -> dict[str, str]:
