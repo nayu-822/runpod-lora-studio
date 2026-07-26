@@ -24,6 +24,7 @@ class TrainingCommand:
 
 
 class SdScriptsCommandBuilder:
+    version = "phase6c-v1"
     allowed_trainer_scripts: ClassVar[frozenset[str]] = frozenset(
         {"sdxl_train_network.py"}
     )
@@ -74,6 +75,8 @@ class SdScriptsCommandBuilder:
         allowed_model_roots: Sequence[Path],
         allowed_dataset_roots: Sequence[Path],
         allowed_output_roots: Sequence[Path],
+        resume_path: Path | None = None,
+        allowed_resume_roots: Sequence[Path] = (),
     ) -> TrainingCommand:
         python_executable = self.validate_python_executable()
         self._validate_text(config.trainer_script, "trainer script")
@@ -148,6 +151,16 @@ class SdScriptsCommandBuilder:
             arguments.append("--cache_latents")
         if config.gradient_checkpointing:
             arguments.append("--gradient_checkpointing")
+        if resume_path is not None:
+            if resume_path.is_symlink():
+                raise TrainingCommandValidationError(
+                    "resume state symlink is not allowed"
+                )
+            resume_path = resume_path.resolve()
+            self._ensure_under_any(resume_path, allowed_resume_roots, "resume state")
+            if not resume_path.is_dir():
+                raise TrainingCommandValidationError("resume state is not a directory")
+            arguments.extend(("--resume", str(resume_path)))
         arguments.extend(self._extra_arguments(config.extra_options))
         return TrainingCommand(tuple(arguments), self._summary(arguments))
 
@@ -239,6 +252,10 @@ class SdScriptsCommandBuilder:
                 "--pretrained_model_name_or_path",
                 "--dataset_config",
             }:
+                redacted.append(argument)
+                redact_next = True
+                continue
+            if argument == "--resume":
                 redacted.append(argument)
                 redact_next = True
                 continue

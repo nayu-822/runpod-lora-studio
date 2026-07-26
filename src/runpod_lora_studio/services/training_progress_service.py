@@ -13,6 +13,7 @@ from runpod_lora_studio.config.settings import AppSettings
 from runpod_lora_studio.domain.training_progress_models import (
     ParsedTrainingProgress,
     TrainingArtifact,
+    TrainingLogParseResult,
     TrainingLogParserState,
     TrainingParseStatus,
     TrainingProgressSnapshot,
@@ -195,8 +196,38 @@ class TrainingProgressService:
                 started_at=job.started_at,
                 now=parse_now,
             )
+            parser_result = result
+            resume_step_mode = str(previous_values.get("resume_step_mode", ""))
+            resume_epoch_mode = str(previous_values.get("resume_epoch_mode", ""))
+            if (
+                job.initial_step is not None
+                and result.progress.current_step is not None
+            ):
+                if resume_step_mode not in {"local", "cumulative"}:
+                    resume_step_mode = (
+                        "local"
+                        if result.progress.current_step < job.initial_step
+                        else "cumulative"
+                    )
+            if (
+                job.initial_epoch is not None
+                and result.progress.current_epoch is not None
+            ):
+                if resume_epoch_mode not in {"local", "cumulative"}:
+                    resume_epoch_mode = (
+                        "local"
+                        if result.progress.current_epoch < job.initial_epoch
+                        else "cumulative"
+                    )
+            step_offset = (job.initial_step or 0) if resume_step_mode == "local" else 0
+            epoch_offset = (
+                (job.initial_epoch or 0) if resume_epoch_mode == "local" else 0
+            )
+            result = _apply_resume_offsets(result, step_offset, epoch_offset)
             progress = result.progress
             warning_values = list(progress.warnings)
+            if job.initial_step is not None and not resume_step_mode:
+                warning_values.append("resume step format could not be determined")
             current_epoch = progress.current_epoch
             total_epochs = progress.total_epochs
             current_step = progress.current_step
@@ -243,11 +274,15 @@ class TrainingProgressService:
                 )
             smoothed_speed = _smoothed_speed(progress.speed, previous)
             state = {
-                "aggregate": _state_to_dict(result.state),
+                "aggregate": _state_to_dict(parser_result.state),
                 "stdout_parser": _state_to_dict(stdout_result.state),
                 "stderr_parser": _state_to_dict(stderr_result.state),
                 "stdout_cursor": _cursor_to_dict(stdout.cursor),
                 "stderr_cursor": _cursor_to_dict(stderr.cursor),
+                "resume_step_mode": resume_step_mode or "unknown",
+                "resume_epoch_mode": resume_epoch_mode or "unknown",
+                "resume_step_offset": step_offset,
+                "resume_epoch_offset": epoch_offset,
             }
             latest_log_at = (
                 datetime.now(UTC)
@@ -352,6 +387,66 @@ def _eta(
         0.0,
     )
     return float(min(remaining, 30 * 24 * 3600))
+
+
+def _apply_resume_offsets(
+    result: TrainingLogParseResult, step_offset: int, epoch_offset: int
+) -> TrainingLogParseResult:
+    if step_offset == 0 and epoch_offset == 0:
+        return result
+    progress = result.progress
+    current_step = (
+        progress.current_step + step_offset
+        if progress.current_step is not None
+        else None
+    )
+    total_steps = (
+        progress.total_steps + step_offset if progress.total_steps is not None else None
+    )
+    current_epoch = (
+        progress.current_epoch + epoch_offset
+        if progress.current_epoch is not None
+        else None
+    )
+    total_epochs = (
+        progress.total_epochs + epoch_offset
+        if progress.total_epochs is not None
+        else None
+    )
+    events = tuple(
+        replace(
+            event,
+            step=event.step + step_offset if event.step is not None else None,
+            epoch=event.epoch + epoch_offset if event.epoch is not None else None,
+        )
+        for event in progress.metric_events
+    )
+    ratio = (
+        max(0.0, min(1.0, current_step / total_steps))
+        if current_step is not None and total_steps and total_steps > 0
+        else progress.progress_ratio
+    )
+    state = replace(
+        result.state,
+        current_step=current_step,
+        total_steps=total_steps,
+        current_epoch=current_epoch,
+        total_epochs=total_epochs,
+    )
+    return TrainingLogParseResult(
+        replace(
+            progress,
+            current_step=current_step,
+            total_steps=total_steps,
+            current_epoch=current_epoch,
+            total_epochs=total_epochs,
+            progress_ratio=ratio,
+            metric_events=events,
+            state=state,
+        ),
+        state,
+        result.source,
+    )
 
 
 def _smoothed_speed(

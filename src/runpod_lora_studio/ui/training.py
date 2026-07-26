@@ -260,3 +260,99 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
     cancel.click(cancel_action, inputs=[job_id], outputs=[message])
     reparse.click(reparse_action, inputs=[job_id], outputs=[message])
     rescan.click(rescan_action, inputs=[job_id], outputs=[message])
+
+    gr.Markdown("### Phase 6C 学習stateからの安全な再開")
+    with gr.Row():
+        resume_job = gr.Dropdown(label="再開元job", choices=[])
+        resume_state = gr.Dropdown(label="再開元state", choices=[])
+        resume_config = gr.Dropdown(label="再開先設定（任意）", choices=[])
+        resume_preview = gr.Button("再開プレビュー")
+    resume_signature = gr.State(value="")
+    resume_details = gr.Markdown()
+    with gr.Row():
+        resume_create = gr.Button("再開jobを作成")
+        resume_start = gr.Button("再開jobを開始", variant="primary")
+    resume_job_id = gr.Textbox(label="再開後job ID", interactive=False)
+
+    def resume_jobs_action(project_id: str | None) -> object:
+        return gr.update(
+            choices=controller.resumable_job_choices(project_id), value=None
+        )
+
+    def resume_configs_action(project_id: str | None) -> object:
+        return gr.update(choices=controller.config_choices(project_id), value=None)
+
+    def resume_states_action(source: str | None) -> object:
+        return gr.update(choices=controller.resume_state_choices(source), value=None)
+
+    def resume_preview_action(
+        source: str | None, state: str | None, target_config: str | None
+    ) -> tuple[str, str]:
+        if not source or not state:
+            return "再開元jobとstateを選択してください", ""
+        try:
+            preview = controller.preview_resume(source, state, target_config)
+            issues = "、".join(preview.compatibility.issues) or "なし"
+            return (
+                "\n".join(
+                    [
+                        f"元job: `{preview.source_job_id}` ({preview.source_status})",
+                        f"state: `{preview.source_state_name}`",
+                        f"fingerprint: `{preview.state_fingerprint[:12]}`",
+                        (
+                            f"epoch/step: `{preview.current_epoch}` / "
+                            f"`{preview.current_step}`"
+                        ),
+                        f"compatibility: `{preview.compatibility.status.value}`",
+                        f"不一致: {issues}",
+                        f"command: `{preview.command_summary}`",
+                    ]
+                ),
+                preview.signature,
+            )
+        except (UserFacingError, ValueError) as exc:
+            return f"エラー: {exc}", ""
+
+    def resume_create_action(
+        source: str | None,
+        state: str | None,
+        target_config: str | None,
+        signature: str,
+    ) -> tuple[str, str]:
+        if not source or not state or not signature:
+            return "", "先に再開プレビューを実行してください"
+        try:
+            created = controller.create_resume_job(
+                source, state, signature, target_config
+            )
+            return created, f"再開jobを作成しました: `{created}`"
+        except (UserFacingError, ValueError) as exc:
+            return "", f"エラー: {exc}"
+
+    def resume_start_action(child: str | None) -> str:
+        if not child:
+            return "再開jobを作成してください"
+        try:
+            controller.start_resume_job(child)
+            return "再開jobをバックグラウンドで開始しました"
+        except (UserFacingError, ValueError) as exc:
+            return f"エラー: {exc}"
+
+    selected_project.change(
+        resume_jobs_action, inputs=[selected_project], outputs=[resume_job]
+    )
+    selected_project.change(
+        resume_configs_action, inputs=[selected_project], outputs=[resume_config]
+    )
+    resume_job.change(resume_states_action, inputs=[resume_job], outputs=[resume_state])
+    resume_preview.click(
+        resume_preview_action,
+        inputs=[resume_job, resume_state, resume_config],
+        outputs=[resume_details, resume_signature],
+    )
+    resume_create.click(
+        resume_create_action,
+        inputs=[resume_job, resume_state, resume_config, resume_signature],
+        outputs=[resume_job_id, message],
+    )
+    resume_start.click(resume_start_action, inputs=[resume_job_id], outputs=[message])

@@ -36,6 +36,7 @@ from runpod_lora_studio.domain.training_progress_models import (
     TrainingArtifact,
     TrainingProgressSnapshot,
 )
+from runpod_lora_studio.domain.training_resume_models import TrainingResumePreview
 from runpod_lora_studio.external.training_process import (
     StartedProcess,
     SubprocessTrainingAdapter,
@@ -62,6 +63,9 @@ from runpod_lora_studio.services.training_command import (
 from runpod_lora_studio.services.training_progress_service import (
     TrainingProgressService,
 )
+from runpod_lora_studio.services.training_resume_service import (
+    TrainingResumeService,
+)
 
 logger = logging.getLogger("runpod_lora_studio.training")
 
@@ -85,6 +89,9 @@ class TrainingService:
             trusted_python_executables=(settings.training_python_executable,),
         )
         self.progress_service = TrainingProgressService(settings)
+        self.resume_service = TrainingResumeService(
+            settings, process_adapter=self.process_adapter
+        )
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="training"
         )
@@ -332,6 +339,39 @@ class TrainingService:
 
     def rescan_artifacts(self, job_id: UUID) -> None:
         self.progress_service.rescan_artifacts(job_id)
+        self.resume_service.refresh_artifact_fingerprints(job_id)
+
+    def list_resumable_jobs(self, project_id: UUID | None = None) -> list[TrainingJob]:
+        return self.resume_service.list_resumable_jobs(project_id)
+
+    def list_resume_states(self, job_id: UUID) -> list[dict[str, str]]:
+        return self.resume_service.list_state_artifacts(job_id)
+
+    def preview_resume(
+        self,
+        source_job_id: UUID,
+        artifact_id: UUID,
+        target_config_id: UUID | None = None,
+    ) -> TrainingResumePreview:
+        return self.resume_service.preview(source_job_id, artifact_id, target_config_id)
+
+    def create_resume_job(
+        self,
+        source_job_id: UUID,
+        artifact_id: UUID,
+        *,
+        target_config_id: UUID | None = None,
+        preview_signature: str | None = None,
+    ) -> UUID:
+        return self.resume_service.create_resume_job(
+            source_job_id,
+            artifact_id,
+            target_config_id=target_config_id,
+            preview_signature=preview_signature,
+        )
+
+    def resume_series(self, job_id: UUID) -> list[UUID]:
+        return self.resume_service.series(job_id)
 
     def _run_job(self, job_id: UUID) -> None:
         worker_id = f"{os.getpid()}:{uuid4().hex}"
@@ -396,6 +436,14 @@ class TrainingService:
         copied_toml = runtime / "config" / "dataset.toml"
         shutil.copy2(snapshot_toml, copied_toml)
         job_config = replace(config, output_directory=job_output)
+        resume_path: Path | None = None
+        manifest_hash: str | None = None
+        with self.session_factory() as session:
+            record = TrainingRepository(session).get_job_record(job_id)
+            if record is not None and record.resume_artifact_id is not None:
+                resume_path, manifest_hash = self.resume_service.prepare_runtime(
+                    job_id, runtime
+                )
         command = self.command_builder.build(
             job_config,
             model_path=model_path,
@@ -403,6 +451,8 @@ class TrainingService:
             allowed_model_roots=self._model_roots(),
             allowed_dataset_roots=(runtime / "config",),
             allowed_output_roots=(runtime,),
+            resume_path=resume_path,
+            allowed_resume_roots=(runtime / "runtime" / "resume",),
         )
         (runtime / "config" / "training-config.json").write_text(
             job_config.snapshot_json(), encoding="utf-8"
@@ -417,6 +467,19 @@ class TrainingService:
                     "dataset_num_repeats": list(dataset_repeats),
                     "dataset_image_counts": list(dataset_image_counts),
                     "job_output_directory": "output",
+                    "source_dataset_content_sha256": _snapshot_content_hash(
+                        self.session_factory, config.dataset_snapshot_id
+                    ),
+                    "source_model_id": str(config.managed_model_id),
+                    "source_model_sha256": _model_hash(
+                        self.session_factory, config.managed_model_id
+                    ),
+                    "trainer_script": job_config.trainer_script,
+                    "command_builder_version": self.command_builder.version,
+                    "trusted_python_executable": str(
+                        self.command_builder.validate_python_executable()
+                    ),
+                    "resume_manifest_sha256": manifest_hash,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -820,6 +883,24 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _snapshot_content_hash(session_factory: Any, snapshot_id: UUID) -> str | None:
+    with session_factory() as session:
+        record = session.scalar(
+            select(DatasetSnapshotRecord).where(
+                DatasetSnapshotRecord.id == str(snapshot_id)
+            )
+        )
+        return record.content_sha256 if record is not None else None
+
+
+def _model_hash(session_factory: Any, model_id: UUID) -> str | None:
+    with session_factory() as session:
+        record = session.scalar(
+            select(ManagedModelRecord).where(ManagedModelRecord.id == str(model_id))
+        )
+        return record.local_sha256 if record is not None else None
 
 
 def _read_dataset_repeats(path: Path) -> tuple[int, ...]:

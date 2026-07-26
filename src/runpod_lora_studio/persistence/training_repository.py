@@ -94,6 +94,18 @@ def _job_from_record(record: TrainingJobRecord) -> TrainingJob:
         failure_message=record.failure_message,
         created_at=_utc(record.created_at) or utc_now(),
         updated_at=_utc(record.updated_at) or utc_now(),
+        parent_job_id=UUID(record.parent_job_id) if record.parent_job_id else None,
+        resume_artifact_id=(
+            UUID(record.resume_artifact_id) if record.resume_artifact_id else None
+        ),
+        resume_mode=record.resume_mode,
+        resume_validation_status=record.resume_validation_status,
+        resume_validation_code=record.resume_validation_code,
+        resume_validation_message=record.resume_validation_message,
+        initial_epoch=record.initial_epoch,
+        initial_step=record.initial_step,
+        progress_step_offset=record.progress_step_offset,
+        progress_epoch_offset=record.progress_epoch_offset,
     )
 
 
@@ -214,6 +226,17 @@ class TrainingRepository:
             stderr_log_path=None,
             runtime_directory=None,
             config_snapshot=None,
+            parent_job_id=None,
+            resume_artifact_id=None,
+            resume_mode=None,
+            resume_requested_at=None,
+            resume_validation_status=None,
+            resume_validation_code=None,
+            resume_validation_message=None,
+            initial_epoch=None,
+            initial_step=None,
+            progress_step_offset=None,
+            progress_epoch_offset=None,
             process_start_time=None,
             process_group_id=None,
             process_identity=None,

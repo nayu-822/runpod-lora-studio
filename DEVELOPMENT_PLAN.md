@@ -520,4 +520,13 @@ Phase 4のレビュー対応を完了し、完了扱いへ戻す。Alembic 0006�
 - DBから進捗・metric・artifactを再取得できるGradio表示と再解析・再走査操作を追加
 - Phase 6Bの`succeeded`はexit code 0のプロセス結果を維持し、成果物の最終品質保証は行わない
 
-stateからのresumeはPhase 6C、Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は未完了とする。
+## Phase 6C完了: SDXL LoRA学習stateからの安全な再開
+
+- Alembic `0013_phase6c_training_resume`で、親jobとの関係、再開対象artifact、検証結果、初期epoch/step、local/cumulative進捗オフセットを追加した
+- `failed`、`canceled`、安全に再確認できた`stale`だけを再開元として許可し、active job、symlink、job output外、空state、容量・深さ・ファイル数超過を拒否する。state内容のdeserializeは行わない
+- stateの安定性をストリームコピーとSHA-256で検証し、childの`runtime/resume/source-state`と`resume-state-manifest.json`へ保存する。親jobのstatus、progress、metric、artifactは変更しない
+- dataset/model/trainer/LoRA/optimizer/scheduler/precision/cache/gradient checkpoint/resolution/batch/repeats/seed/runtimeの互換性をfingerprintで比較し、epochの縮小とmetadata欠落を拒否する。preview signatureにより再検証前の変更も検出する
+- childには固定された`--resume`だけを追加し、開始直前にstateを再検証する。local形式のログは初期epoch/stepをoffsetして累積表示し、child outputだけを走査する
+- 再開元選択、state選択、preview、child job作成・開始のGradio操作と、fingerprint、互換性、親子分離、コピー検証、active/stale境界のテストを追加した
+
+Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は、Phase 6Cまで完了したが、Phase 9連携を含む完成条件は未完了とする。

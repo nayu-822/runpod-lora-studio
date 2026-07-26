@@ -184,3 +184,13 @@ class TrainingJob:
     failure_message: str | None
     created_at: datetime
     updated_at: datetime
+    parent_job_id: UUID | None = None
+    resume_artifact_id: UUID | None = None
+    resume_mode: str | None = None
+    resume_validation_status: str | None = None
+    resume_validation_code: str | None = None
+    resume_validation_message: str | None = None
+    initial_epoch: int | None = None
+    initial_step: int | None = None
+    progress_step_offset: int | None = None
+    progress_epoch_offset: int | None = None

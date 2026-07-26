@@ -907,6 +907,29 @@ class TrainingJobRecord(Base):
     stderr_log_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     runtime_directory: Mapped[str | None] = mapped_column(Text, nullable=True)
     config_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parent_job_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("training_jobs.id", ondelete="RESTRICT"), nullable=True
+    )
+    resume_artifact_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("training_artifacts.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    resume_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    resume_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    resume_validation_status: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    resume_validation_code: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    resume_validation_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    initial_epoch: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    initial_step: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    progress_step_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    progress_epoch_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
     process_start_time: Mapped[float | None] = mapped_column(Float, nullable=True)
     process_group_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     process_identity: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -923,6 +946,44 @@ class TrainingJobRecord(Base):
         DateTime(timezone=True), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class TrainingResumeValidationRecord(Base):
+    __tablename__ = "training_resume_validations"
+    __table_args__ = (
+        Index("ix_training_resume_validations_source_job", "source_job_id"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    source_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("training_jobs.id", ondelete="RESTRICT")
+    )
+    source_artifact_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("training_artifacts.id", ondelete="RESTRICT")
+    )
+    target_training_config_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("training_configs.id", ondelete="RESTRICT")
+    )
+    source_state_relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    source_state_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    source_job_config_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    target_config_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    compatibility_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    compatibility_issues: Mapped[str] = mapped_column(Text, nullable=False)
+    validated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    validator_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
 

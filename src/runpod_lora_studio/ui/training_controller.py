@@ -6,6 +6,7 @@ from typing import Any
 from uuid import UUID
 
 from runpod_lora_studio.domain.training_models import TrainingConfigInput, TrainingJob
+from runpod_lora_studio.domain.training_resume_models import TrainingResumePreview
 from runpod_lora_studio.services.training_service import TrainingService
 
 
@@ -79,6 +80,59 @@ class TrainingController:
 
     def create_job(self, config_id: str) -> str:
         return str(self.service.create_job(UUID(config_id)))
+
+    def resumable_job_choices(self, project_id: str | None) -> list[str]:
+        if not project_id:
+            return []
+        return [
+            f"{job.id} | {job.status.value}"
+            for job in self.service.list_resumable_jobs(UUID(project_id))
+        ]
+
+    def config_choices(self, project_id: str | None) -> list[str]:
+        if not project_id:
+            return []
+        return [
+            f"{config.id} | {config.name}"
+            for config in self.service.list_configs(UUID(project_id))
+        ]
+
+    def resume_state_choices(self, job_id: str | None) -> list[str]:
+        if not job_id:
+            return []
+        return [
+            f"{item['id']} | {item['filename']}"
+            for item in self.service.list_resume_states(UUID(job_id))
+            if item["validation_status"] == "valid"
+        ]
+
+    def preview_resume(
+        self, job_id: str, artifact_choice: str, config_choice: str | None = None
+    ) -> TrainingResumePreview:
+        return self.service.preview_resume(
+            UUID(_choice_id_text(job_id)),
+            UUID(_choice_id_text(artifact_choice)),
+            _optional_choice_id(config_choice),
+        )
+
+    def create_resume_job(
+        self,
+        job_id: str,
+        artifact_choice: str,
+        signature: str,
+        config_choice: str | None = None,
+    ) -> str:
+        return str(
+            self.service.create_resume_job(
+                UUID(_choice_id_text(job_id)),
+                UUID(_choice_id_text(artifact_choice)),
+                target_config_id=_optional_choice_id(config_choice),
+                preview_signature=signature,
+            )
+        )
+
+    def start_resume_job(self, job_id: str) -> str:
+        return self.start_job(job_id)
 
     def start_job(self, job_id: str) -> str:
         return str(self.service.start_job(UUID(job_id)))
@@ -156,6 +210,14 @@ class TrainingController:
 
 def _choice_id(value: str) -> UUID:
     return UUID(value.split(" | ", 1)[0].strip())
+
+
+def _choice_id_text(value: str) -> str:
+    return value.split(" | ", 1)[0].strip()
+
+
+def _optional_choice_id(value: str | None) -> UUID | None:
+    return UUID(_choice_id_text(value)) if value else None
 
 
 def _display_pair(current: int | None, total: int | None) -> str:
