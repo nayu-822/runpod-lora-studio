@@ -35,7 +35,8 @@ class TrainingRecommendationService:
         ):
             raise ValueError("recommendation is stale")
         extra_options = dict(base.extra_options)
-        change_diff = {
+        recommended = {
+            "resolution": recommendation.resolution,
             "batch_size": recommendation.batch_size,
             "epochs": recommendation.epochs,
             "learning_rate": recommendation.learning_rate,
@@ -47,9 +48,17 @@ class TrainingRecommendationService:
             "mixed_precision": recommendation.mixed_precision,
             "cache_latents": recommendation.cache_latents,
             "gradient_checkpointing": recommendation.gradient_checkpointing,
+            "save_every_n_epochs": recommendation.save_every_n_epochs,
+            "seed": recommendation.seed,
+        }
+        applied = {name: getattr(base, name) for name in recommended}
+        change_diff = {
+            name: {"recommended": value, "applied": applied[name]}
+            for name, value in recommended.items()
         }
         return replace(
             base,
+            resolution=recommendation.resolution,
             batch_size=recommendation.batch_size,
             epochs=recommendation.epochs,
             learning_rate=recommendation.learning_rate,
@@ -61,6 +70,8 @@ class TrainingRecommendationService:
             mixed_precision=recommendation.mixed_precision,
             cache_latents=recommendation.cache_latents,
             gradient_checkpointing=recommendation.gradient_checkpointing,
+            save_every_n_epochs=recommendation.save_every_n_epochs,
+            seed=recommendation.seed,
             extra_options=extra_options,
             recommendation_id=recommendation.id,
             recommendation_engine_version=recommendation.engine_version,

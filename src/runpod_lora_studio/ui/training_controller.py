@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from runpod_lora_studio.domain.recommendation_models import TrainingRecommendation
 from runpod_lora_studio.domain.training_models import TrainingConfigInput, TrainingJob
 from runpod_lora_studio.domain.training_resume_models import TrainingResumePreview
 from runpod_lora_studio.services.training_service import TrainingService
@@ -35,8 +34,15 @@ class TrainingController:
         self,
         project_id: str,
         values: tuple[Any, ...],
-        recommendation: TrainingRecommendation | None = None,
     ) -> str:
+        data = self.config_input(project_id, values)
+        return str(self.service.create_config(data).id)
+
+    def config_input(
+        self,
+        project_id: str,
+        values: tuple[Any, ...],
+    ) -> TrainingConfigInput:
         (
             snapshot,
             model,
@@ -59,7 +65,7 @@ class TrainingController:
             cache_latents,
             gradient_checkpointing,
         ) = values
-        data = TrainingConfigInput(
+        return TrainingConfigInput(
             project_id=UUID(project_id),
             dataset_snapshot_id=_choice_id(str(snapshot)),
             managed_model_id=_choice_id(str(model)),
@@ -81,26 +87,7 @@ class TrainingController:
             save_every_n_epochs=int(save_every),
             cache_latents=bool(cache_latents),
             gradient_checkpointing=bool(gradient_checkpointing),
-            recommendation_id=recommendation.id if recommendation else None,
-            recommendation_engine_version=(
-                recommendation.engine_version if recommendation else None
-            ),
-            recommendation_change_diff=(
-                {
-                    "batch_size": recommendation.batch_size,
-                    "epochs": recommendation.epochs,
-                    "learning_rate": recommendation.learning_rate,
-                    "optimizer": recommendation.optimizer,
-                    "scheduler": recommendation.scheduler,
-                    "network_dim": recommendation.network_dim,
-                    "network_alpha": recommendation.network_alpha,
-                    "mixed_precision": recommendation.mixed_precision,
-                }
-                if recommendation
-                else {}
-            ),
         )
-        return str(self.service.create_config(data).id)
 
     def create_job(self, config_id: str) -> str:
         return str(self.service.create_job(UUID(config_id)))

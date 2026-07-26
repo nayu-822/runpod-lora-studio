@@ -175,6 +175,9 @@ class TrainingRecommendation:
     settings_fingerprint: str
     engine_version: str
     created_at: datetime
+    resolution: int = 1024
+    save_every_n_epochs: int = 1
+    seed: int = 42
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,3 +197,4 @@ class RecommendationRequest:
     warning_count: int
     created_at: datetime
     updated_at: datetime
+    current_config: dict[str, object] = field(default_factory=dict)

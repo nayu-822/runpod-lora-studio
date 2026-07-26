@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from datetime import UTC, datetime
 from typing import Protocol
@@ -17,6 +15,7 @@ from runpod_lora_studio.domain.recommendation_models import (
     TrainingRecommendation,
     WarningSeverity,
 )
+from runpod_lora_studio.services.recommendation_fingerprint import input_fingerprint
 from runpod_lora_studio.services.training_memory_estimator import (
     DEFAULT_SAFETY_MARGIN_BYTES,
     TrainingMemoryEstimator,
@@ -295,6 +294,10 @@ class RuleBasedRecommendationEngine:
             "resolution": resolution,
             "batch_size": batch,
             "epochs": epochs,
+            "save_every_n_epochs": _positive_int(
+                data.current_config.get("save_every_n_epochs"), 1
+            ),
+            "seed": _positive_int(data.current_config.get("seed"), 42),
             "network_dim": dim,
             "network_alpha": alpha,
             "optimizer": optimizer,
@@ -341,6 +344,11 @@ class RuleBasedRecommendationEngine:
                 settings_fingerprint=fingerprint,
                 engine_version=self.engine_version,
                 created_at=now,
+                resolution=resolution,
+                save_every_n_epochs=_positive_int(
+                    data.current_config.get("save_every_n_epochs"), 1
+                ),
+                seed=_positive_int(data.current_config.get("seed"), 42),
             ),
         )
 
@@ -466,65 +474,15 @@ def _positive_int(value: object, default: int) -> int:
 
 
 def _fingerprint(data: RecommendationInput, settings: dict[str, object]) -> str:
+    import hashlib
+    import json
+
     payload = {
-        "project_id": str(data.project_id),
-        "dataset_snapshot_id": str(data.dataset_snapshot_id),
-        "model_id": str(data.model_id),
-        "environment_snapshot_id": str(data.environment_snapshot_id),
-        "concept_type": data.concept_type,
-        "quality_profile": data.quality_profile.value,
-        "speed_profile": data.speed_profile.value,
-        "environment": _stable_environment(data),
-        "training_environment": _stable_training_environment(data),
-        "dataset": {
-            "snapshot_id": str(data.dataset.snapshot_id),
-            "content_sha256": data.dataset.content_sha256,
-            "dataset_toml_sha256": data.dataset.dataset_toml_sha256,
-            "analyzer_version": data.dataset.analyzer_version,
-        },
-        "model_hash": data.user_constraints.get("model_sha256"),
+        "input_fingerprint": input_fingerprint(
+            data, engine_version=RuleBasedRecommendationEngine.engine_version
+        ),
         "settings": settings,
-        "engine_version": RuleBasedRecommendationEngine.engine_version,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
     ).hexdigest()
-
-
-def _stable_environment(data: RecommendationInput) -> dict[str, object]:
-    return {
-        "cuda_available": data.environment.cuda_available,
-        "cuda_runtime_version": data.environment.cuda_runtime_version,
-        "cuda_driver_version": data.environment.cuda_driver_version,
-        "torch_version": data.environment.torch_version,
-        "bf16_supported": data.environment.bf16_supported,
-        "fp16_supported": data.environment.fp16_supported,
-        "xformers_available": data.environment.xformers_available,
-        "bitsandbytes_available": data.environment.bitsandbytes_available,
-        "gpus": [
-            {
-                "name": gpu.name,
-                "uuid": gpu.uuid,
-                "architecture": gpu.architecture,
-                "compute_capability": gpu.compute_capability,
-                "total_vram_bytes": gpu.total_vram_bytes,
-            }
-            for gpu in data.environment.gpu_devices
-        ],
-    }
-
-
-def _stable_training_environment(data: RecommendationInput) -> dict[str, object]:
-    return {
-        "sd_scripts_version": data.training_environment.sd_scripts_version,
-        "trainer_script": str(data.training_environment.trainer_script)
-        if data.training_environment.trainer_script
-        else None,
-        "safetensors_available": data.training_environment.safetensors_available,
-        "torch_available": data.training_environment.torch_available,
-        "xformers_available": data.training_environment.xformers_available,
-        "bitsandbytes_available": data.training_environment.bitsandbytes_available,
-        "bf16_supported": data.training_environment.bf16_supported,
-        "fp16_supported": data.training_environment.fp16_supported,
-        "cuda_available": data.training_environment.cuda_available,
-    }

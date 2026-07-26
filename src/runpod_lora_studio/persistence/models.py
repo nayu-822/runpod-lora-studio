@@ -948,6 +948,7 @@ class TrainingRecommendationRequestRecord(Base):
     quality_profile: Mapped[str] = mapped_column(String(32), nullable=False)
     speed_profile: Mapped[str] = mapped_column(String(32), nullable=False)
     user_constraints_json: Mapped[str] = mapped_column(Text, nullable=False)
+    current_config_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     engine_version: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)

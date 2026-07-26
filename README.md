@@ -299,5 +299,5 @@ Phase 7Aでは、CUDA/GPU/VRAM、bf16、xformers、bitsandbytes、sd-scriptsの�
 
 - 推奨エンジンはルールベースで、concept type、quality/speed profile、実効画像数、解像度、VRAM安全マージンからbatch、dim/alpha、epoch、optimizer、scheduler、precision、cache/checkpointingを決めます。gradient accumulationはPhase 7Aでは1に固定します。
 - VRAM見積もりはtotal/free VRAMを区別し、安全マージンを差し引いて判定します。GPU未検出、bf16非対応、依存不足、空caption、重複、未確認類似グループなどは警告として表示し、blocking警告がある推奨は適用できません。
-- 「推奨設定を適用」は既存の`TrainingConfigInput`検証を通る設定を保存するだけで、学習ジョブを自動開始しません。dataset snapshotのrepeatsは変更せず、推奨ID、エンジンバージョン、変更差分を設定へ記録します。Phase 7Bの自動探索や学習中適応は対象外です。
+- 「推奨設定を適用」はDBから推奨とrequestを再読込し、関連付け、入力fingerprint、snapshot/modelの状態、現在の診断、ユーザー編集後の危険度を再検証してから、既存の`TrainingConfigInput`検証を通して保存します。blocking warningがある推奨はUIだけでなくサービス側でも拒否します。free VRAMは安定fingerprintには含めず、適用直前に再診断します。手動設定は推奨provenanceを持たずに保存できます。dataset snapshotのrepeatsは変更せず、推奨ID、エンジンバージョン、各項目の`recommended`/`applied`差分を設定へ記録します。UI stateには推奨本体を保持せず、IDとfingerprintだけを保持します。Phase 7Bの自動探索や学習中適応は対象外です。
 - `failed`、`canceled`、`stale`のいずれでもPID、process group、process identity、worker情報、heartbeatを確認し、終了を確証できないjobは再開しません。プロセスのkillは行いません。

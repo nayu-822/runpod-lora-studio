@@ -537,5 +537,5 @@ Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は�
 - `ComputeEnvironmentService`と`TrainingEnvironmentService`でGPU/CUDA/VRAM、bf16、依存ライブラリ、sd-scripts実行環境を診断し、診断結果を不変スナップショットとして保存する
 - 完了済みdataset snapshotから、画像数、repeatsを反映した実効画像数、caption、trigger coverage、重複・類似グループ、解像度・aspect・bucket統計を計算する
 - `RuleBasedRecommendationEngine`と`TrainingMemoryEstimator`で、許可済みoptimizer/scheduler/network moduleの範囲内から1件の決定論的推奨を生成する。GPUがない場合や安全VRAMを超える場合はblocking warningを付ける
-- 推奨の適用は既存の`TrainingService`のconfig検証を通して保存し、学習開始とは分離する。dataset snapshotは変更せず、推奨ID・engine version・変更差分をtraining configへ記録する
-- Alembic `0016_phase7a_recommendation_snapshots`および`0017_phase7a_recommendation_metadata`で環境・推奨・適用 provenanceを保存する。Optuna等の自動探索、学習中適応、Phase 7B機能は対象外とする
+- 推奨の適用は`RecommendationApplicationService`へ一元化し、DBからrequest/recommendationを再読込して関連付け、入力fingerprint、snapshot/model、現在の診断、ユーザー編集後のblocking riskを再検証してから既存の`TrainingService`のconfig検証を通して保存する。学習開始とは分離し、manual configはprovenanceなしで保存する。dataset snapshotは変更せず、推奨ID・engine version・各項目の`recommended`/`applied`差分をtraining configへ記録する。UI stateには推奨本体を保持せず、推奨ID・request ID・fingerprint・警告要約だけを保持する
+- Alembic `0016_phase7a_recommendation_snapshots`、`0017_phase7a_recommendation_metadata`、`0018_phase7a_recommendation_input_config`で環境・推奨・適用 provenanceと再検証用の入力設定を保存する。free VRAMは安定fingerprintから除外し、適用直前に再診断する。Optuna等の自動探索、学習中適応、Phase 7B機能は対象外とする

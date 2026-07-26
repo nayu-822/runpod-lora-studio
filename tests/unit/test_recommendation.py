@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -14,6 +15,7 @@ from runpod_lora_studio.domain.recommendation_models import (
     WarningSeverity,
 )
 from runpod_lora_studio.domain.training_models import TrainingConfigInput
+from runpod_lora_studio.services.recommendation_fingerprint import input_fingerprint
 from runpod_lora_studio.services.training_memory_estimator import (
     TrainingMemoryEstimator,
 )
@@ -23,6 +25,7 @@ from runpod_lora_studio.services.training_recommendation_engine import (
 from runpod_lora_studio.services.training_recommendation_service import (
     TrainingRecommendationService,
 )
+from runpod_lora_studio.services.training_risk_service import TrainingRiskService
 
 
 def _input(
@@ -163,4 +166,75 @@ def test_apply_recommendation_preserves_snapshot_and_records_provenance() -> Non
     assert applied.dataset_snapshot_id == base.dataset_snapshot_id
     assert applied.recommendation_id == recommendation.id
     assert applied.recommendation_engine_version == recommendation.engine_version
-    assert applied.recommendation_change_diff["batch_size"] == recommendation.batch_size
+    assert applied.recommendation_change_diff["batch_size"] == {
+        "recommended": recommendation.batch_size,
+        "applied": base.batch_size,
+    }
+
+
+def test_input_fingerprint_ignores_free_vram_but_tracks_stable_inputs() -> None:
+    data = _input(
+        gpu=GPUDeviceInfo(
+            index=0,
+            name="test",
+            total_vram_bytes=24 * 1024**3,
+            free_vram_bytes=20 * 1024**3,
+        )
+    )
+    changed_free = replace(
+        data,
+        environment=replace(
+            data.environment,
+            gpu_devices=(
+                replace(data.environment.gpu_devices[0], free_vram_bytes=8 * 1024**3),
+            ),
+        ),
+    )
+    changed_dataset = replace(
+        data,
+        dataset=replace(data.dataset, content_sha256="changed"),
+    )
+
+    assert input_fingerprint(data, engine_version="test") == input_fingerprint(
+        changed_free, engine_version="test"
+    )
+    assert input_fingerprint(data, engine_version="test") != input_fingerprint(
+        changed_dataset, engine_version="test"
+    )
+
+
+def test_training_risk_rechecks_user_edited_values() -> None:
+    data = _input(
+        gpu=GPUDeviceInfo(
+            index=0,
+            name="test",
+            total_vram_bytes=24 * 1024**3,
+            free_vram_bytes=20 * 1024**3,
+        ),
+        bf16=True,
+    )
+    recommendation = RuleBasedRecommendationEngine().recommend(data)[0]
+    edited = TrainingConfigInput(
+        project_id=data.project_id,
+        dataset_snapshot_id=data.dataset_snapshot_id,
+        managed_model_id=data.model_id,
+        name="test",
+        output_name="output",
+        output_directory=Path("/workspace/outputs"),
+        sd_scripts_root=Path("/workspace/sd-scripts"),
+        network_dim=8,
+        network_alpha=16,
+        mixed_precision="bf16",
+    )
+
+    warnings = TrainingRiskService.evaluate(
+        recommendation,
+        edited,
+        environment=data.environment,
+        effective_image_count=data.dataset.effective_image_count,
+        repeats=data.dataset.repeats,
+        allowed_optimizers=frozenset({"AdamW8bit"}),
+        allowed_schedulers=frozenset({"cosine"}),
+    )
+
+    assert any(warning.code == "NETWORK_ALPHA_INVALID" for warning in warnings)

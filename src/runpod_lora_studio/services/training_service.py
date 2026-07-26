@@ -20,7 +20,6 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 from runpod_lora_studio.config.settings import AppSettings
 from runpod_lora_studio.domain.models import DatasetSnapshotStatus
-from runpod_lora_studio.domain.recommendation_models import TrainingRecommendation
 from runpod_lora_studio.domain.storage_models import (
     ManagedModelStatus,
     TransferDirection,
@@ -63,9 +62,6 @@ from runpod_lora_studio.services.training_command import (
 )
 from runpod_lora_studio.services.training_progress_service import (
     TrainingProgressService,
-)
-from runpod_lora_studio.services.training_recommendation_service import (
-    TrainingRecommendationService,
 )
 from runpod_lora_studio.services.training_resume_service import (
     TrainingResumeService,
@@ -119,19 +115,6 @@ class TrainingService:
                 TrainingRepository(session).get_config(UUID(record.id))
                 or self._missing()
             )
-
-    def apply_recommendation(
-        self,
-        base: TrainingConfigInput,
-        recommendation: TrainingRecommendation,
-        *,
-        current_fingerprint: str | None = None,
-    ) -> TrainingConfig:
-        """Apply a selected recommendation, but leave job creation/start explicit."""
-        data = TrainingRecommendationService.apply_to_config(
-            base, recommendation, current_fingerprint=current_fingerprint
-        )
-        return self.create_config(data)
 
     def update_config(
         self, config_id: UUID, data: TrainingConfigInput
