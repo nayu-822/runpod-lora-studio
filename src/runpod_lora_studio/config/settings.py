@@ -136,6 +136,19 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     storage_retry_max_backoff_seconds: float = Field(default=300.0, ge=0.0)
     storage_job_stale_after_seconds: float = Field(default=120.0, gt=0.0)
 
+    # Phase 6A training process defaults. Secrets are deliberately not passed
+    # through the training job environment.
+    training_jobs_dir: Path | None = None
+    training_sd_scripts_root: Path = Path("/workspace/sd-scripts")
+    training_python_executable: str = "python"
+    training_heartbeat_interval_seconds: float = Field(default=2.0, gt=0.1, le=60.0)
+    training_job_stale_after_seconds: float = Field(default=120.0, gt=0.0)
+    training_starting_grace_seconds: float = Field(default=30.0, ge=0.0)
+    training_cancel_grace_seconds: float = Field(default=10.0, gt=0.0)
+    training_log_tail_bytes: int = Field(
+        default=64 * 1024, ge=1024, le=10 * 1024 * 1024
+    )
+
     runpod_pod_id: str | None = Field(default=None, validation_alias="RUNPOD_POD_ID")
     # Tokens and credentials added later must use SecretStr and repr=False as well.
     runpod_api_key: SecretStr | None = Field(
@@ -164,6 +177,7 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
         "temp_dir",
         "database_path",
         "tagger_model_dir",
+        "training_sd_scripts_root",
     )
     @classmethod
     def validate_paths(cls, value: Path) -> Path:
@@ -181,6 +195,7 @@ def ensure_runtime_directories(settings: AppSettings) -> None:
         settings.logs_dir,
         settings.temp_dir,
         settings.database_path.parent,
+        settings.training_jobs_dir or settings.workspace_root / "training" / "jobs",
     )
     for directory in (settings.model_cache_dir, settings.transfer_temp_dir):
         if directory is not None:

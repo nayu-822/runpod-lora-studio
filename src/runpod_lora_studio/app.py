@@ -20,11 +20,13 @@ from runpod_lora_studio.services.similarity_detection_service import (
 )
 from runpod_lora_studio.services.storage_service import StorageService
 from runpod_lora_studio.services.tagging_service import TaggingService
+from runpod_lora_studio.services.training_service import TrainingService
 from runpod_lora_studio.ui.dataset import build_dataset_tab
 from runpod_lora_studio.ui.phase1 import build_image_tab, build_project_tab
 from runpod_lora_studio.ui.similarity import build_similarity_tab
 from runpod_lora_studio.ui.storage import build_storage_tab
 from runpod_lora_studio.ui.tagging import build_tagging_tab
+from runpod_lora_studio.ui.training import build_training_tab
 
 
 def build_status_markdown(settings: AppSettings, report: EnvironmentReport) -> str:
@@ -91,9 +93,11 @@ def create_app(
     tagging = TaggingService(runtime_settings, projects)
     datasets = DatasetSnapshotService(runtime_settings, projects)
     storage = StorageService(runtime_settings, datasets=datasets)
+    training = TrainingService(runtime_settings)
     datasets.recover_finalized_snapshots()
     datasets.recover_stale()
     storage.recover_stale_jobs()
+    training.reconcile_stale_jobs()
     path_rows = build_paths_dataframe(runtime_settings)
 
     with gr.Blocks(title=runtime_settings.app_title) as demo:
@@ -129,6 +133,8 @@ def create_app(
             build_dataset_tab(datasets, selected_project)
         with gr.Tab("モデル・Google Drive"):
             build_storage_tab(storage, selected_project)
+        with gr.Tab("SDXL LoRA学習"):
+            build_training_tab(training, selected_project)
         gr.Markdown(
             "Phase 5のモデル管理・Google Drive転送基盤まで実装済みです。"
             "学習実行、学習成果物の最終同期、RunPod制御は後続Phaseの対象です。"

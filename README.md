@@ -261,3 +261,8 @@ Phase 5では、rcloneを介してGoogle Driveのモデルを一覧表示し、R
 転送後はverification levelに応じて各ファイルの存在・サイズ、remote hash、必須manifest、snapshot content hashを検証し、ローカルmanifestへ成功・失敗・スキップ件数、サイズ、ハッシュ、remoteメタデータ、rcloneバージョン、設定スナップショットを記録します。`remote_hash_and_size`はremote hashとサイズの一致、`manifest_metadata_and_size`はmanifestメタデータとサイズ、`existence_only`は存在のみ、`not_verified`は未検証、`verification_failed`は検証失敗を表します。古いtransfer-manifest.jsonのlocal SHA-256だけではremote実体の同一性を確認できないため、skip_identicalや転送後検証の成功には使用しません。進捗は完了済みファイルと現在ファイルを分けた累積値で、スキップは転送バイト数へ含めません。キャンセル、指数バックオフ、rclone子PID、worker ID、heartbeat、アプリ再起動後のstale検出をDBへ保存します。DBトランザクションは短く保ち、画像やモデル全体をbytesへ展開しません。
 
 通常処理では`rclone sync`、remote側の無関係なファイル削除、危険な上書き、秘密情報のログ出力を行いません。Google Drive実通信の手動確認は、rclone設定を配置したRunPodで`rclone version`、`rclone listremotes`、接続確認、モデル一覧、ドライラン、少量のモデル取得、completedスナップショットの転送・再検証の順に実施してください。認証情報がない環境の自動テストはFakeStorageTransferAdapterを使用します。
+## Phase 6A: SDXL LoRA学習ジョブ基盤
+
+Phase 6Aでは、完成済みデータセットスナップショットと検証済みローカルモデルを入力に、学習設定・ジョブをSQLiteへ保存し、安全な引数配列で `sdxl_train_network.py` を起動します。ジョブはPID、worker heartbeat、stdout/stderrログ、終了コードを記録し、キャンセル、stale復旧、boundedなログ末尾取得に対応します。
+
+学習コマンドは許可されたtrainerと型付き追加オプションだけを受け付け、`shell=False`、許可ディレクトリ、固定された環境変数を使用します。Phase 6Aの範囲には成果物のGoogle Drive同期、epoch/loss解析、resume、TensorBoard、Pod停止・Terminateは含まれません。

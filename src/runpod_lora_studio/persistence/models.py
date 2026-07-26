@@ -814,6 +814,121 @@ class ProjectStorageSettingsRecord(Base):
     )
 
 
+class TrainingConfigRecord(Base):
+    __tablename__ = "training_configs"
+    __table_args__ = (
+        Index("ix_training_configs_project_id", "project_id"),
+        Index("ix_training_configs_snapshot_id", "dataset_snapshot_id"),
+        Index("ix_training_configs_model_id", "managed_model_id"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    dataset_snapshot_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("dataset_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    managed_model_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("managed_models.id", ondelete="RESTRICT"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    output_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    output_directory: Mapped[str] = mapped_column(Text, nullable=False)
+    sd_scripts_root: Mapped[str] = mapped_column(Text, nullable=False)
+    trainer_script: Mapped[str] = mapped_column(String(128), nullable=False)
+    python_executable: Mapped[str] = mapped_column(Text, nullable=False)
+    resolution: Mapped[int] = mapped_column(Integer, nullable=False)
+    batch_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    epochs: Mapped[int] = mapped_column(Integer, nullable=False)
+    repeats: Mapped[int] = mapped_column(Integer, nullable=False)
+    learning_rate: Mapped[float] = mapped_column(Float, nullable=False)
+    optimizer: Mapped[str] = mapped_column(String(128), nullable=False)
+    scheduler: Mapped[str] = mapped_column(String(128), nullable=False)
+    network_module: Mapped[str] = mapped_column(String(128), nullable=False)
+    network_dim: Mapped[int] = mapped_column(Integer, nullable=False)
+    network_alpha: Mapped[int] = mapped_column(Integer, nullable=False)
+    mixed_precision: Mapped[str] = mapped_column(String(16), nullable=False)
+    save_every_n_epochs: Mapped[int] = mapped_column(Integer, nullable=False)
+    cache_latents: Mapped[bool] = mapped_column(Integer, nullable=False)
+    gradient_checkpointing: Mapped[bool] = mapped_column(Integer, nullable=False)
+    seed: Mapped[int] = mapped_column(Integer, nullable=False)
+    extra_options: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class TrainingJobRecord(Base):
+    __tablename__ = "training_jobs"
+    __table_args__ = (
+        Index("ix_training_jobs_project_id", "project_id"),
+        Index(
+            "uq_training_jobs_active_project",
+            "project_id",
+            unique=True,
+            sqlite_where=text(
+                "status IN ('queued', 'starting', 'running', 'cancel_requested')"
+            ),
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    training_config_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("training_configs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    dataset_snapshot_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("dataset_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    managed_model_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("managed_models.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    cancel_requested: Mapped[bool] = mapped_column(Integer, nullable=False)
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    worker_heartbeat: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    command_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stdout_log_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stderr_log_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    runtime_directory: Mapped[str | None] = mapped_column(Text, nullable=True)
+    config_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    process_start_time: Mapped[float | None] = mapped_column(Float, nullable=True)
+    process_group_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    process_identity: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    failure_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 # Short compatibility name for service and test code.
 InspectionResultRecord = ImageInspectionResultRecord
 
