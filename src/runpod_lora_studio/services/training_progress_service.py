@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -87,10 +88,12 @@ class TrainingProgressService:
             )
             if job is None or config is None:
                 return
-            output_root = _trusted_output_directory(
-                config.output_directory, self.settings
-            )
+            output_root, warning = _job_output_directory(job, self.settings)
             if output_root is None:
+                if warning:
+                    logger.warning(
+                        "artifact_scan_skipped job_id=%s: %s", job_id, warning
+                    )
                 return
             scanner = TrainingArtifactScanner(
                 output_root,
@@ -157,14 +160,39 @@ class TrainingProgressService:
             stderr = IncrementalLogReader(
                 logs_root, self.settings.training_progress_read_bytes
             ).read(stderr_path, stderr_cursor)
-            parser_state = _state_from_dict(previous_values.get("parser"))
-            result = self.parser.parse(
+            aggregate_state = _state_from_dict(
+                previous_values.get("aggregate", previous_values.get("parser"))
+            )
+            stdout_state = _state_from_dict(previous_values.get("stdout_parser"))
+            stderr_state = _state_from_dict(previous_values.get("stderr_parser"))
+            stdout_remainder = "" if stdout.reset else stdout_state.remainder
+            stderr_remainder = "" if stderr.reset else stderr_state.remainder
+            stdout_result = self.parser.parse_stream(
                 stdout.data,
-                stderr.data,
-                parser_state,
+                replace(aggregate_state, remainder=stdout_remainder),
                 total_epochs=config.epochs,
                 estimated_total_steps=_estimated_total_steps(runtime, config),
                 started_at=job.started_at,
+                now=datetime.now(UTC),
+                source="stdout",
+            )
+            stderr_result = self.parser.parse_stream(
+                stderr.data,
+                replace(aggregate_state, remainder=stderr_remainder),
+                total_epochs=config.epochs,
+                estimated_total_steps=_estimated_total_steps(runtime, config),
+                started_at=job.started_at,
+                now=datetime.now(UTC),
+                source="stderr",
+            )
+            result = self.parser.merge(
+                aggregate_state,
+                stdout_result,
+                stderr_result,
+                total_epochs=config.epochs,
+                estimated_total_steps=_estimated_total_steps(runtime, config),
+                started_at=job.started_at,
+                now=datetime.now(UTC),
             )
             progress = result.progress
             warning_values = list(progress.warnings)
@@ -199,21 +227,24 @@ class TrainingProgressService:
                     else old_loss
                 )
             )
-            for warning in (stdout.warning, stderr.warning):
+            for stream_name, warning in (
+                ("stdout", stdout.warning),
+                ("stderr", stderr.warning),
+            ):
                 if warning:
-                    warning_values.append(warning)
+                    warning_values.append(f"{stream_name}: {warning}")
             if stdout.reset or stderr.reset:
                 warning_values.append("log offset reset after truncate or rotation")
-            output_root = _trusted_output_directory(
-                config.output_directory, self.settings
-            )
+            output_root, output_warning = _job_output_directory(job, self.settings)
             if output_root is None:
                 warning_values.append(
-                    "artifact output directory is outside the allowed root"
+                    output_warning or "job output directory is unavailable"
                 )
             smoothed_speed = _smoothed_speed(progress.speed, previous)
             state = {
-                "parser": _state_to_dict(result.state),
+                "aggregate": _state_to_dict(result.state),
+                "stdout_parser": _state_to_dict(stdout_result.state),
+                "stderr_parser": _state_to_dict(stderr_result.state),
                 "stdout_cursor": _cursor_to_dict(stdout.cursor),
                 "stderr_cursor": _cursor_to_dict(stderr.cursor),
             }
@@ -441,10 +472,33 @@ def _is_under(path: Path, root: Path) -> bool:
     return True
 
 
-def _trusted_output_directory(path: str, settings: AppSettings) -> Path | None:
-    raw = Path(path)
-    if raw.is_symlink():
-        return None
-    resolved = raw.resolve()
-    root = settings.outputs_dir.resolve()
-    return resolved if _is_under(resolved, root) else None
+def _job_output_directory(
+    job: TrainingJobRecord, settings: AppSettings
+) -> tuple[Path | None, str | None]:
+    """Return only the output owned by this job, never the shared config root."""
+    if not job.runtime_directory:
+        return None, "legacy job format has no dedicated runtime directory"
+    raw_runtime = Path(job.runtime_directory)
+    if raw_runtime.is_symlink():
+        return None, "job runtime directory is a symlink"
+    jobs_root = (
+        settings.training_jobs_dir or settings.workspace_root / "training" / "jobs"
+    ).resolve()
+    try:
+        runtime = raw_runtime.resolve(strict=True)
+    except OSError:
+        return None, "job runtime directory is unavailable"
+    if not _is_under(runtime, jobs_root):
+        return None, "job runtime directory is outside the allowed root"
+    raw_output = runtime / "output"
+    if raw_output.is_symlink():
+        return None, "job output directory is a symlink"
+    try:
+        output = raw_output.resolve(strict=True)
+    except OSError:
+        return None, "legacy job format has no dedicated output directory"
+    if not output.is_dir():
+        return None, "legacy job format has no dedicated output directory"
+    if not _is_under(output, runtime) or not _is_under(output, jobs_root):
+        return None, "job output directory is outside the allowed root"
+    return output, None

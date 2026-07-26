@@ -275,10 +275,11 @@ Phase 6Aでは、完成済みデータセットスナップショットと検証
 
 ## Phase 6B: 学習進捗解析と成果物追跡
 
-Phase 6Bでは、workerのメモリ状態を正とせず、SQLiteに保存した進捗・metric・artifactをGradioへ復元表示します。stdout/stderrはbyte offsetから増分解析し、ANSI制御文字、不正UTF-8、carriage return、未完了行を安全に扱います。
+Phase 6Bでは、workerのメモリ状態を正とせず、SQLiteに保存した進捗・metric・artifactをGradioへ復元表示します。stdout/stderrはbyte offsetから増分解析し、ANSI制御文字、不正UTF-8、carriage return、未完了行を安全に扱います。stdoutとstderrの未完了バイト列・parser stateは別々に保存し、片方のログをもう片方へ連結しません。
 
 - 総stepはログ明示値を優先し、ない場合だけsnapshot由来のdataset TOMLと`num_repeats`から推定します。推定式は`ceil(sum(image_count * num_repeats) / (batch_size * gradient_accumulation_steps * world_size)) * epochs`です。
 - loss履歴は同一job・metric・stepでupsertし、最大件数を超えた場合は決定的に間引きます。ETAは直近のstep速度から上限付きで計算し、終了jobでは表示しません。
-- 成果物は許可されたoutput directory配下のoutput name一致`.safetensors`と検証済みstate directoryだけを発見します。symlink、一時ファイル、サイズ上限超過、壊れたheaderは採用せず、ファイルを削除・移動しません。
+- 学習実行時の`--output_dir`は`training/jobs/<job_id>/output`へ固定し、設定に保存された候補出力先を実行時の共有領域として使用しません。成果物はこのジョブ専用output配下のoutput name一致`.safetensors`と検証済みstate directoryだけを発見するため、異なるjobの同名ファイルも混ざりません。symlink、一時ファイル、サイズ上限超過、壊れたheaderは採用せず、ファイルを削除・移動しません。
+- ログのinode変更またはtruncateを検出した場合はoffsetと保留中UTF-8バイト列を破棄して新しいファイルの先頭から読み直します。旧形式job（専用runtime/outputがないもの）は共有出力先を走査せず、警告として扱います。
 - safetensorsはheader、tensor、metadata、サイズ・mtime、SHA-256を基本検証します。pickle系ローダーやGPUへのtensorロードは行いません。
 - Phase 6Bの`succeeded`はプロセスのexit code 0を意味し、最終LoRAの品質保証やGoogle Drive同期を意味しません。stateからのresumeはPhase 6C、成果物同期と完了manifestはPhase 9の対象です。

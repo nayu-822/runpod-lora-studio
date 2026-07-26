@@ -38,7 +38,9 @@ class IncrementalLogReader:
             resolved = path.resolve(strict=True)
             resolved.relative_to(self.logs_root)
             if not resolved.is_file():
-                return TrainingLogChunk(b"", current)
+                return TrainingLogChunk(
+                    b"", TrainingLogCursor(), True, "log path is not a regular file"
+                )
             stat = resolved.stat()
             key = (stat.st_dev, stat.st_ino)
             reset = current.file_key is not None and (
@@ -49,7 +51,11 @@ class IncrementalLogReader:
                 handle.seek(offset)
                 data = handle.read(self.max_bytes)
             next_offset = offset + len(data)
-            pending, complete = _split_incomplete_utf8(current.pending + data)
+            # A new inode or a shrink starts a new byte stream. Carrying the
+            # previous file's incomplete UTF-8 suffix into it would join two
+            # unrelated log files and can fabricate a metric line.
+            prefix = b"" if reset else current.pending
+            pending, complete = _split_incomplete_utf8(prefix + data)
             warning = "log was truncated or rotated; offset reset" if reset else None
             return TrainingLogChunk(
                 complete,

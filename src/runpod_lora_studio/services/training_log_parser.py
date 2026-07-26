@@ -101,10 +101,59 @@ class TrainingLogParser:
         started_at: datetime | None = None,
         now: datetime | None = None,
     ) -> TrainingLogParseResult:
+        baseline = state or TrainingLogParserState()
+        if stdout and stderr:
+            stdout_result = self.parse_stream(
+                stdout,
+                baseline,
+                total_epochs=total_epochs,
+                estimated_total_steps=estimated_total_steps,
+                started_at=started_at,
+                now=now,
+                source="stdout",
+            )
+            stderr_result = self.parse_stream(
+                stderr,
+                baseline,
+                total_epochs=total_epochs,
+                estimated_total_steps=estimated_total_steps,
+                started_at=started_at,
+                now=now,
+                source="stderr",
+            )
+            return _merge_parse_results(
+                baseline,
+                stdout_result,
+                stderr_result,
+                total_epochs=total_epochs,
+                estimated_total_steps=estimated_total_steps,
+                started_at=started_at,
+                now=now,
+            )
+        return self.parse_stream(
+            stdout or stderr,
+            baseline,
+            total_epochs=total_epochs,
+            estimated_total_steps=estimated_total_steps,
+            started_at=started_at,
+            now=now,
+            source="stdout" if stdout else "stderr",
+        )
+
+    def parse_stream(
+        self,
+        data: bytes,
+        state: TrainingLogParserState | None = None,
+        *,
+        total_epochs: int | None = None,
+        estimated_total_steps: int | None = None,
+        started_at: datetime | None = None,
+        now: datetime | None = None,
+        source: str = "log",
+    ) -> TrainingLogParseResult:
         old = state or TrainingLogParserState()
         warnings = list(old.warnings)
-        combined = stdout + (b"\n" if stdout and stderr else b"") + stderr
-        text = self._decode(combined)
+        text = self._decode(data)
         text = old.remainder + text
         lines = re.split(r"[\r\n]+", text)
         remainder = lines.pop() if lines and not text.endswith(("\n", "\r")) else ""
@@ -129,9 +178,10 @@ class TrainingLogParser:
                 new_epoch, reported_total = int(epoch_match[1]), int(epoch_match[2])
                 if epoch is not None and new_epoch < epoch:
                     warnings.append(
-                        "epoch decreased; log rotation or restart suspected"
+                        f"{source}: epoch decreased; log rotation or restart suspected"
                     )
-                epoch, total_epoch_value = new_epoch, reported_total
+                else:
+                    epoch, total_epoch_value = new_epoch, reported_total
             match = STEP_RE.search(line)
             if (
                 match is None
@@ -142,16 +192,21 @@ class TrainingLogParser:
             if match:
                 new_step, reported_total = int(match[1]), int(match[2])
                 if step is not None and new_step < step:
-                    warnings.append("step decreased; log rotation or restart suspected")
-                step, total_step = new_step, reported_total
-                total_step_from_log = True
+                    warnings.append(
+                        f"{source}: step decreased; log rotation or restart suspected"
+                    )
+                else:
+                    step, total_step = new_step, reported_total
+                    total_step_from_log = True
             match = LOSS_RE.search(line)
             if match:
                 parsed = _finite_float(match[1])
                 if parsed is not None:
                     loss = parsed
                     events.append(
-                        TrainingMetricEvent("loss", parsed, epoch, step, logged_at)
+                        TrainingMetricEvent(
+                            "loss", parsed, epoch, step, logged_at, f"{source}:log"
+                        )
                     )
             match = LR_RE.search(line)
             if match:
@@ -160,7 +215,12 @@ class TrainingLogParser:
                     learning_rate = parsed
                     events.append(
                         TrainingMetricEvent(
-                            "learning_rate", parsed, epoch, step, logged_at
+                            "learning_rate",
+                            parsed,
+                            epoch,
+                            step,
+                            logged_at,
+                            f"{source}:log",
                         )
                     )
             match = SPEED_RE.search(line)
@@ -174,19 +234,20 @@ class TrainingLogParser:
                 remaining = _finite_float(match[1])
         current_time = now or datetime.now(UTC)
         if elapsed is None and started_at is not None:
-            elapsed = max(0.0, (current_time - started_at).total_seconds())
+            reference = _utc_datetime(started_at)
+            elapsed = max(0.0, (current_time - reference).total_seconds())
         ratio: float | None = None
-        source = TrainingProgressSource.UNKNOWN
+        progress_source = TrainingProgressSource.UNKNOWN
         if step is not None and total_step and total_step > 0:
             ratio = _clamp(step / total_step)
-            source = (
+            progress_source = (
                 TrainingProgressSource.LOG
                 if total_step_from_log
                 else TrainingProgressSource.ESTIMATED
             )
         elif epoch is not None and total_epoch_value and total_epoch_value > 0:
             ratio = _clamp(epoch / total_epoch_value)
-            source = TrainingProgressSource.LOG
+            progress_source = TrainingProgressSource.LOG
         next_state = TrainingLogParserState(
             remainder=remainder,
             current_epoch=epoch,
@@ -219,12 +280,31 @@ class TrainingLogParser:
                 elapsed,
                 remaining,
                 ratio,
-                source,
+                progress_source,
                 tuple(events),
                 next_state.warnings,
                 next_state,
             ),
             next_state,
+            source,
+        )
+
+    def merge(
+        self,
+        baseline: TrainingLogParserState,
+        *results: TrainingLogParseResult,
+        total_epochs: int | None = None,
+        estimated_total_steps: int | None = None,
+        started_at: datetime | None = None,
+        now: datetime | None = None,
+    ) -> TrainingLogParseResult:
+        return _merge_parse_results(
+            baseline,
+            *results,
+            total_epochs=total_epochs,
+            estimated_total_steps=estimated_total_steps,
+            started_at=started_at,
+            now=now,
         )
 
     @staticmethod
@@ -233,6 +313,141 @@ class TrainingLogParser:
             return data.decode("utf-8")
         except UnicodeDecodeError:
             return data.decode("utf-8", errors="replace")
+
+
+def _merge_parse_results(
+    baseline: TrainingLogParserState,
+    *results: TrainingLogParseResult,
+    total_epochs: int | None = None,
+    estimated_total_steps: int | None = None,
+    started_at: datetime | None = None,
+    now: datetime | None = None,
+) -> TrainingLogParseResult:
+    """Merge stream results without making the result depend on read order."""
+    ordered = sorted(
+        results,
+        key=lambda result: _stream_priority(result.source),
+    )
+
+    def changed(field: str) -> list[object]:
+        return [
+            getattr(result.state, field)
+            for result in ordered
+            if getattr(result.state, field) != getattr(baseline, field)
+        ]
+
+    def first_changed(field: str) -> object:
+        values = changed(field)
+        return values[0] if values else getattr(baseline, field)
+
+    step_values = [value for value in changed("current_step") if isinstance(value, int)]
+    current_step = max(step_values, default=baseline.current_step)
+    total_step_values = [
+        value for value in changed("total_steps") if isinstance(value, int)
+    ]
+    total_steps = max(total_step_values, default=baseline.total_steps)
+    if total_steps is None:
+        total_steps = estimated_total_steps
+    current_epoch_value = first_changed("current_epoch")
+    total_epoch_value = first_changed("total_epochs") or total_epochs
+    latest_loss_value = first_changed("latest_loss")
+    learning_rate_value = first_changed("learning_rate")
+    speed_value = first_changed("speed")
+    elapsed_value = first_changed("elapsed_seconds")
+    remaining_value = first_changed("remaining_seconds")
+    elapsed = elapsed_value if isinstance(elapsed_value, float) else None
+    if elapsed is None and started_at is not None:
+        current_time = now or datetime.now(UTC)
+        reference = _utc_datetime(started_at)
+        elapsed = max(0.0, (current_time - reference).total_seconds())
+    current_epoch = (
+        current_epoch_value if isinstance(current_epoch_value, int) else None
+    )
+    total_epoch = total_epoch_value if isinstance(total_epoch_value, int) else None
+    latest_loss = latest_loss_value if isinstance(latest_loss_value, float) else None
+    learning_rate = (
+        learning_rate_value if isinstance(learning_rate_value, float) else None
+    )
+    speed = speed_value if isinstance(speed_value, float) else None
+    remaining = remaining_value if isinstance(remaining_value, float) else None
+    total_steps_source_value = first_changed("total_steps_source")
+    total_steps_source = (
+        total_steps_source_value
+        if isinstance(total_steps_source_value, TrainingProgressSource)
+        else TrainingProgressSource.UNKNOWN
+    )
+    if current_step is not None and total_steps and total_steps > 0:
+        ratio = _clamp(current_step / total_steps)
+        progress_source = (
+            TrainingProgressSource.LOG
+            if total_steps_source is TrainingProgressSource.LOG
+            else TrainingProgressSource.ESTIMATED
+        )
+    elif current_epoch is not None and total_epoch and total_epoch > 0:
+        ratio = _clamp(current_epoch / total_epoch)
+        progress_source = TrainingProgressSource.LOG
+    else:
+        ratio = None
+        progress_source = TrainingProgressSource.UNKNOWN
+    warnings = list(baseline.warnings)
+    for result in results:
+        warnings.extend(result.progress.warnings)
+    events: list[TrainingMetricEvent] = []
+    seen: set[tuple[str, int]] = set()
+    for result in ordered:
+        for event in result.progress.metric_events:
+            if event.step is None:
+                events.append(event)
+                continue
+            key = (event.name, event.step)
+            if key not in seen:
+                seen.add(key)
+                events.append(event)
+    next_state = TrainingLogParserState(
+        current_epoch=current_epoch,
+        total_epochs=total_epoch,
+        current_step=current_step,
+        total_steps=total_steps,
+        latest_loss=latest_loss,
+        learning_rate=learning_rate,
+        speed=speed,
+        elapsed_seconds=elapsed,
+        remaining_seconds=remaining,
+        total_steps_source=total_steps_source,
+        warnings=tuple(dict.fromkeys(warnings[-20:])),
+    )
+    return TrainingLogParseResult(
+        ParsedTrainingProgress(
+            current_epoch,
+            total_epoch,
+            current_step,
+            total_steps,
+            latest_loss,
+            learning_rate,
+            speed,
+            elapsed,
+            remaining,
+            ratio,
+            progress_source,
+            tuple(events),
+            next_state.warnings,
+            next_state,
+        ),
+        next_state,
+        "aggregate",
+    )
+
+
+def _stream_priority(source: str) -> int:
+    if source == "stdout" or source.startswith("stdout:"):
+        return 0
+    if source == "stderr" or source.startswith("stderr:"):
+        return 1
+    return 2
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
 
 SdScriptsLogParser = TrainingLogParser

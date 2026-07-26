@@ -514,9 +514,9 @@ Phase 4のレビュー対応を完了し、完了扱いへ戻す。Alembic 0006�
 ## Phase 6B完了: SDXL LoRA学習進捗解析と成果物追跡
 
 - Alembic `0012_phase6b_progress_artifacts`で、training progress、metric history、artifact trackingを追加
-- stdout/stderrの増分reader、offset・rotation・不完全UTF-8・不完全行の復元、sd-scripts/tqdm形式のparserを実装
+- stdout/stderrの増分reader、offset・rotation・不完全UTF-8・不完全行の復元、sd-scripts/tqdm形式のparserを実装。2ストリームのremainderとparser stateは個別に永続化し、集約時は順序に依存しない
 - ログ明示step優先、dataset TOMLの`num_repeats`による総step推定、進捗率、平滑化ETA、決定的metric間引きを実装
-- output nameと許可拡張子に基づくartifact発見、state構造検証、safetensors header/metadata/SHA-256基本検証を実装
+- jobごとの`training/jobs/<job_id>/output`を実行時出力先およびartifact走査先とし、output nameと許可拡張子に基づくartifact発見、state構造検証、safetensors header/metadata/SHA-256基本検証を実装。専用出力先のない旧形式jobは共有ディレクトリを走査しない
 - DBから進捗・metric・artifactを再取得できるGradio表示と再解析・再走査操作を追加
 - Phase 6Bの`succeeded`はexit code 0のプロセス結果を維持し、成果物の最終品質保証は行わない
 

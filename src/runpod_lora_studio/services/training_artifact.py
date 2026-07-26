@@ -42,6 +42,7 @@ class TrainingArtifactScanner:
         max_header_size: int = 16 * 1024 * 1024,
         max_metadata_size: int = 256 * 1024,
     ) -> None:
+        self._input_is_symlink = output_root.is_symlink()
         self.output_root = output_root.resolve()
         self.max_depth = max(1, max_depth)
         self.max_count = max(1, max_count)
@@ -50,7 +51,7 @@ class TrainingArtifactScanner:
         self.max_metadata_size = max(1024, max_metadata_size)
 
     def scan(self, output_name: str) -> tuple[DiscoveredArtifact, ...]:
-        if not self.output_root.is_dir() or self.output_root.is_symlink():
+        if self._input_is_symlink or not self.output_root.is_dir():
             return ()
         found: list[DiscoveredArtifact] = []
         for path in self._walk(self.output_root):

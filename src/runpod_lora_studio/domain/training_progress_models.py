@@ -86,6 +86,7 @@ class ParsedTrainingProgress:
 class TrainingLogParseResult:
     progress: ParsedTrainingProgress
     state: TrainingLogParserState
+    source: str = "log"
 
 
 @dataclass(frozen=True, slots=True)

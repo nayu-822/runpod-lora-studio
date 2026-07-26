@@ -9,6 +9,7 @@ import threading
 import time
 import tomllib
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -391,18 +392,20 @@ class TrainingService:
         (runtime / "logs").mkdir(parents=True, exist_ok=True)
         (runtime / "output").mkdir(parents=True, exist_ok=True)
         (runtime / "runtime").mkdir(parents=True, exist_ok=True)
+        job_output = runtime / "output"
         copied_toml = runtime / "config" / "dataset.toml"
         shutil.copy2(snapshot_toml, copied_toml)
+        job_config = replace(config, output_directory=job_output)
         command = self.command_builder.build(
-            config,
+            job_config,
             model_path=model_path,
             dataset_config_path=copied_toml,
             allowed_model_roots=self._model_roots(),
             allowed_dataset_roots=(runtime / "config",),
-            allowed_output_roots=(self.settings.outputs_dir,),
+            allowed_output_roots=(runtime,),
         )
         (runtime / "config" / "training-config.json").write_text(
-            config.snapshot_json(), encoding="utf-8"
+            job_config.snapshot_json(), encoding="utf-8"
         )
         (runtime / "runtime" / "metadata.json").write_text(
             json.dumps(
@@ -413,6 +416,7 @@ class TrainingService:
                     "job_dataset_toml_sha256": _sha256_file(copied_toml),
                     "dataset_num_repeats": list(dataset_repeats),
                     "dataset_image_counts": list(dataset_image_counts),
+                    "job_output_directory": "output",
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -427,7 +431,7 @@ class TrainingService:
             record.stdout_log_path = str(runtime / "logs" / "stdout.log")
             record.stderr_log_path = str(runtime / "logs" / "stderr.log")
             record.command_summary = command.summary
-            record.config_snapshot = config.snapshot_json()
+            record.config_snapshot = job_config.snapshot_json()
             record.updated_at = utc_now()
             session.commit()
         return config, model_path, copied_toml, command, runtime

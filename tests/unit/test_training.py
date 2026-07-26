@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 import sys
 import time
 from dataclasses import replace
@@ -199,6 +200,15 @@ def _config(
     )
 
 
+def _write_valid_checkpoint(path: Path) -> None:
+    header = {
+        "__metadata__": {"epoch": "1", "step": "10"},
+        "lora": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+    }
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"data")
+
+
 def _wait(service: TrainingService, job_id: UUID, expected: TrainingJobStatus) -> None:
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -390,6 +400,9 @@ def test_training_job_succeeds_with_fake_process(test_workspace: Path) -> None:
         assert job.stdout_log_path is not None
         assert job.stdout_log_path.is_relative_to(service.jobs_root)
         assert Path(fake.start_calls[0][0][0]).name.startswith("python")
+        command = fake.start_calls[0][0]
+        output_index = command.index("--output_dir") + 1
+        assert Path(command[output_index]) == service.jobs_root / str(job_id) / "output"
         metadata = json.loads(
             (service.jobs_root / str(job_id) / "runtime" / "metadata.json").read_text(
                 encoding="utf-8"
@@ -400,6 +413,47 @@ def test_training_job_succeeds_with_fake_process(test_workspace: Path) -> None:
             metadata["source_dataset_toml_sha256"]
             == metadata["job_dataset_toml_sha256"]
         )
+        assert metadata["job_output_directory"] == "output"
+        config_snapshot_path = (
+            service.jobs_root / str(job_id) / "config" / "training-config.json"
+        )
+        snapshot = json.loads(config_snapshot_path.read_text(encoding="utf-8"))
+        assert Path(snapshot["output_directory"]) == (
+            service.jobs_root / str(job_id) / "output"
+        )
+    finally:
+        service.close()
+
+
+def test_artifacts_are_isolated_by_job_output_directory(test_workspace: Path) -> None:
+    settings, project_id, snapshot_id, model_id = _fixture(test_workspace)
+    fake = FakeTrainingProcessAdapter(running=False, exit_code=0)
+    service = TrainingService(settings, process_adapter=fake)
+    try:
+        config = _config(service, project_id, snapshot_id, model_id)
+        first = service.create_job(config.id)
+        service.start_job(first)
+        _wait(service, first, TrainingJobStatus.SUCCEEDED)
+        first_output = service.jobs_root / str(first) / "output"
+        _write_valid_checkpoint(first_output / "test-lora-000010.safetensors")
+        _write_valid_checkpoint(settings.outputs_dir / "test-lora-000020.safetensors")
+        service.rescan_artifacts(first)
+
+        second = service.create_job(config.id)
+        service.start_job(second)
+        _wait(service, second, TrainingJobStatus.SUCCEEDED)
+        second_output = service.jobs_root / str(second) / "output"
+        _write_valid_checkpoint(second_output / "test-lora-000010.safetensors")
+        service.rescan_artifacts(second)
+
+        first_artifacts = service.list_artifacts(first)
+        second_artifacts = service.list_artifacts(second)
+        assert [item.relative_path.as_posix() for item in first_artifacts] == [
+            "test-lora-000010.safetensors"
+        ]
+        assert [item.relative_path.as_posix() for item in second_artifacts] == [
+            "test-lora-000010.safetensors"
+        ]
     finally:
         service.close()
 
