@@ -531,3 +531,11 @@ Phase 4のレビュー対応を完了し、完了扱いへ戻す。Alembic 0006�
 - 再開元選択、state選択、preview、child job作成・開始のGradio操作と、fingerprint、互換性、親子分離、コピー検証、active/stale境界のテストを追加した
 
 Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は、Phase 6Cまで完了したが、Phase 9連携を含む完成条件は未完了とする。
+
+## Phase 7A完了: 実行環境診断と学習パラメータ推奨エンジン基盤
+
+- `ComputeEnvironmentService`と`TrainingEnvironmentService`でGPU/CUDA/VRAM、bf16、依存ライブラリ、sd-scripts実行環境を診断し、診断結果を不変スナップショットとして保存する
+- 完了済みdataset snapshotから、画像数、repeatsを反映した実効画像数、caption、trigger coverage、重複・類似グループ、解像度・aspect・bucket統計を計算する
+- `RuleBasedRecommendationEngine`と`TrainingMemoryEstimator`で、許可済みoptimizer/scheduler/network moduleの範囲内から1件の決定論的推奨を生成する。GPUがない場合や安全VRAMを超える場合はblocking warningを付ける
+- 推奨の適用は既存の`TrainingService`のconfig検証を通して保存し、学習開始とは分離する。dataset snapshotは変更せず、推奨ID・engine version・変更差分をtraining configへ記録する
+- Alembic `0016_phase7a_recommendation_snapshots`および`0017_phase7a_recommendation_metadata`で環境・推奨・適用 provenanceを保存する。Optuna等の自動探索、学習中適応、Phase 7B機能は対象外とする

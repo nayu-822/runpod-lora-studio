@@ -98,6 +98,9 @@ class TrainingConfigInput:
     gradient_checkpointing: bool = False
     seed: int = 42
     extra_options: dict[str, Any] = field(default_factory=dict)
+    recommendation_id: UUID | None = None
+    recommendation_engine_version: str | None = None
+    recommendation_change_diff: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +131,9 @@ class TrainingConfig:
     extra_options: dict[str, Any]
     created_at: datetime
     updated_at: datetime
+    recommendation_id: UUID | None = None
+    recommendation_engine_version: str | None = None
+    recommendation_change_diff: dict[str, Any] = field(default_factory=dict)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -155,6 +161,11 @@ class TrainingConfig:
             "gradient_checkpointing": self.gradient_checkpointing,
             "seed": self.seed,
             "extra_options": self.extra_options,
+            "recommendation_id": str(self.recommendation_id)
+            if self.recommendation_id
+            else None,
+            "recommendation_engine_version": self.recommendation_engine_version,
+            "recommendation_change_diff": self.recommendation_change_diff,
         }
 
     def snapshot_json(self) -> str:

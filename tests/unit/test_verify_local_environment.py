@@ -145,7 +145,7 @@ def test_migration_check_requires_current_to_equal_head(test_workspace: Path) ->
     check = _check_migration(settings)
 
     assert check.ok
-    assert "current=0015_phase6c_state_position_provenance" in check.detail
+    assert "current=0017_phase7a_recommendation_metadata" in check.detail
 
 
 def test_migration_check_rejects_unmigrated_database(test_workspace: Path) -> None:

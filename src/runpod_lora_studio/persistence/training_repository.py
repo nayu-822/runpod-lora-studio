@@ -60,6 +60,13 @@ def _config_from_record(record: TrainingConfigRecord) -> TrainingConfig:
         gradient_checkpointing=bool(record.gradient_checkpointing),
         seed=record.seed,
         extra_options=cast(dict[str, Any], extra_options),
+        recommendation_id=UUID(record.recommendation_id)
+        if record.recommendation_id
+        else None,
+        recommendation_engine_version=record.recommendation_engine_version,
+        recommendation_change_diff=cast(
+            dict[str, Any], json.loads(record.recommendation_change_diff or "{}")
+        ),
         created_at=_utc(record.created_at) or utc_now(),
         updated_at=_utc(record.updated_at) or utc_now(),
     )
@@ -145,6 +152,13 @@ class TrainingRepository:
             extra_options=json.dumps(
                 data.extra_options, ensure_ascii=False, sort_keys=True
             ),
+            recommendation_id=(
+                str(data.recommendation_id) if data.recommendation_id else None
+            ),
+            recommendation_engine_version=data.recommendation_engine_version,
+            recommendation_change_diff=json.dumps(
+                data.recommendation_change_diff, ensure_ascii=False, sort_keys=True
+            ),
             created_at=now,
             updated_at=now,
         )
@@ -202,6 +216,13 @@ class TrainingRepository:
             "seed": data.seed,
             "extra_options": json.dumps(
                 data.extra_options, ensure_ascii=False, sort_keys=True
+            ),
+            "recommendation_id": (
+                str(data.recommendation_id) if data.recommendation_id else None
+            ),
+            "recommendation_engine_version": data.recommendation_engine_version,
+            "recommendation_change_diff": json.dumps(
+                data.recommendation_change_diff, ensure_ascii=False, sort_keys=True
             ),
         }.items():
             setattr(record, name, value)

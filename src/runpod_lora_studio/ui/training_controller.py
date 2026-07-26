@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from runpod_lora_studio.domain.recommendation_models import TrainingRecommendation
 from runpod_lora_studio.domain.training_models import TrainingConfigInput, TrainingJob
 from runpod_lora_studio.domain.training_resume_models import TrainingResumePreview
 from runpod_lora_studio.services.training_service import TrainingService
@@ -30,7 +31,12 @@ class TrainingController:
             for item_id, name in self.service.list_available_models(UUID(project_id))
         ]
 
-    def save_config(self, project_id: str, values: tuple[Any, ...]) -> str:
+    def save_config(
+        self,
+        project_id: str,
+        values: tuple[Any, ...],
+        recommendation: TrainingRecommendation | None = None,
+    ) -> str:
         (
             snapshot,
             model,
@@ -75,6 +81,24 @@ class TrainingController:
             save_every_n_epochs=int(save_every),
             cache_latents=bool(cache_latents),
             gradient_checkpointing=bool(gradient_checkpointing),
+            recommendation_id=recommendation.id if recommendation else None,
+            recommendation_engine_version=(
+                recommendation.engine_version if recommendation else None
+            ),
+            recommendation_change_diff=(
+                {
+                    "batch_size": recommendation.batch_size,
+                    "epochs": recommendation.epochs,
+                    "learning_rate": recommendation.learning_rate,
+                    "optimizer": recommendation.optimizer,
+                    "scheduler": recommendation.scheduler,
+                    "network_dim": recommendation.network_dim,
+                    "network_alpha": recommendation.network_alpha,
+                    "mixed_precision": recommendation.mixed_precision,
+                }
+                if recommendation
+                else {}
+            ),
         )
         return str(self.service.create_config(data).id)
 

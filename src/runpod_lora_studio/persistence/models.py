@@ -855,10 +855,133 @@ class TrainingConfigRecord(Base):
     gradient_checkpointing: Mapped[bool] = mapped_column(Integer, nullable=False)
     seed: Mapped[int] = mapped_column(Integer, nullable=False)
     extra_options: Mapped[str] = mapped_column(Text, nullable=False)
+    recommendation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    recommendation_engine_version: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    recommendation_change_diff: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ComputeEnvironmentSnapshotRecord(Base):
+    __tablename__ = "compute_environment_snapshots"
+    __table_args__ = (Index("ix_compute_environment_snapshots_project", "project_id"),)
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    project_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    warning_json: Mapped[str] = mapped_column(Text, nullable=False)
+    error_json: Mapped[str] = mapped_column(Text, nullable=False)
+    detector_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    detected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class TrainingEnvironmentSnapshotRecord(Base):
+    __tablename__ = "training_environment_snapshots"
+    __table_args__ = (Index("ix_training_environment_snapshots_project", "project_id"),)
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    project_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True
+    )
+    compute_snapshot_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("compute_environment_snapshots.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    warning_json: Mapped[str] = mapped_column(Text, nullable=False)
+    error_json: Mapped[str] = mapped_column(Text, nullable=False)
+    detector_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    detected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class TrainingRecommendationRequestRecord(Base):
+    __tablename__ = "training_recommendation_requests"
+    __table_args__ = (
+        Index("ix_training_recommendation_requests_project", "project_id"),
+        Index("ix_training_recommendation_requests_snapshot", "dataset_snapshot_id"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    dataset_snapshot_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("dataset_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    managed_model_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("managed_models.id", ondelete="RESTRICT"), nullable=False
+    )
+    environment_snapshot_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("compute_environment_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    concept_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    quality_profile: Mapped[str] = mapped_column(String(32), nullable=False)
+    speed_profile: Mapped[str] = mapped_column(String(32), nullable=False)
+    user_constraints_json: Mapped[str] = mapped_column(Text, nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    engine_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    warning_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class TrainingRecommendationRecord(Base):
+    __tablename__ = "training_recommendations"
+    __table_args__ = (
+        UniqueConstraint("request_id", "rank", name="uq_training_recommendation_rank"),
+        Index("ix_training_recommendations_request", "request_id"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    request_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("training_recommendation_requests.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    profile_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    settings_json: Mapped[str] = mapped_column(Text, nullable=False)
+    reasons_json: Mapped[str] = mapped_column(Text, nullable=False)
+    warnings_json: Mapped[str] = mapped_column(Text, nullable=False)
+    settings_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    engine_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
 

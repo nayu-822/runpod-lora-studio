@@ -292,4 +292,12 @@ Phase 6Cでは、`failed`、`canceled`、またはプロセス終了を安全に
 - dataset snapshot/content/TOML、モデル、trainer、LoRA構成、optimizer/scheduler、precision、cache、gradient checkpoint、resolution、batch、repeats、seed、sd-scripts root、信頼済みPython、command builder versionを再開前に比較します。epochの延長は許可しますが、縮小やmetadata欠落は拒否します。
 - childの`runtime/resume/source-state`へatomicにコピーし、`config/resume-state-manifest.json`を作成してから、固定された`--resume`引数で起動します。開始直前にも同じ検証を再実行します。
 - 選択したstate artifactのepoch/stepを初期値とoffsetの唯一の基準にします。artifact、state directory名、`training_state.json`、`state.json`、`resume-state-manifest.json`の値は厳格な非負整数として検証し、複数情報源の不一致、target epochsまたは推定total stepsを超える値、上限超過を拒否します。採用値と出所をpreview、DB、manifest、fingerprintへ保存します。親jobの最新progressはoffsetに使用せず、値が異なる場合はpreviewとmanifestへwarningを保存します。再開元の進捗・metricをchildへコピーせず、child outputだけをartifact走査します。
+
+## Phase 7A: 実行環境診断と学習パラメータ推奨
+
+Phase 7Aでは、CUDA/GPU/VRAM、bf16、xformers、bitsandbytes、sd-scriptsの実行環境を診断し、完了済みdataset snapshotの統計を入力として決定論的なLoRA学習設定を提示します。診断結果と推奨結果はSQLiteへスナップショットとして保存し、後から同じ入力 fingerprintを検証できます。
+
+- 推奨エンジンはルールベースで、concept type、quality/speed profile、実効画像数、解像度、VRAM安全マージンからbatch、dim/alpha、epoch、optimizer、scheduler、precision、cache/checkpointingを決めます。gradient accumulationはPhase 7Aでは1に固定します。
+- VRAM見積もりはtotal/free VRAMを区別し、安全マージンを差し引いて判定します。GPU未検出、bf16非対応、依存不足、空caption、重複、未確認類似グループなどは警告として表示し、blocking警告がある推奨は適用できません。
+- 「推奨設定を適用」は既存の`TrainingConfigInput`検証を通る設定を保存するだけで、学習ジョブを自動開始しません。dataset snapshotのrepeatsは変更せず、推奨ID、エンジンバージョン、変更差分を設定へ記録します。Phase 7Bの自動探索や学習中適応は対象外です。
 - `failed`、`canceled`、`stale`のいずれでもPID、process group、process identity、worker情報、heartbeatを確認し、終了を確証できないjobは再開しません。プロセスのkillは行いません。

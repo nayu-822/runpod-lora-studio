@@ -5,13 +5,178 @@ from uuid import UUID
 
 import gradio as gr
 
+from runpod_lora_studio.domain.recommendation_models import (
+    QualityProfile,
+    RecommendationInput,
+    SpeedProfile,
+    TrainingRecommendation,
+)
+from runpod_lora_studio.services.dataset_statistics_service import (
+    DatasetStatisticsService,
+)
+from runpod_lora_studio.services.environment_diagnostic_service import (
+    ComputeEnvironmentService,
+    TrainingEnvironmentService,
+)
 from runpod_lora_studio.services.project_service import UserFacingError
+from runpod_lora_studio.services.recommendation_persistence_service import (
+    RecommendationPersistenceService,
+)
+from runpod_lora_studio.services.training_recommendation_engine import (
+    RuleBasedRecommendationEngine,
+)
 from runpod_lora_studio.services.training_service import TrainingService
 from runpod_lora_studio.ui.training_controller import TrainingController
 
 
 def build_training_tab(service: TrainingService, selected_project: gr.State) -> None:
     controller = TrainingController(service)
+    compute_diagnostics = ComputeEnvironmentService(service.settings)
+    training_diagnostics = TrainingEnvironmentService(service.settings)
+    dataset_statistics = DatasetStatisticsService(service.settings)
+    recommendation_service = RecommendationPersistenceService(service.settings)
+    recommendation_engine = RuleBasedRecommendationEngine()
+    gr.Markdown("### Phase 7A 実行環境診断・推奨設定")
+    with gr.Row():
+        concept_type = gr.Dropdown(
+            choices=[
+                "character",
+                "style",
+                "outfit",
+                "object",
+                "pose",
+                "general_concept",
+            ],
+            value="character",
+            label="concept type",
+        )
+        quality_profile = gr.Dropdown(
+            choices=["conservative", "balanced", "detail_focused"],
+            value="balanced",
+            label="quality profile",
+        )
+        speed_profile = gr.Dropdown(
+            choices=["memory_saver", "balanced", "speed_priority"],
+            value="balanced",
+            label="speed profile",
+        )
+        diagnose = gr.Button("環境を診断")
+    diagnostic_view = gr.Markdown()
+    recommend = gr.Button("学習設定を推奨")
+    recommendation_view = gr.Markdown()
+    recommendation_state = gr.State(value=None)
+
+    def recommend_action(
+        project_id: str | None,
+        snapshot_choice: str | None,
+        model_choice: str | None,
+        concept: str,
+        quality: str,
+        speed: str,
+        current_resolution: float,
+    ) -> tuple[str, TrainingRecommendation | None]:
+        if not project_id or not snapshot_choice or not model_choice:
+            return "プロジェクト、dataset snapshot、モデルを選択してください。", None
+        try:
+            snapshot_id = UUID(snapshot_choice.split("|", 1)[0].strip())
+            model_id = UUID(model_choice.split("|", 1)[0].strip())
+            compute = compute_diagnostics.detect()
+            training = training_diagnostics.detect()
+            environment_snapshot_id = compute_diagnostics.snapshot(UUID(project_id))
+            training_diagnostics.snapshot(
+                UUID(project_id), compute_snapshot_id=environment_snapshot_id
+            )
+            dataset = dataset_statistics.calculate(snapshot_id)
+            data = RecommendationInput(
+                project_id=UUID(project_id),
+                dataset_snapshot_id=snapshot_id,
+                model_id=model_id,
+                environment_snapshot_id=environment_snapshot_id,
+                environment=compute,
+                training_environment=training,
+                dataset=dataset,
+                concept_type=concept,
+                quality_profile=QualityProfile(quality),
+                speed_profile=SpeedProfile(speed),
+                current_config={"resolution": int(current_resolution)},
+            )
+            recommendation = recommendation_engine.recommend(data)[0]
+            recommendation_service.save(data, (recommendation,))
+            lines = [
+                "#### 推奨結果（適用しても学習は開始しません）",
+                f"- batch: `{recommendation.batch_size}` / "
+                f"epochs: `{recommendation.epochs}`",
+                f"- dim/alpha: `{recommendation.network_dim}/"
+                f"{recommendation.network_alpha}`",
+                f"- precision: `{recommendation.mixed_precision}` / "
+                f"optimizer: `{recommendation.optimizer}`",
+                f"- 推定総step: `{recommendation.estimated_total_steps}` / "
+                f"VRAM: `{recommendation.estimated_vram_bytes}` bytes",
+            ]
+            lines.extend(
+                f"- {warning.severity.value}: {warning.code} — {warning.message}"
+                for warning in recommendation.warnings
+            )
+            return "\n".join(lines), recommendation
+        except (OSError, ValueError) as exc:
+            return f"推奨生成エラー: {exc}", None
+
+    apply_recommendation = gr.Button("推奨値を入力欄へ反映")
+
+    def apply_action(
+        recommendation: TrainingRecommendation | None,
+    ) -> tuple[object, ...]:
+        if recommendation is None:
+            return (gr.update(),) * 10 + ("推奨結果がありません。",)
+        return (
+            recommendation.batch_size,
+            recommendation.epochs,
+            recommendation.learning_rate,
+            recommendation.optimizer,
+            recommendation.scheduler,
+            recommendation.network_module,
+            recommendation.network_dim,
+            recommendation.network_alpha,
+            recommendation.mixed_precision,
+            "推奨値を入力欄へ反映しました。内容を確認してから設定を保存してください。",
+        )
+
+    def diagnose_action(
+        project_id: str | None, concept: str, quality: str, speed: str
+    ) -> str:
+        del concept, quality, speed
+        try:
+            compute = compute_diagnostics.detect()
+            training = training_diagnostics.detect()
+            if project_id:
+                compute_diagnostics.snapshot(UUID(project_id))
+                training_diagnostics.snapshot(UUID(project_id))
+            gpu = compute.gpu_devices[0] if compute.gpu_devices else None
+            gpu_text = (
+                "未検出"
+                if gpu is None
+                else f"{gpu.name} / VRAM {gpu.total_vram_bytes or 0} bytes"
+            )
+            return "\n".join(
+                [
+                    "#### 診断結果",
+                    f"- GPU: {gpu_text}",
+                    f"- CUDA: {'利用可能' if compute.cuda_available else '利用不可'}",
+                    f"- bf16: {compute.bf16_supported}",
+                    f"- sd-scripts: {'利用可能' if not training.errors else '要確認'}",
+                    f"- 警告: {len(compute.warnings) + len(training.warnings)} / "
+                    f"エラー: {len(compute.errors) + len(training.errors)}",
+                    "推奨設定の適用後も、既存のTrainingConfig検証を通過させてからジョブ作成してください。",
+                ]
+            )
+        except (OSError, ValueError) as exc:
+            return f"診断エラー: {exc}"
+
+    diagnose.click(
+        diagnose_action,
+        inputs=[selected_project, concept_type, quality_profile, speed_profile],
+        outputs=[diagnostic_view],
+    )
     gr.Markdown("### Phase 6A SDXL LoRA学習")
     with gr.Row():
         snapshot = gr.Dropdown(label="completed dataset snapshot", choices=[])
@@ -72,6 +237,35 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
     config_id = gr.State(value=None)
     job_id = gr.Textbox(label="job ID")
     message = gr.Markdown()
+    recommend.click(
+        recommend_action,
+        inputs=[
+            selected_project,
+            snapshot,
+            model,
+            concept_type,
+            quality_profile,
+            speed_profile,
+            resolution,
+        ],
+        outputs=[recommendation_view, recommendation_state],
+    )
+    apply_recommendation.click(
+        apply_action,
+        inputs=[recommendation_state],
+        outputs=[
+            batch_size,
+            epochs,
+            learning_rate,
+            optimizer,
+            scheduler,
+            network_module,
+            network_dim,
+            network_alpha,
+            mixed_precision,
+            message,
+        ],
+    )
     jobs_table = gr.Dataframe(
         headers=[
             "ID",
@@ -141,11 +335,15 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
         except (UserFacingError, ValueError) as exc:
             return gr.update(choices=[], label=f"エラー: {exc}"), gr.update(choices=[])
 
-    def save_action(project_id: str | None, *values: Any) -> str | None:
+    def save_action(
+        project_id: str | None,
+        recommendation: TrainingRecommendation | None,
+        *values: Any,
+    ) -> str | None:
         if not project_id:
             return "プロジェクトを選択してください"
         try:
-            return controller.save_config(project_id, values)
+            return controller.save_config(project_id, values, recommendation)
         except (UserFacingError, ValueError) as exc:
             return f"エラー: {exc}"
 
@@ -221,6 +419,7 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
     )
     save_inputs = [
         selected_project,
+        recommendation_state,
         snapshot,
         model,
         name,
