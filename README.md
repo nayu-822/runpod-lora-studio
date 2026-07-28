@@ -103,6 +103,21 @@ Phase 1 では、以下はまだ実装していません。
 - `RUNPOD_API_KEY` は将来の機能用で、現段階では利用しません
 - `rclone.conf` や学習成果物は Git 管理対象外です
 
+## GPU identity と学習時メモリ測定
+
+TorchのGPUDeviceInfo.indexは、CUDA_VISIBLE_DEVICES適用後のlogical indexです。
+physical indexとは直接比較せず、固定queryのnvidia-smi inventory（index、UUID、GPU名、
+total VRAM、compute capability）とUUIDを照合します。CUDA_VISIBLE_DEVICES=2,0は
+logical 0 → physical 2、logical 1 → physical 0と解決し、UUID指定は大文字小文字を
+正規化した一意のexact/prefix matchだけを受け付けます。不正・曖昧・不一致なtokenは
+架空のfingerprintを作らずwarningまたはfailed snapshotにします。
+
+torch.cuda.mem_get_info()は(free, total)の順で読み取り、total VRAMはfree VRAMの
+変動から独立して保存します。開始前にGPUを一意に確定できない複数GPUジョブでは、
+対象PIDのcompute-process queryで単一GPU UUIDを確認できた場合だけruntime identityを
+別スナップショットへ保存し、summaryとcalibrationはそのidentity由来の物理GPU属性を
+使用します。推奨付きジョブで実行GPUを確定できない場合は開始を拒否します。
+
 ### Phase 1の最終確認事項
 
 - ローカル環境確認ではGitを必須項目として確認します。Git未導入や実行失敗でも、SQLite、Alembic、任意項目の確認を最後まで継続し、最終終了コードは非0になります。

@@ -26,3 +26,21 @@ class TrainingJobEnvironmentSnapshot:
     detected_at: datetime
     status: str
     warning_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingJobSelectedGpu:
+    """Immutable runtime GPU identity resolved from the target process."""
+
+    id: UUID
+    training_job_id: UUID
+    logical_gpu_index: int | None
+    physical_gpu_index: int | None
+    gpu_uuid_fingerprint: str
+    gpu_architecture: str | None
+    compute_capability: str | None
+    total_vram_bytes: int | None
+    selected_at: datetime
+    selection_source: str
+    status: str
+    warning_codes: tuple[str, ...] = ()

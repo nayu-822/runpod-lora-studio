@@ -28,6 +28,7 @@ from runpod_lora_studio.persistence.models import (
     TrainingExecutionSummaryRecord,
     TrainingJobEnvironmentSnapshotRecord,
     TrainingJobRecord,
+    TrainingJobSelectedGpuRecord,
     TrainingMemoryAggregateRecord,
     TrainingMetricPointRecord,
     TrainingProgressRecord,
@@ -113,6 +114,11 @@ class TrainingPerformanceCollector:
                     TrainingJobEnvironmentSnapshotRecord.training_job_id == str(job_id)
                 )
             )
+            selected_gpu = session.scalar(
+                select(TrainingJobSelectedGpuRecord).where(
+                    TrainingJobSelectedGpuRecord.training_job_id == str(job_id)
+                )
+            )
             environment_snapshot_id = (
                 UUID(request.environment_snapshot_id) if request else None
             )
@@ -156,27 +162,63 @@ class TrainingPerformanceCollector:
                 memory.gpu_identity_verified and memory.gpu_uuid_fingerprint is not None
             )
             gpu_fingerprint = (
-                job_environment.gpu_uuid_fingerprint
+                selected_gpu.gpu_uuid_fingerprint
+                if selected_gpu is not None
+                else job_environment.gpu_uuid_fingerprint
                 if job_environment and job_environment.gpu_uuid_fingerprint is not None
                 else memory.gpu_uuid_fingerprint
                 if measured_gpu_verified
                 else None
             )
-            gpu_total = (
-                job_environment.total_vram_bytes
-                if job_environment and job_environment.total_vram_bytes is not None
-                else memory.total_bytes
+            if selected_gpu is not None:
+                gpu_total = (
+                    selected_gpu.total_vram_bytes
+                    if selected_gpu.total_vram_bytes is not None
+                    else memory.total_bytes
+                    if measured_gpu_verified
+                    and memory.gpu_uuid_fingerprint == gpu_fingerprint
+                    else None
+                )
+            else:
+                gpu_total = (
+                    job_environment.total_vram_bytes
+                    if job_environment and job_environment.total_vram_bytes is not None
+                    else memory.total_bytes
+                    if measured_gpu_verified
+                    and (
+                        gpu_fingerprint is None
+                        or memory.gpu_uuid_fingerprint == gpu_fingerprint
+                    )
+                    else None
+                )
+            gpu_architecture = (
+                selected_gpu.gpu_architecture
+                if selected_gpu is not None
+                else job_environment.gpu_architecture
+                if job_environment
+                else None
+            )
+            gpu_index = (
+                selected_gpu.logical_gpu_index
+                if selected_gpu is not None
+                else job_environment.logical_gpu_index
+                if job_environment and job_environment.logical_gpu_index is not None
+                else None
+            )
+            physical_gpu_index = (
+                selected_gpu.physical_gpu_index
+                if selected_gpu is not None
+                else job_environment.physical_gpu_index
+                if job_environment is not None
+                else memory.gpu_index
                 if measured_gpu_verified
                 else None
             )
-            gpu_architecture = (
-                job_environment.gpu_architecture if job_environment else None
-            )
-            gpu_index = (
-                job_environment.logical_gpu_index
-                if job_environment and job_environment.logical_gpu_index is not None
-                else memory.gpu_index
-                if measured_gpu_verified
+            compute_capability = (
+                selected_gpu.compute_capability
+                if selected_gpu is not None
+                else job_environment.compute_capability
+                if job_environment is not None
                 else None
             )
             stdout = _read_tail(
@@ -222,8 +264,9 @@ class TrainingPerformanceCollector:
                 initial_step=job.initial_step,
                 parse_warning=progress.parse_warning if progress else None,
             )
+            recommendation_environment = selected_gpu or job_environment
             if _runtime_gpu_differs_from_recommendation(
-                job_environment, environment_payload
+                recommendation_environment, environment_payload
             ):
                 exclusion_reasons = tuple(
                     sorted(
@@ -260,6 +303,8 @@ class TrainingPerformanceCollector:
                 gpu_total=gpu_total,
                 gpu_architecture=gpu_architecture,
                 gpu_index=gpu_index,
+                physical_gpu_index=physical_gpu_index,
+                compute_capability=compute_capability,
                 memory=memory,
                 completed_steps=completed_steps,
                 planned_steps=planned_steps,
@@ -306,6 +351,8 @@ def _make_summary(
     gpu_total: int | None,
     gpu_architecture: str | None,
     gpu_index: int | None,
+    physical_gpu_index: int | None,
+    compute_capability: str | None,
     memory: GpuMemorySummary,
     completed_steps: int | None,
     planned_steps: int | None,
@@ -340,6 +387,8 @@ def _make_summary(
         "gpu_identity_fingerprint": gpu_fingerprint,
         "gpu_architecture": gpu_architecture,
         "gpu_index": gpu_index,
+        "physical_gpu_index": physical_gpu_index,
+        "compute_capability": compute_capability,
         "settings_fingerprint": settings_fingerprint,
         "recommendation_id": recommendation_id,
         "environment_snapshot_id": environment_snapshot_id,
@@ -495,6 +544,8 @@ _SUMMARY_FIELDS = (
     "gpu_total_vram_bytes",
     "gpu_architecture",
     "gpu_index",
+    "physical_gpu_index",
+    "compute_capability",
     "resolution",
     "batch_size",
     "gradient_accumulation_steps",
@@ -684,7 +735,9 @@ def _memory_summary_from_record(
 
 
 def _runtime_gpu_differs_from_recommendation(
-    job_environment: TrainingJobEnvironmentSnapshotRecord | None,
+    job_environment: (
+        TrainingJobEnvironmentSnapshotRecord | TrainingJobSelectedGpuRecord | None
+    ),
     recommendation_payload: dict[str, object],
 ) -> bool:
     if job_environment is None:
@@ -702,7 +755,9 @@ def _runtime_gpu_differs_from_recommendation(
     if job_environment.gpu_uuid_fingerprint is not None:
         return job_environment.gpu_uuid_fingerprint not in expected
     try:
-        visible = set(json.loads(job_environment.visible_gpu_uuids_json or "[]"))
+        visible = set(
+            json.loads(getattr(job_environment, "visible_gpu_uuids_json", "[]") or "[]")
+        )
     except (TypeError, ValueError):
         visible = set()
     return bool(visible) and not (visible & expected)

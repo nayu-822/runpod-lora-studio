@@ -101,6 +101,7 @@ class TrainingCalibrationMatcher:
             return False
         for actual, expected in (
             (summary.gpu_architecture, snapshot.gpu_architecture),
+            (summary.compute_capability, snapshot.compute_capability),
             (summary.resolution, snapshot.resolution),
             (summary.batch_size, snapshot.batch_size),
             (
@@ -155,6 +156,7 @@ class RecommendationCalibrationService:
         cache_latents: bool | None = None,
         gradient_checkpointing: bool | None = None,
         gpu_architecture: str | None = None,
+        compute_capability: str | None = None,
         batch_size: int | None = None,
         gradient_accumulation_steps: int | None = None,
         effective_batch_size: int | None = None,
@@ -187,6 +189,10 @@ class RecommendationCalibrationService:
             )
             and (
                 gpu_architecture is None or summary.gpu_architecture == gpu_architecture
+            )
+            and (
+                compute_capability is None
+                or summary.compute_capability == compute_capability
             )
             and (batch_size is None or summary.batch_size == batch_size)
             and (
@@ -244,6 +250,7 @@ class RecommendationCalibrationService:
                 "gpu": gpu_identity_fingerprint,
                 "vram": gpu_total_vram_bytes,
                 "gpu_architecture": gpu_architecture,
+                "compute_capability": compute_capability,
                 "batch_size": batch_size,
                 "gradient_accumulation_steps": gradient_accumulation_steps,
                 "effective_batch_size": effective_batch_size,
@@ -291,6 +298,7 @@ class RecommendationCalibrationService:
             source_summary_ids=source_ids,
             source_summary_fingerprint=source_fingerprint,
             gpu_architecture=gpu_architecture,
+            compute_capability=compute_capability,
             batch_size=batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             effective_batch_size=effective_batch_size,
@@ -354,6 +362,10 @@ class RecommendationCalibrationService:
             and (
                 snapshot.gpu_architecture is None
                 or summary.gpu_architecture == snapshot.gpu_architecture
+            )
+            and (
+                snapshot.compute_capability is None
+                or summary.compute_capability == snapshot.compute_capability
             )
             and (
                 snapshot.batch_size is None or summary.batch_size == snapshot.batch_size

@@ -1279,6 +1279,20 @@ RunPodテンプレートではHTTPポート7860のみを公開する。`share=Tr
 - bf16対応
 - xformers / SDPA可否
 
+Torchのdevice indexはプロセスから見えるlogical indexとして扱い、
+CUDA_VISIBLE_DEVICESの数値tokenをphysical indexとして直接比較しない。
+physical index、GPU UUID、architecture、compute capability、total VRAMは固定queryの
+nvidia-smi inventoryとTorch device UUIDを照合して確定する。UUID prefixは一意に解決
+できる場合だけ受け付け、曖昧・不正な指定はunverifiedとして扱う。
+torch.cuda.mem_get_info()の戻り値は(free, total)であり、free VRAMは変動値、total VRAMは
+GPU identityに紐づく固定値として保存する。
+
+開始前に複数GPUから実行GPUを一意に選べない場合、推奨付きジョブは開始しない。
+手動ジョブでは対象PIDのcompute-process queryが単一UUIDを返した場合に限り、
+TrainingJobSelectedGpuとしてruntime identityを別途保存する。summaryとcalibrationの
+GPU属性は確定したruntime identityに対応する同一physical inventoryから取得し、
+pre-startのvisible GPU集合から別GPUの属性をfallbackしない。
+
 取得結果を推奨パラメータ生成へ渡す。
 
 ### 22.4 ポート

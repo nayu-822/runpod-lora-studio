@@ -540,7 +540,10 @@ Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は�
 - 推奨の適用は`RecommendationApplicationService`へ一元化し、DBからrequest/recommendationを再読込して関連付け、入力fingerprint、snapshot/model、現在の診断、ユーザー編集後のblocking riskを再検証してから既存の`TrainingService`のconfig検証を通して保存する。学習開始とは分離し、manual configはprovenanceなしで保存する。dataset snapshotは変更せず、推奨ID・engine version・各項目の`recommended`/`applied`差分をtraining configへ記録する。UI stateには推奨本体を保持せず、推奨ID・request ID・fingerprint・警告要約だけを保持する
 - Alembic `0016_phase7a_recommendation_snapshots`、`0017_phase7a_recommendation_metadata`、`0018_phase7a_recommendation_input_config`で環境・推奨・適用 provenanceと再検証用の入力設定を保存する。free VRAMは安定fingerprintから除外し、適用直前に再診断する。Optuna等の自動探索、学習中適応、Phase 7B機能は対象外とする
 
-## Phase 7B完了: 学習実績を利用した推奨補正・履歴比較・OOMフィードバック
+## Phase 7B実装状況: 学習実績を利用した推奨補正・履歴比較・OOMフィードバック
+
+- Torch indexはlogical indexとして扱い、physical GPU情報は固定nvidia-smi inventoryとUUID照合で確定する。mem_get_info()は(free, total)の順で取得し、free VRAMの変動をtotal VRAMへ混入させない。
+- 開始前に実行GPUを確定できない推奨付きジョブは開始せず、PID queryで単一GPUを確定できた場合はimmutableな開始前snapshotとは別にruntime GPU identityを保存する。レビュー対応の品質確認が完了するまでPhase 7Bを完全完了扱いにしない。
 
 - 各TrainingJobの開始境界で、推奨の有無に依存しない不変の実行環境snapshotを追加する。論理/物理GPU、UUID fingerprint、architecture/compute capability、total VRAM、CUDA、正規化済みCUDA_VISIBLE_DEVICES、sd-scripts/xformers、detector version、detected_atを保存し、秘密情報やホスト情報は保存しない。
 - GPU UUIDとCUDA_VISIBLE_DEVICESの対応、PID/process identity/groupを検証し、複数GPUやGPU変更時は安全側に倒す。実行時snapshotをsummary/calibrationの正本とし、推奨時snapshotは比較・stale判定だけに使う。手動jobでもtarget process peakを利用可能にする。

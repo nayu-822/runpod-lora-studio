@@ -954,6 +954,32 @@ class TrainingJobEnvironmentSnapshotRecord(Base):
     warning_codes_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
 
 
+class TrainingJobSelectedGpuRecord(Base):
+    __tablename__ = "training_job_selected_gpus"
+    __table_args__ = (
+        UniqueConstraint("training_job_id", name="uq_training_job_selected_gpu_job"),
+        Index("ix_training_job_selected_gpu_job", "training_job_id"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    training_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("training_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    logical_gpu_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    physical_gpu_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gpu_uuid_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    gpu_architecture: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    compute_capability: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    total_vram_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    selected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    selection_source: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    warning_codes_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+
+
 class TrainingRecommendationRequestRecord(Base):
     __tablename__ = "training_recommendation_requests"
     __table_args__ = (
@@ -1096,6 +1122,8 @@ class TrainingExecutionSummaryRecord(Base):
     )
     gpu_architecture: Mapped[str | None] = mapped_column(String(128), nullable=True)
     gpu_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    physical_gpu_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    compute_capability: Mapped[str | None] = mapped_column(String(32), nullable=True)
     gpu_total_vram_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dataset_scale_fingerprint: Mapped[str | None] = mapped_column(
         String(64), nullable=True
@@ -1285,6 +1313,7 @@ class RecommendationCalibrationSnapshotRecord(Base):
     gpu_identity_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
     gpu_total_vram_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
     gpu_architecture: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    compute_capability: Mapped[str | None] = mapped_column(String(32), nullable=True)
     resolution: Mapped[int | None] = mapped_column(Integer, nullable=True)
     batch_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     gradient_accumulation_steps: Mapped[int | None] = mapped_column(

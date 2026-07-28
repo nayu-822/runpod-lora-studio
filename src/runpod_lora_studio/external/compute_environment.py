@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import platform
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -10,11 +11,16 @@ from typing import Any, Protocol
 from runpod_lora_studio.domain.recommendation_models import (
     ComputeEnvironmentInfo,
     GPUDeviceInfo,
+    PhysicalGpuInfo,
 )
 
 
 class ComputeEnvironmentAdapter(Protocol):
     def detect(self) -> ComputeEnvironmentInfo: ...
+
+
+class PhysicalGpuInventoryAdapter(Protocol):
+    def detect(self) -> tuple[PhysicalGpuInfo, ...]: ...
 
 
 class TorchComputeEnvironmentAdapter:
@@ -41,7 +47,16 @@ class TorchComputeEnvironmentAdapter:
             try:
                 for index in range(int(torch.cuda.device_count())):
                     properties = torch.cuda.get_device_properties(index)
-                    total, free = torch.cuda.mem_get_info(index)
+                    free, total = torch.cuda.mem_get_info(index)
+                    if (
+                        isinstance(free, bool)
+                        or isinstance(total, bool)
+                        or int(free) < 0
+                        or int(total) <= 0
+                        or int(free) > int(total)
+                    ):
+                        warnings.append(f"GPU {index} returned invalid VRAM values")
+                        continue
                     major = getattr(properties, "major", None)
                     minor = getattr(properties, "minor", None)
                     devices.append(
@@ -97,6 +112,79 @@ class FakeComputeEnvironmentAdapter:
 
     def detect(self) -> ComputeEnvironmentInfo:
         return self.info
+
+
+class NvidiaSmiGpuInventoryAdapter:
+    """Read a bounded, fixed-format physical GPU inventory."""
+
+    query = "--query-gpu=index,uuid,name,memory.total,compute_cap"
+    format_option = "--format=csv,noheader,nounits"
+
+    def __init__(
+        self,
+        *,
+        executable: str = "nvidia-smi",
+        timeout_seconds: float = 5.0,
+        max_output_bytes: int = 32 * 1024,
+    ) -> None:
+        self.executable = executable
+        self.timeout_seconds = timeout_seconds
+        self.max_output_bytes = max_output_bytes
+
+    def detect(self) -> tuple[PhysicalGpuInfo, ...]:
+        executable = shutil.which(self.executable) or self.executable
+        try:
+            result = subprocess.run(
+                [executable, self.query, self.format_option],
+                capture_output=True,
+                check=False,
+                shell=False,
+                text=False,
+                timeout=self.timeout_seconds,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ()
+        if result.returncode != 0:
+            return ()
+        output = result.stdout[: self.max_output_bytes].decode(
+            "utf-8", errors="replace"
+        )
+        rows: list[PhysicalGpuInfo] = []
+        indexes: set[int] = set()
+        uuids: set[str] = set()
+        for line in output.splitlines():
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) != 5:
+                continue
+            index_text, uuid, name, total_text, capability = fields
+            try:
+                index = int(index_text)
+                total_mib = int(total_text)
+            except ValueError:
+                continue
+            normalized_uuid = uuid.strip().lower()
+            if (
+                index < 0
+                or not normalized_uuid
+                or not name
+                or total_mib <= 0
+                or index in indexes
+                or normalized_uuid in uuids
+            ):
+                return ()
+            indexes.add(index)
+            uuids.add(normalized_uuid)
+            rows.append(
+                PhysicalGpuInfo(
+                    index=index,
+                    uuid=uuid,
+                    name=name,
+                    architecture=name,
+                    compute_capability=capability or None,
+                    total_vram_bytes=total_mib * 1024**2,
+                )
+            )
+        return tuple(rows)
 
 
 def _optional_str(value: Any) -> str | None:

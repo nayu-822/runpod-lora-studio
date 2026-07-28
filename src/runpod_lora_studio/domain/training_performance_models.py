@@ -115,6 +115,8 @@ class TrainingExecutionSummary:
     settings_fingerprint: str | None
     gpu_architecture: str | None = None
     gpu_index: int | None = None
+    physical_gpu_index: int | None = None
+    compute_capability: str | None = None
     dataset_scale_fingerprint: str | None = None
     environment_snapshot_id: UUID | None = None
     training_job_environment_snapshot_id: UUID | None = None
@@ -207,6 +209,7 @@ class TrainingCalibrationSnapshot:
     source_summary_ids: tuple[UUID, ...] = ()
     source_summary_fingerprint: str = ""
     gpu_architecture: str | None = None
+    compute_capability: str | None = None
     batch_size: int | None = None
     gradient_accumulation_steps: int | None = None
     effective_batch_size: int | None = None

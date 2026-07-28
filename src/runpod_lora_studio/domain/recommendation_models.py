@@ -49,6 +49,18 @@ class GPUDeviceInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class PhysicalGpuInfo:
+    """GPU identity reported by the host inventory, outside Torch remapping."""
+
+    index: int
+    uuid: str
+    name: str
+    architecture: str | None = None
+    compute_capability: str | None = None
+    total_vram_bytes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ComputeEnvironmentInfo:
     gpu_devices: tuple[GPUDeviceInfo, ...] = ()
     cuda_available: bool = False

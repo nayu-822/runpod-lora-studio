@@ -625,7 +625,7 @@ class TrainingService:
                 )
             if time.monotonic() >= next_memory_at:
                 try:
-                    self.memory_monitor.measure(
+                    aggregate = self.memory_monitor.measure(
                         job_id,
                         started,
                         process_identity_verified=self._process_matches(
@@ -633,6 +633,11 @@ class TrainingService:
                         ),
                         expected_gpu_uuid_fingerprints=expected_gpu_fingerprints,
                     )
+                    if aggregate.gpu_identity_verified:
+                        self.job_environment_service.record_runtime_gpu(
+                            job_id,
+                            aggregate.gpu_uuid_fingerprint,
+                        )
                 except Exception:
                     logger.exception(
                         "training_memory_measurement_failed job_id=%s", job_id
@@ -677,10 +682,16 @@ class TrainingService:
         # according to the final job state and final artifacts are visible.
         self.progress_service.refresh_job(job_id)
         try:
-            self.memory_monitor.capture_after_process(
+            aggregate = self.memory_monitor.capture_after_process(
                 job_id,
                 expected_gpu_uuid_fingerprints=self._expected_gpu_fingerprints(job_id),
             )
+            if aggregate.gpu_identity_verified:
+                self.job_environment_service.record_runtime_gpu(
+                    job_id,
+                    aggregate.gpu_uuid_fingerprint,
+                    selection_source="post_process_measurement",
+                )
         except Exception:
             logger.exception("training_memory_after_process_failed job_id=%s", job_id)
         try:
@@ -731,7 +742,6 @@ class TrainingService:
         self, job_id: UUID, job_environment: TrainingJobEnvironmentSnapshot
     ) -> None:
         selected = job_environment.gpu_uuid_fingerprint
-        visible = set(job_environment.visible_gpu_uuid_fingerprints)
         with self.session_factory() as session:
             job = session.scalar(
                 select(TrainingJobRecord).where(TrainingJobRecord.id == str(job_id))
@@ -783,11 +793,11 @@ class TrainingService:
             )
             if not expected:
                 return
-            if selected is not None and selected not in expected:
+            if selected is None:
                 raise TrainingEnvironmentMismatchError(
-                    "execution GPU differs from recommendation snapshot"
+                    "execution GPU could not be uniquely determined"
                 )
-            if selected is None and visible and not (visible & expected):
+            if selected not in expected:
                 raise TrainingEnvironmentMismatchError(
                     "execution GPU differs from recommendation snapshot"
                 )

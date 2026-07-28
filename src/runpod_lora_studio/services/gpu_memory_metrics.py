@@ -78,6 +78,7 @@ class NvidiaSmiGpuMemoryAdapter:
         )
         parsed_processes = _parse_process_rows(process_rows)
         target_rows = [row for row in parsed_processes if row[0] == pid]
+        target_gpu_uuids = {uuid.lower() for _, uuid, used in target_rows if used >= 0}
         target_by_uuid: dict[str, list[int]] = {}
         for target_pid, uuid, used in target_rows:
             if target_pid == pid:
@@ -98,7 +99,15 @@ class NvidiaSmiGpuMemoryAdapter:
             if index < 0 or not uuid or total <= 0 or free < 0 or free > total:
                 continue
             uuid_fp = gpu_uuid_fingerprint(uuid)
-            gpu_verified = bool(expected) and uuid_fp in expected
+            runtime_gpu_verified = (
+                valid_pid
+                and process_identity_verified
+                and len(target_gpu_uuids) == 1
+                and uuid.lower() in target_gpu_uuids
+            )
+            gpu_verified = (
+                bool(expected) and uuid_fp in expected
+            ) or runtime_gpu_verified
             rows_for_gpu = [
                 row for row in parsed_processes if row[1] == uuid and row[2] <= total
             ]

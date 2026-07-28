@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from runpod_lora_studio.domain.recommendation_models import (
     ComputeEnvironmentInfo,
     GPUDeviceInfo,
+    PhysicalGpuInfo,
     TrainingRecommendation,
 )
 from runpod_lora_studio.domain.training_performance_models import (
@@ -133,8 +135,7 @@ def test_gpu_memory_metrics_convert_mib_and_return_null_on_invalid_samples() -> 
 def test_execution_snapshot_maps_cuda_visible_devices_to_physical_gpu() -> None:
     info = ComputeEnvironmentInfo(
         gpu_devices=(
-            GPUDeviceInfo(index=0, name="A", uuid="GPU-a", total_vram_bytes=10),
-            GPUDeviceInfo(index=2, name="B", uuid="GPU-b", total_vram_bytes=20),
+            GPUDeviceInfo(index=0, name="B", uuid="GPU-b", total_vram_bytes=20),
         ),
         cuda_available=True,
     )
@@ -146,6 +147,15 @@ def test_execution_snapshot_maps_cuda_visible_devices_to_physical_gpu() -> None:
         {"CUDA_VISIBLE_DEVICES": "2"},
         datetime.now(UTC),
         "test-detector",
+        physical_inventory=(
+            PhysicalGpuInfo(
+                index=2,
+                uuid="GPU-b",
+                name="B",
+                architecture="B",
+                total_vram_bytes=20,
+            ),
+        ),
     )
 
     assert snapshot.logical_gpu_index == 0
@@ -228,6 +238,33 @@ def test_nvidia_smi_attributes_target_pid_per_gpu_and_rejects_over_total(
     assert all(item.identity_verified for item in samples)
 
 
+def test_nvidia_smi_process_query_can_select_one_runtime_gpu_without_expected_set(
+    monkeypatch,
+) -> None:
+    adapter = NvidiaSmiGpuMemoryAdapter()
+
+    def fake_query(query: list[str]) -> list[str]:
+        if query[0].startswith("--query-gpu"):
+            return [
+                "2, GPU-b, 20000, 15000",
+                "0, GPU-a, 16000, 12000",
+            ]
+        return ["42, GPU-b, 100"]
+
+    monkeypatch.setattr(adapter, "_run_query", fake_query)
+
+    samples = adapter.collect(
+        pid=42,
+        process_identity_verified=True,
+        expected_gpu_uuid_fingerprints=(),
+    )
+
+    selected = [sample for sample in samples if sample.identity_verified]
+    assert len(selected) == 1
+    assert selected[0].gpu_index == 2
+    assert selected[0].gpu_uuid_fingerprint == gpu_uuid_fingerprint("GPU-b")
+
+
 def test_calibration_is_deterministic_and_excludes_oom_from_speed() -> None:
     first = _summary(speed=2.0, created_offset=1)
     second = _summary(speed=4.0, created_offset=2)
@@ -273,6 +310,21 @@ def test_outlier_filter_and_matcher_preserve_manual_exclusion_and_gpu_boundary()
     )
     assert TrainingCalibrationMatcher().matches(good, snapshot)
     assert not TrainingCalibrationMatcher().matches(other_gpu, snapshot)
+
+
+def test_calibration_rejects_compute_capability_mismatch() -> None:
+    summary = replace(_summary(), gpu_architecture="Arch-B", compute_capability="8.0")
+    snapshot = RecommendationCalibrationService().build(
+        (summary,),
+        gpu_identity_fingerprint="gpu-a",
+        gpu_architecture="Arch-B",
+        compute_capability="8.0",
+    )
+
+    assert TrainingCalibrationMatcher().matches(summary, snapshot)
+    assert not TrainingCalibrationMatcher().matches(
+        replace(summary, compute_capability="7.5"), snapshot
+    )
 
 
 def test_oom_feedback_only_suggests_lower_batch_and_keeps_baseline_safety_floor() -> (
