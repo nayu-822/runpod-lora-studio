@@ -181,6 +181,9 @@ class TrainingMemoryMonitor:
                 record.failed_sample_count, self.settings.training_memory_max_samples
             )
             record.updated_at = datetime.now(UTC)
+            if "GPU_CHANGED_DURING_JOB" in _codes_from_json(record.failure_codes_json):
+                record.gpu_identity_verified = False
+                record.process_identity_verified = False
             record.confidence = _confidence(record)
             if aggregate_changed:
                 summary_ids = session.scalars(
@@ -238,17 +241,23 @@ def _merge_sample(
     sample: GpuMemorySample,
     fingerprint: str,
 ) -> str | None:
-    if record.gpu_index is not None and record.gpu_index != sample.gpu_index:
-        record.failed_sample_count += 1
-        record.gpu_identity_verified = False
-        return "GPU_CHANGED_DURING_JOB"
     if (
-        record.gpu_uuid_fingerprint is not None
-        and sample.gpu_uuid_fingerprint is not None
+        record.sample_count > 0
         and record.gpu_uuid_fingerprint != sample.gpu_uuid_fingerprint
     ):
         record.failed_sample_count += 1
         record.gpu_identity_verified = False
+        record.process_identity_verified = False
+        return "GPU_CHANGED_DURING_JOB"
+    if (
+        record.gpu_uuid_fingerprint is None
+        and record.sample_count > 0
+        and sample.gpu_uuid_fingerprint is None
+        and record.gpu_index != sample.gpu_index
+    ):
+        record.failed_sample_count += 1
+        record.gpu_identity_verified = False
+        record.process_identity_verified = False
         return "GPU_CHANGED_DURING_JOB"
     record.gpu_index = sample.gpu_index
     record.gpu_uuid_fingerprint = sample.gpu_uuid_fingerprint
@@ -403,6 +412,8 @@ def _min_value(first: int | None, second: int | None) -> int | None:
 
 
 def _confidence(record: TrainingMemoryAggregateRecord) -> str:
+    if "GPU_CHANGED_DURING_JOB" in _codes_from_json(record.failure_codes_json):
+        return CalibrationConfidence.NONE.value
     if record.sample_count == 0:
         return CalibrationConfidence.NONE.value
     if (

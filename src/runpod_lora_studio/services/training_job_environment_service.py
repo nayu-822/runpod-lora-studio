@@ -6,6 +6,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
@@ -31,6 +32,9 @@ from runpod_lora_studio.external.training_environment import (
 )
 from runpod_lora_studio.persistence.database import create_session_factory
 from runpod_lora_studio.persistence.models import (
+    RecommendationCalibrationSnapshotRecord,
+    RecommendationCalibrationSourceRecord,
+    TrainingExecutionSummaryRecord,
     TrainingJobEnvironmentSnapshotRecord,
     TrainingJobSelectedGpuRecord,
 )
@@ -192,6 +196,7 @@ class TrainingJobEnvironmentService:
             selection_source=selection_source,
             status="ok" if physical else "warning",
             warning_codes=() if physical else ("PHYSICAL_GPU_NOT_FOUND",),
+            last_observed_gpu_uuid_fingerprint=gpu_uuid_fingerprint,
         )
         with self.session_factory() as session:
             record = session.scalar(
@@ -203,21 +208,12 @@ class TrainingJobEnvironmentService:
                 session.add(_record_from_selected_gpu(values))
                 session.commit()
                 return values
-            if record.gpu_uuid_fingerprint != values.gpu_uuid_fingerprint:
-                warnings = _json_values(record.warning_codes_json)
-                record.logical_gpu_index = values.logical_gpu_index
-                record.physical_gpu_index = values.physical_gpu_index
-                record.gpu_uuid_fingerprint = values.gpu_uuid_fingerprint
-                record.gpu_architecture = values.gpu_architecture
-                record.compute_capability = values.compute_capability
-                record.total_vram_bytes = values.total_vram_bytes
-                record.selected_at = values.selected_at
-                record.selection_source = values.selection_source
-                record.status = "changed"
-                record.warning_codes_json = json.dumps(
-                    sorted(set(warnings) | {"GPU_CHANGED_DURING_JOB"})
-                )
-                session.commit()
+            gpu_changed = _record_selected_gpu_observation(
+                record, values.gpu_uuid_fingerprint, values.selected_at
+            )
+            if gpu_changed:
+                _mark_selected_gpu_calibrations_stale(session, training_job_id)
+            session.commit()
             return _selected_gpu_from_record(record)
 
     def get_runtime_gpu(self, training_job_id: UUID) -> TrainingJobSelectedGpu | None:
@@ -505,6 +501,10 @@ def _record_from_selected_gpu(
         selection_source=selected.selection_source,
         status=selected.status,
         warning_codes_json=json.dumps(selected.warning_codes, sort_keys=True),
+        last_observed_gpu_uuid_fingerprint=selected.last_observed_gpu_uuid_fingerprint
+        or selected.gpu_uuid_fingerprint,
+        gpu_change_detected_at=selected.gpu_change_detected_at,
+        gpu_change_count=selected.gpu_change_count,
     )
 
 
@@ -524,6 +524,9 @@ def _selected_gpu_from_record(
         selection_source=record.selection_source,
         status=record.status,
         warning_codes=_json_values(record.warning_codes_json),
+        last_observed_gpu_uuid_fingerprint=record.last_observed_gpu_uuid_fingerprint,
+        gpu_change_detected_at=record.gpu_change_detected_at,
+        gpu_change_count=record.gpu_change_count,
     )
 
 
@@ -537,3 +540,45 @@ def _json_values(value: str | None) -> tuple[str, ...]:
         if isinstance(parsed, list)
         else ()
     )
+
+
+def _record_selected_gpu_observation(
+    record: TrainingJobSelectedGpuRecord,
+    observed_gpu_uuid_fingerprint: str,
+    observed_at: datetime,
+) -> bool:
+    """Record bounded GPU-change audit data without mutating first identity."""
+
+    previous_observed = record.last_observed_gpu_uuid_fingerprint
+    record.last_observed_gpu_uuid_fingerprint = observed_gpu_uuid_fingerprint
+    if record.gpu_uuid_fingerprint == observed_gpu_uuid_fingerprint:
+        return False
+    if previous_observed != observed_gpu_uuid_fingerprint:
+        record.gpu_change_count += 1
+    if record.gpu_change_detected_at is None:
+        record.gpu_change_detected_at = observed_at
+    warnings = _json_values(record.warning_codes_json)
+    record.status = "changed"
+    record.warning_codes_json = json.dumps(
+        sorted(set(warnings) | {"GPU_CHANGED_DURING_JOB"})
+    )
+    return True
+
+
+def _mark_selected_gpu_calibrations_stale(session: Any, training_job_id: UUID) -> None:
+    summary_ids = session.scalars(
+        select(TrainingExecutionSummaryRecord.id).where(
+            TrainingExecutionSummaryRecord.training_job_id == str(training_job_id)
+        )
+    ).all()
+    if not summary_ids:
+        return
+    calibration_ids = session.scalars(
+        select(RecommendationCalibrationSourceRecord.calibration_id).where(
+            RecommendationCalibrationSourceRecord.summary_id.in_(summary_ids)
+        )
+    ).all()
+    if calibration_ids:
+        session.query(RecommendationCalibrationSnapshotRecord).filter(
+            RecommendationCalibrationSnapshotRecord.id.in_(calibration_ids)
+        ).update({"stale": True}, synchronize_session=False)

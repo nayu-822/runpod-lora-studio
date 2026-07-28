@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from statistics import median
@@ -170,6 +170,32 @@ class TrainingPerformanceCollector:
                 if measured_gpu_verified
                 else None
             )
+            selected_gpu_changed = selected_gpu is not None and (
+                selected_gpu.status != "ok"
+                or "GPU_CHANGED_DURING_JOB"
+                in _json_tuple(selected_gpu.warning_codes_json)
+            )
+            memory_gpu_changed = (
+                "GPU_CHANGED_DURING_JOB" in memory.failure_codes
+                or "GPU_CHANGED_DURING_JOB" in memory.warning_codes
+            )
+            expected_gpu_fingerprint = (
+                selected_gpu.gpu_uuid_fingerprint
+                if selected_gpu is not None
+                else job_environment.gpu_uuid_fingerprint
+                if job_environment is not None
+                else None
+            )
+            memory_identity_mismatch = (
+                memory.gpu_uuid_fingerprint is not None
+                and expected_gpu_fingerprint is not None
+                and memory.gpu_uuid_fingerprint != expected_gpu_fingerprint
+            )
+            summary_memory = (
+                _invalidate_memory_summary_identity(memory)
+                if memory_identity_mismatch
+                else memory
+            )
             if selected_gpu is not None:
                 gpu_total = (
                     selected_gpu.total_vram_bytes
@@ -274,13 +300,26 @@ class TrainingPerformanceCollector:
                         | {"gpu_environment_changed_since_recommendation"}
                     )
                 )
+            if selected_gpu_changed or memory_gpu_changed:
+                exclusion_reasons = tuple(
+                    sorted(set(exclusion_reasons) | {"gpu_changed_during_job"})
+                )
+            if memory_identity_mismatch:
+                exclusion_reasons = tuple(
+                    sorted(set(exclusion_reasons) | {"gpu_identity_mismatch"})
+                )
             failure_category = classification.category
             usable_speed = (
                 not exclusion_reasons
                 and failure_category is TrainingFailureCategory.NONE
             )
             usable_memory = (
-                gpu_fingerprint is not None
+                selected_gpu is not None
+                and selected_gpu.status == "ok"
+                and not selected_gpu_changed
+                and not memory_gpu_changed
+                and not memory_identity_mismatch
+                and gpu_fingerprint is not None
                 and memory.target_peak_allocated_bytes is not None
                 and memory.process_identity_verified
                 and memory.gpu_identity_verified
@@ -305,7 +344,7 @@ class TrainingPerformanceCollector:
                 gpu_index=gpu_index,
                 physical_gpu_index=physical_gpu_index,
                 compute_capability=compute_capability,
-                memory=memory,
+                memory=summary_memory,
                 completed_steps=completed_steps,
                 planned_steps=planned_steps,
                 elapsed=elapsed,
@@ -487,6 +526,7 @@ def _make_summary(
             "oom_detected": values["oom_detected"],
             "usable_for_speed": usable_speed,
             "usable_for_memory": usable_memory,
+            "exclusion_reasons": exclusion_reasons,
             "collector_version": TrainingPerformanceCollector.version,
             "classifier_version": classifier_version,
         }
@@ -731,6 +771,35 @@ def _memory_summary_from_record(
         failure_codes=_json_tuple(record.failure_codes_json),
         other_process_ratio=other_ratio,
         confidence=CalibrationConfidence(record.confidence),
+    )
+
+
+def _invalidate_memory_summary_identity(
+    memory: GpuMemorySummary,
+) -> GpuMemorySummary:
+    """Prevent memory values from a different GPU entering the summary."""
+
+    return replace(
+        memory,
+        gpu_index=None,
+        gpu_uuid_fingerprint=None,
+        total_bytes=None,
+        free_before_bytes=None,
+        free_after_bytes=None,
+        target_peak_allocated_bytes=None,
+        target_peak_reserved_bytes=None,
+        whole_gpu_min_free_bytes=None,
+        whole_gpu_peak_used_bytes=None,
+        other_process_peak_used_bytes=None,
+        sample_count=0,
+        process_identity_verified=False,
+        gpu_identity_verified=False,
+        coverage_seconds=None,
+        other_process_ratio=None,
+        confidence=CalibrationConfidence.NONE,
+        failure_codes=tuple(
+            sorted(set(memory.failure_codes) | {"GPU_IDENTITY_MISMATCH"})
+        ),
     )
 
 

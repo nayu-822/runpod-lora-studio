@@ -44,3 +44,6 @@ class TrainingJobSelectedGpu:
     selection_source: str
     status: str
     warning_codes: tuple[str, ...] = ()
+    last_observed_gpu_uuid_fingerprint: str | None = None
+    gpu_change_detected_at: datetime | None = None
+    gpu_change_count: int = 0

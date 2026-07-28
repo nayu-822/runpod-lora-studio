@@ -978,6 +978,13 @@ class TrainingJobSelectedGpuRecord(Base):
     selection_source: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     warning_codes_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    last_observed_gpu_uuid_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    gpu_change_detected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    gpu_change_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class TrainingRecommendationRequestRecord(Base):

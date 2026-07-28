@@ -117,6 +117,8 @@ torch.cuda.mem_get_info()は(free, total)の順で読み取り、total VRAMはfr
 対象PIDのcompute-process queryで単一GPU UUIDを確認できた場合だけruntime identityを
 別スナップショットへ保存し、summaryとcalibrationはそのidentity由来の物理GPU属性を
 使用します。推奨付きジョブで実行GPUを確定できない場合は開始を拒否します。
+最初に確定したselected GPU identityは学習中も上書きせず、異なるUUIDを観測した場合は
+変更監査情報を保存し、そのジョブを速度・VRAM校正から除外します。
 
 ### Phase 1の最終確認事項
 

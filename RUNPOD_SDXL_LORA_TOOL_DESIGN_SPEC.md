@@ -1292,6 +1292,10 @@ GPU identityに紐づく固定値として保存する。
 TrainingJobSelectedGpuとしてruntime identityを別途保存する。summaryとcalibrationの
 GPU属性は確定したruntime identityに対応する同一physical inventoryから取得し、
 pre-startのvisible GPU集合から別GPUの属性をfallbackしない。
+selected GPU identityは最初の確定後immutableとし、後続のGPU変更は初回identityを
+上書きせず、最終観測UUID・変更時刻・変更回数・warning codeを限定的に監査保存する。
+GPU変更またはselected GPUとmemory aggregateのUUID不一致がある実績は、速度・VRAM校正へ
+利用せず、関連するcalibrationをstale化する。
 
 取得結果を推奨パラメータ生成へ渡す。
 

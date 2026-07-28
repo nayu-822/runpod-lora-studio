@@ -544,6 +544,7 @@ Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は�
 
 - Torch indexはlogical indexとして扱い、physical GPU情報は固定nvidia-smi inventoryとUUID照合で確定する。mem_get_info()は(free, total)の順で取得し、free VRAMの変動をtotal VRAMへ混入させない。
 - 開始前に実行GPUを確定できない推奨付きジョブは開始せず、PID queryで単一GPUを確定できた場合はimmutableな開始前snapshotとは別にruntime GPU identityを保存する。レビュー対応の品質確認が完了するまでPhase 7Bを完全完了扱いにしない。
+- selected GPU identityは最初の確定値を保持し、後続の異なるUUIDは監査情報とGPU_CHANGED_DURING_JOBとして記録する。変更ジョブは速度・VRAM校正へ利用せず、関連calibrationをstale化する。
 
 - 各TrainingJobの開始境界で、推奨の有無に依存しない不変の実行環境snapshotを追加する。論理/物理GPU、UUID fingerprint、architecture/compute capability、total VRAM、CUDA、正規化済みCUDA_VISIBLE_DEVICES、sd-scripts/xformers、detector version、detected_atを保存し、秘密情報やホスト情報は保存しない。
 - GPU UUIDとCUDA_VISIBLE_DEVICESの対応、PID/process identity/groupを検証し、複数GPUやGPU変更時は安全側に倒す。実行時snapshotをsummary/calibrationの正本とし、推奨時snapshotは比較・stale判定だけに使う。手動jobでもtarget process peakを利用可能にする。

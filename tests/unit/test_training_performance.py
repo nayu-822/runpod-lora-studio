@@ -16,6 +16,10 @@ from runpod_lora_studio.domain.training_performance_models import (
     TrainingExecutionSummary,
     TrainingFailureCategory,
 )
+from runpod_lora_studio.persistence.models import (
+    TrainingJobSelectedGpuRecord,
+    TrainingMemoryAggregateRecord,
+)
 from runpod_lora_studio.services.gpu_memory_metrics import (
     NvidiaSmiGpuMemoryAdapter,
     StaticGpuMemoryMetricsAdapter,
@@ -32,9 +36,15 @@ from runpod_lora_studio.services.training_failure_classifier import (
     TrainingFailureClassifier,
 )
 from runpod_lora_studio.services.training_job_environment_service import (
+    _record_selected_gpu_observation,
     _snapshot_from_info,
 )
-from runpod_lora_studio.services.training_memory_monitor import _select_sample
+from runpod_lora_studio.services.training_memory_monitor import (
+    _add_codes,
+    _confidence,
+    _merge_sample,
+    _select_sample,
+)
 
 
 def _summary(
@@ -188,6 +198,82 @@ def test_gpu_sample_selection_never_falls_back_to_another_gpu() -> None:
     assert _select_sample(samples, ("b",)) is samples[1]
     assert _select_sample(samples, ()) is None
     assert _select_sample(samples, ("missing",)) is None
+
+
+def test_selected_gpu_keeps_first_identity_and_records_later_change() -> None:
+    first_at = datetime(2026, 1, 1, tzinfo=UTC)
+    changed_at = datetime(2026, 1, 1, 1, tzinfo=UTC)
+    record = TrainingJobSelectedGpuRecord(
+        id=str(uuid4()),
+        training_job_id=str(uuid4()),
+        gpu_uuid_fingerprint="gpu-a",
+        selected_at=first_at,
+        selection_source="target_process",
+        status="ok",
+        warning_codes_json="[]",
+        last_observed_gpu_uuid_fingerprint="gpu-a",
+        gpu_change_count=0,
+    )
+
+    assert not _record_selected_gpu_observation(record, "gpu-a", changed_at)
+    assert record.gpu_uuid_fingerprint == "gpu-a"
+    assert record.selected_at == first_at
+    assert _record_selected_gpu_observation(record, "gpu-b", changed_at)
+    assert record.gpu_uuid_fingerprint == "gpu-a"
+    assert record.last_observed_gpu_uuid_fingerprint == "gpu-b"
+    assert record.gpu_change_detected_at == changed_at
+    assert record.gpu_change_count == 1
+    assert record.status == "changed"
+    assert record.warning_codes_json == '["GPU_CHANGED_DURING_JOB"]'
+
+
+def test_memory_gpu_change_does_not_merge_gpu_b_into_gpu_a() -> None:
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    record = TrainingMemoryAggregateRecord(
+        id=str(uuid4()),
+        training_job_id=str(uuid4()),
+        gpu_index=2,
+        gpu_uuid_fingerprint="gpu-a",
+        gpu_total_vram_bytes=16 * 1024**3,
+        free_vram_before_bytes=12 * 1024**3,
+        minimum_free_vram_bytes=10 * 1024**3,
+        free_vram_after_bytes=10 * 1024**3,
+        target_process_peak_used_bytes=6 * 1024**3,
+        whole_gpu_peak_used_bytes=6 * 1024**3,
+        other_process_peak_used_bytes=0,
+        sample_count=2,
+        failed_sample_count=0,
+        process_identity_verified=True,
+        gpu_identity_verified=True,
+        confidence=CalibrationConfidence.HIGH.value,
+        last_sample_fingerprint="old",
+        measurement_version="test",
+        warning_codes_json="[]",
+        failure_codes_json="[]",
+        updated_at=timestamp,
+    )
+    sample = GpuMemorySample(
+        timestamp=timestamp + timedelta(seconds=1),
+        gpu_index=0,
+        total_bytes=24 * 1024**3,
+        free_bytes=20 * 1024**3,
+        process_used_bytes=8 * 1024**3,
+        gpu_uuid_fingerprint="gpu-b",
+        whole_gpu_used_bytes=4 * 1024**3,
+        identity_verified=True,
+        gpu_identity_verified=True,
+    )
+
+    code = _merge_sample(record, sample, "new")
+    assert code == "GPU_CHANGED_DURING_JOB"
+    _add_codes(record, "failure_codes_json", (code,))
+    assert record.gpu_uuid_fingerprint == "gpu-a"
+    assert record.gpu_total_vram_bytes == 16 * 1024**3
+    assert record.target_process_peak_used_bytes == 6 * 1024**3
+    assert record.minimum_free_vram_bytes == 10 * 1024**3
+    assert not record.gpu_identity_verified
+    assert not record.process_identity_verified
+    assert _confidence(record) == CalibrationConfidence.NONE.value
 
 
 def test_nvidia_smi_attributes_target_pid_per_gpu_and_rejects_over_total(
