@@ -170,6 +170,21 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     training_resume_max_epoch: int = Field(default=100_000, ge=1)
     training_resume_max_step: int = Field(default=1_000_000_000, ge=1)
 
+    # Phase 8A image-source search. Image bytes are intentionally not fetched
+    # in this phase; these limits protect the metadata API worker.
+    image_search_connect_timeout_seconds: float = Field(default=10.0, gt=0.0, le=300.0)
+    image_search_read_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
+    image_search_max_response_bytes: int = Field(default=4 * 1024 * 1024, ge=1024)
+    image_search_min_interval_seconds: float = Field(default=1.0, ge=0.0, le=60.0)
+    image_search_retry_max_attempts: int = Field(default=4, ge=1, le=8)
+    image_search_retry_base_backoff_seconds: float = Field(default=1.0, ge=0.0, le=60.0)
+    image_search_retry_max_backoff_seconds: float = Field(
+        default=30.0, ge=0.0, le=600.0
+    )
+    image_search_max_pages: int = Field(default=100, ge=1, le=10_000)
+    image_search_max_requests: int = Field(default=200, ge=1, le=20_000)
+    image_search_stale_after_seconds: float = Field(default=300.0, gt=0.0)
+
     runpod_pod_id: str | None = Field(default=None, validation_alias="RUNPOD_POD_ID")
     # Tokens and credentials added later must use SecretStr and repr=False as well.
     runpod_api_key: SecretStr | None = Field(

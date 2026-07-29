@@ -67,7 +67,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0026_phase7b_gpu_calibration_reasons"
+            "0027_phase8a_image_acquisition"
         )
 
 
@@ -187,6 +187,53 @@ def test_phase7b_memory_and_compatibility_migrations_are_present(
     }.issubset(calibration_columns)
 
 
+def test_phase8a_acquisition_tables_have_source_and_plan_constraints(
+    test_workspace: Path,
+) -> None:
+    settings = migrate(test_workspace)
+    inspector = inspect(create_engine_for_settings(settings))
+    tables = set(inspector.get_table_names())
+    assert {
+        "external_image_posts",
+        "image_source_searches",
+        "image_source_search_results",
+        "image_acquisition_plans",
+        "image_acquisition_plan_items",
+        "external_image_asset_links",
+    }.issubset(tables)
+    post_columns = {
+        item["name"] for item in inspector.get_columns("external_image_posts")
+    }
+    assert {
+        "source_type",
+        "external_post_id",
+        "source_md5",
+        "metadata_fingerprint",
+    }.issubset(post_columns)
+    post_unique = {
+        item["name"]
+        for item in inspector.get_unique_constraints("external_image_posts")
+    }
+    result_unique = {
+        item["name"]
+        for item in inspector.get_unique_constraints("image_source_search_results")
+    }
+    plan_unique = {
+        item["name"]
+        for item in inspector.get_unique_constraints("image_acquisition_plans")
+    }
+    assert "uq_external_image_source_post" in post_unique
+    assert "uq_image_search_result_post" in result_unique
+    assert "plan_fingerprint" in {
+        column["name"] for column in inspector.get_columns("image_acquisition_plans")
+    }
+    assert "uq_image_plan_item_post" in {
+        item["name"]
+        for item in inspector.get_unique_constraints("image_acquisition_plan_items")
+    }
+    assert plan_unique
+
+
 def test_existing_0001_database_upgrades_to_head(test_workspace: Path) -> None:
     settings = migrate(test_workspace, "0001_initial")
     migrate(test_workspace, "head")
@@ -240,7 +287,7 @@ def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0026_phase7b_gpu_calibration_reasons"
+            "0027_phase8a_image_acquisition"
         )
 
 
@@ -268,7 +315,7 @@ def test_phase4_downgrade_and_reupgrade_preserves_phase3_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0026_phase7b_gpu_calibration_reasons"
+            "0027_phase8a_image_acquisition"
         )
 
 
@@ -282,7 +329,7 @@ def test_phase5_upgrades_existing_0006_database_to_head(
         assert "managed_models" in tables
         assert "storage_transfer_jobs" in tables
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0026_phase7b_gpu_calibration_reasons"
+            "0027_phase8a_image_acquisition"
         )
 
 
@@ -303,7 +350,7 @@ def test_phase5_heartbeat_migration_upgrades_existing_0007_database(
             "current_file_transferred_bytes",
         }.issubset(columns)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0026_phase7b_gpu_calibration_reasons"
+            "0027_phase8a_image_acquisition"
         )
 
 
@@ -351,7 +398,7 @@ def test_phase5_progress_migration_upgrades_existing_0008_database(
         ).one()
         assert row == ("running", 0, 0)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0026_phase7b_gpu_calibration_reasons"
+            "0027_phase8a_image_acquisition"
         )
 
 
@@ -378,7 +425,7 @@ def test_phase5_progress_downgrade_and_reupgrade(test_workspace: Path) -> None:
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0026_phase7b_gpu_calibration_reasons"
+            "0027_phase8a_image_acquisition"
         )
 
 

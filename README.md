@@ -278,6 +278,14 @@ Phase 5では、rcloneを介してGoogle Driveのモデルを一覧表示し、R
 転送後はverification levelに応じて各ファイルの存在・サイズ、remote hash、必須manifest、snapshot content hashを検証し、ローカルmanifestへ成功・失敗・スキップ件数、サイズ、ハッシュ、remoteメタデータ、rcloneバージョン、設定スナップショットを記録します。`remote_hash_and_size`はremote hashとサイズの一致、`manifest_metadata_and_size`はmanifestメタデータとサイズ、`existence_only`は存在のみ、`not_verified`は未検証、`verification_failed`は検証失敗を表します。古いtransfer-manifest.jsonのlocal SHA-256だけではremote実体の同一性を確認できないため、skip_identicalや転送後検証の成功には使用しません。進捗は完了済みファイルと現在ファイルを分けた累積値で、スキップは転送バイト数へ含めません。キャンセル、指数バックオフ、rclone子PID、worker ID、heartbeat、アプリ再起動後のstale検出をDBへ保存します。DBトランザクションは短く保ち、画像やモデル全体をbytesへ展開しません。
 
 通常処理では`rclone sync`、remote側の無関係なファイル削除、危険な上書き、秘密情報のログ出力を行いません。Google Drive実通信の手動確認は、rclone設定を配置したRunPodで`rclone version`、`rclone listremotes`、接続確認、モデル一覧、ドライラン、少量のモデル取得、completedスナップショットの転送・再検証の順に実施してください。認証情報がない環境の自動テストはFakeStorageTransferAdapterを使用します。
+
+## Phase 8A: Danbooru検索・取得候補・取得計画
+
+「画像取得」タブでは、必須／除外タグ、rating、スコア、解像度、拡張子、候補数を検証してDanbooruの公開メタデータAPIを検索できます。検索結果はsource typeと外部post IDをキーにSQLiteへ保存し、既存画像・既存計画・URL・拡張子・rating・解像度をローカルで再確認します。除外理由は候補ごとに固定コードで保持し、UIでは日本語で表示します。
+
+Phase 8Aは画像本体をダウンロードせず、外部画像を初期表示せず、確定時も不変の取得計画だけを保存します。API通信は固定HTTPSエンドポイント、応答サイズ上限、JSON schema確認、1ワーカーのレート制限、429等の限定的な指数バックオフ、キャンセルを使用します。認証が必要な場合は`DANBOORU_LOGIN`と`DANBOORU_API_KEY`を環境変数へ設定します。これらはDB、ログ、UI、fingerprintへ保存しません。
+
+検索結果の確認と計画確定の間にメタデータや重複状態が変わった場合は確定を拒否します。確定済み計画はfingerprintで冪等に再取得できます。画像ファイルの取得、`.part`、magic bytes／SHA検証、ImageRecord登録、サムネイル生成、ZIP化はPhase 8B以降の対象です。
 ## Phase 6A: SDXL LoRA学習ジョブ基盤
 
 Phase 6Aでは、完成済みデータセットスナップショットと検証済みローカルモデルを入力に、学習設定・ジョブをSQLiteへ保存し、安全な引数配列で `sdxl_train_network.py` を起動します。ジョブはPID、worker heartbeat、stdout/stderrログ、終了コードを記録し、キャンセル、stale復旧、boundedなログ末尾取得に対応します。

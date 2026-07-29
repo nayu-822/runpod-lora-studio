@@ -556,3 +556,12 @@ Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は�
 - `RecommendationCalibrationService`はGPU/VRAMクラス/architecture、resolution、batch、gradient accumulation/effective batch、LoRA module/dim/alpha、optimizer、precision、cache/checkpointing、world size、sd-scripts version、xformersが一致する履歴だけを選択し、outlier除外、中央値、保守的percentile、信頼度、source fingerprintを決定論的に保存する。低信頼・stale・履歴不足時はPhase 7A baselineへフォールバックする
 - `CalibratedRecommendationService`は時間・VRAMの比較とOOM後のbatch低下提案を提供するが、baselineの安全制約を緩和せず、推奨適用や学習開始を自動実行しない。UIから履歴再収集・校正再構築・履歴表示を操作できる
 - Alembic `0019_phase7b_training_performance`を変更せず、`0020_phase7b_memory_measurements`でメモリ集約・サマリー拡張、`0021_phase7b_calibration_compatibility`で厳密校正条件を追加する。内容fingerprintと校正状態fingerprintを分離し、関連校正だけをstale化する。Optuna等の自動探索、複数jobの自動起動、lossだけによる品質判定は対象外とする
+
+## Phase 8A実装状況: Danbooru検索・取得候補管理・取得計画
+
+- `ImageSourceAdapter` Protocol、Danbooruアダプター、Fake adapter、固定source registryを追加した。queryはタグ・rating・数値・拡張子を正規化し、固定query fingerprintを生成する。任意URL、任意rating文字列、制御文字、bool数値は受け付けない。
+- `ExternalImagePost`、`ImageSourceSearch`、検索結果、`ImageAcquisitionPlan`、plan item、外部postと既存ImageAssetのlinkをAlembic `0027_phase8a_image_acquisition`へ追加した。source type + external post IDとplan fingerprintにunique制約を持たせ、MD5やURL単独では同一postと判定しない。
+- Danbooru APIは固定HTTPS host、JSON content type、応答サイズ上限、redirect拒否、環境変数認証、単一workerのmonotonic rate limiter、429／408／5xx／timeoutのbounded retry、Retry-After優先、キャンセルを使用する。raw responseと認証情報は保存しない。
+- 検索はqueued/running/completed/partially_failed/failed/canceled/staleを保存し、cursor loop、ページ／request上限、重複post、worker claim、heartbeat、キャンセルを扱う。候補は`MISSING_FILE_URL`等の固定除外理由と利用可否を保存する。
+- 取得計画のpreview fingerprintには検索fingerprint、adapter version、候補メタデータを含める。confirm時にDBを再検証し、確定済みplanは不変・冪等で、画像ダウンロードは行わない。UIは外部画像を表示せず、ratingと除外理由を日本語で表示する。
+- Phase 8Bの画像取得、ファイル検証、ImageRecord登録、サムネイル、ZIP、他source、tagger／dataset／Drive連携は未実装である。

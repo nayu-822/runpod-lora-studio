@@ -12,6 +12,7 @@ from runpod_lora_studio.config.settings import (
 )
 from runpod_lora_studio.environment import EnvironmentReport, collect_environment_report
 from runpod_lora_studio.logging.config import configure_logging
+from runpod_lora_studio.services.acquisition_service import ImageAcquisitionService
 from runpod_lora_studio.services.dataset_snapshot_service import DatasetSnapshotService
 from runpod_lora_studio.services.image_service import ImageService
 from runpod_lora_studio.services.project_service import ProjectService
@@ -21,6 +22,7 @@ from runpod_lora_studio.services.similarity_detection_service import (
 from runpod_lora_studio.services.storage_service import StorageService
 from runpod_lora_studio.services.tagging_service import TaggingService
 from runpod_lora_studio.services.training_service import TrainingService
+from runpod_lora_studio.ui.acquisition import build_acquisition_tab
 from runpod_lora_studio.ui.dataset import build_dataset_tab
 from runpod_lora_studio.ui.phase1 import build_image_tab, build_project_tab
 from runpod_lora_studio.ui.similarity import build_similarity_tab
@@ -94,6 +96,7 @@ def create_app(
     datasets = DatasetSnapshotService(runtime_settings, projects)
     storage = StorageService(runtime_settings, datasets=datasets)
     training = TrainingService(runtime_settings)
+    acquisition = ImageAcquisitionService(runtime_settings)
     datasets.recover_finalized_snapshots()
     datasets.recover_stale()
     storage.recover_stale_jobs()
@@ -126,6 +129,8 @@ def create_app(
         image_refresh = gr.State(value=0)
         with gr.Tab("画像"):
             build_image_tab(images, selected_project, project_table, image_refresh)
+        with gr.Tab("画像取得"):
+            build_acquisition_tab(acquisition, selected_project)
         with gr.Tab("近似重複"):
             build_similarity_tab(similarity, selected_project, image_refresh)
         with gr.Tab("タグ付け・キャプション"):

@@ -1634,6 +1634,240 @@ class TrainingArtifactRecord(Base):
     )
 
 
+class ExternalImagePostRecord(Base):
+    __tablename__ = "external_image_posts"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_type", "external_post_id", name="uq_external_image_source_post"
+        ),
+        Index("ix_external_image_posts_source_md5", "source_type", "source_md5"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_post_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    post_url: Mapped[str] = mapped_column(Text, nullable=False)
+    file_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    preview_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sample_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    file_extension: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    rating: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_md5: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    normalized_tags_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]"
+    )
+    metadata_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_metadata_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}"
+    )
+    is_deleted: Mapped[bool] = mapped_column(Integer, nullable=False, default=False)
+    is_pending: Mapped[bool] = mapped_column(Integer, nullable=False, default=False)
+    is_flagged: Mapped[bool] = mapped_column(Integer, nullable=False, default=False)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ImageSourceSearchRecord(Base):
+    __tablename__ = "image_source_searches"
+    __table_args__ = (Index("ix_image_source_searches_project", "project_id"),)
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    normalized_query: Mapped[str] = mapped_column(Text, nullable=False)
+    query_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    query_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    adapter_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    requested_candidate_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    returned_post_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    accepted_candidate_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    excluded_candidate_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    api_request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    rate_limit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    current_cursor: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    cancellation_requested: Mapped[bool] = mapped_column(
+        Integer, nullable=False, default=False
+    )
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ImageSourceSearchResultRecord(Base):
+    __tablename__ = "image_source_search_results"
+    __table_args__ = (
+        UniqueConstraint(
+            "search_id", "external_post_id", name="uq_image_search_result_post"
+        ),
+        Index("ix_image_source_search_results_search", "search_id"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    search_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("image_source_searches.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    external_post_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    result_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    candidate_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    exclusion_reasons_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]"
+    )
+    already_imported: Mapped[bool] = mapped_column(
+        Integer, nullable=False, default=False
+    )
+    already_planned: Mapped[bool] = mapped_column(
+        Integer, nullable=False, default=False
+    )
+    selected: Mapped[bool] = mapped_column(Integer, nullable=False, default=False)
+    metadata_fingerprint_at_search: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ImageAcquisitionPlanRecord(Base):
+    __tablename__ = "image_acquisition_plans"
+    __table_args__ = (Index("ix_image_acquisition_plans_project", "project_id"),)
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_search_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("image_source_searches.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    selected_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    skipped_existing_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    blocked_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    plan_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True
+    )
+    plan_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    query_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    adapter_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ImageAcquisitionPlanItemRecord(Base):
+    __tablename__ = "image_acquisition_plan_items"
+    __table_args__ = (
+        UniqueConstraint("plan_id", "external_post_id", name="uq_image_plan_item_post"),
+        Index("ix_image_acquisition_plan_items_plan", "plan_id"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    plan_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("image_acquisition_plans.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    external_post_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    search_result_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("image_source_search_results.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    planned_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    expected_metadata_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    expected_file_url_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    expected_md5: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    expected_width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expected_height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expected_extension: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    skip_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ExternalImageAssetLinkRecord(Base):
+    __tablename__ = "external_image_asset_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_type",
+            "external_post_id",
+            name="uq_external_image_asset_source_post",
+        ),
+        UniqueConstraint("image_asset_id", "source_type", name="uq_image_asset_source"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    image_asset_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("image_assets.id", ondelete="CASCADE"), nullable=False
+    )
+    external_post_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 # Short compatibility name for service and test code.
 InspectionResultRecord = ImageInspectionResultRecord
 
