@@ -13,8 +13,13 @@ from uuid import UUID, uuid4
 from sqlalchemy import select
 
 from runpod_lora_studio.config.settings import AppSettings
+from runpod_lora_studio.domain.training_environment_models import (
+    SelectedGpuStatus,
+    normalize_selected_gpu_status,
+)
 from runpod_lora_studio.domain.training_performance_models import (
     CalibrationConfidence,
+    GpuCalibrationExclusionReason,
     GpuMemorySummary,
     TrainingExecutionSummary,
     TrainingFailureCategory,
@@ -45,6 +50,123 @@ from runpod_lora_studio.services.training_failure_classifier import (
 )
 
 logger = logging.getLogger("runpod_lora_studio.training_performance")
+
+GPU_CHANGED_DURING_JOB_CODE = "GPU_CHANGED_DURING_JOB"
+GPU_IDENTITY_MISMATCH_CODE = "GPU_IDENTITY_MISMATCH"
+TARGET_PID_NOT_FOUND_CODE = "TARGET_PID_NOT_FOUND"
+AMBIGUOUS_GPU_SELECTION_CODE = "AMBIGUOUS_GPU_SELECTION"
+PHYSICAL_GPU_NOT_FOUND_CODE = "PHYSICAL_GPU_NOT_FOUND"
+
+_PHYSICAL_GPU_CODES = frozenset(
+    {
+        PHYSICAL_GPU_NOT_FOUND_CODE,
+        "PHYSICAL_GPU_INVENTORY_UNAVAILABLE",
+    }
+)
+_AMBIGUOUS_GPU_CODES = frozenset(
+    {AMBIGUOUS_GPU_SELECTION_CODE, "AMBIGUOUS_GPU_UUID_PREFIX"}
+)
+_IDENTITY_UNVERIFIED_CODES = frozenset(
+    {
+        "GPU_IDENTITY_UNAVAILABLE",
+        "GPU_UUID_NOT_FOUND",
+        "GPU_UUID_MISMATCH",
+        "PHYSICAL_GPU_MAPPING_UNVERIFIED",
+        "INVALID_VISIBLE_GPU_TOKEN",
+        "DUPLICATE_VISIBLE_GPU_TOKEN",
+        "EMPTY_VISIBLE_GPU_TOKEN",
+        "EXPECTED_GPU_NOT_FOUND",
+        "PROCESS_IDENTITY_MISMATCH",
+        "PROCESS_GROUP_MISMATCH",
+        "NVIDIA_SMI_QUERY_FAILED",
+    }
+)
+
+
+def _gpu_calibration_assessment(
+    *,
+    selected_gpu: TrainingJobSelectedGpuRecord | None,
+    job_environment: TrainingJobEnvironmentSnapshotRecord | None,
+    memory: GpuMemorySummary,
+    memory_identity_mismatch: bool,
+) -> tuple[
+    SelectedGpuStatus | None,
+    tuple[str, ...],
+    tuple[GpuCalibrationExclusionReason, ...],
+]:
+    """Classify GPU evidence without treating every non-OK state as a change."""
+
+    selected_status = (
+        normalize_selected_gpu_status(selected_gpu.status)
+        if selected_gpu is not None
+        else None
+    )
+    selected_warning_codes = (
+        _json_tuple(selected_gpu.warning_codes_json) if selected_gpu is not None else ()
+    )
+    environment_warning_codes = (
+        _json_tuple(job_environment.warning_codes_json)
+        if job_environment is not None
+        else ()
+    )
+    memory_codes = set(memory.failure_codes) | set(memory.warning_codes)
+    all_codes = (
+        set(selected_warning_codes) | set(environment_warning_codes) | memory_codes
+    )
+    reasons: set[GpuCalibrationExclusionReason] = set()
+
+    if (
+        selected_status is SelectedGpuStatus.CHANGED
+        or GPU_CHANGED_DURING_JOB_CODE in selected_warning_codes
+        or GPU_CHANGED_DURING_JOB_CODE in memory.failure_codes
+    ):
+        reasons.add(GpuCalibrationExclusionReason.GPU_CHANGED_DURING_JOB)
+
+    status_reason = {
+        SelectedGpuStatus.IDENTITY_UNVERIFIED: (
+            GpuCalibrationExclusionReason.GPU_IDENTITY_UNVERIFIED
+        ),
+        SelectedGpuStatus.PHYSICAL_GPU_NOT_FOUND: (
+            GpuCalibrationExclusionReason.PHYSICAL_GPU_NOT_FOUND
+        ),
+        SelectedGpuStatus.AMBIGUOUS_SELECTION: (
+            GpuCalibrationExclusionReason.AMBIGUOUS_GPU_SELECTION
+        ),
+        SelectedGpuStatus.PROCESS_GPU_NOT_FOUND: (
+            GpuCalibrationExclusionReason.TARGET_PROCESS_GPU_NOT_FOUND
+        ),
+        SelectedGpuStatus.IDENTITY_MISMATCH: (
+            GpuCalibrationExclusionReason.SELECTED_GPU_MEMORY_MISMATCH
+        ),
+    }
+    if selected_status in status_reason:
+        reasons.add(status_reason[selected_status])
+    if all_codes & _PHYSICAL_GPU_CODES:
+        reasons.add(GpuCalibrationExclusionReason.PHYSICAL_GPU_NOT_FOUND)
+    if all_codes & _AMBIGUOUS_GPU_CODES:
+        reasons.add(GpuCalibrationExclusionReason.AMBIGUOUS_GPU_SELECTION)
+    if TARGET_PID_NOT_FOUND_CODE in all_codes:
+        reasons.add(GpuCalibrationExclusionReason.TARGET_PROCESS_GPU_NOT_FOUND)
+    if all_codes & {GPU_IDENTITY_MISMATCH_CODE, "EXPECTED_GPU_NOT_FOUND"}:
+        reasons.add(GpuCalibrationExclusionReason.SELECTED_GPU_MEMORY_MISMATCH)
+    if all_codes & _IDENTITY_UNVERIFIED_CODES:
+        reasons.add(GpuCalibrationExclusionReason.GPU_IDENTITY_UNVERIFIED)
+    if memory_identity_mismatch:
+        reasons.add(GpuCalibrationExclusionReason.SELECTED_GPU_MEMORY_MISMATCH)
+
+    return (
+        selected_status,
+        tuple(sorted(set(selected_warning_codes))),
+        tuple(sorted(reasons, key=lambda reason: reason.value)),
+    )
+
+
+def _gpu_calibration_is_usable(
+    reasons: tuple[GpuCalibrationExclusionReason, ...],
+) -> bool:
+    """GPU identity uncertainty never contributes to either calibration."""
+
+    return not reasons
 
 
 class TrainingPerformanceCollector:
@@ -170,15 +292,6 @@ class TrainingPerformanceCollector:
                 if measured_gpu_verified
                 else None
             )
-            selected_gpu_changed = selected_gpu is not None and (
-                selected_gpu.status != "ok"
-                or "GPU_CHANGED_DURING_JOB"
-                in _json_tuple(selected_gpu.warning_codes_json)
-            )
-            memory_gpu_changed = (
-                "GPU_CHANGED_DURING_JOB" in memory.failure_codes
-                or "GPU_CHANGED_DURING_JOB" in memory.warning_codes
-            )
             expected_gpu_fingerprint = (
                 selected_gpu.gpu_uuid_fingerprint
                 if selected_gpu is not None
@@ -190,6 +303,14 @@ class TrainingPerformanceCollector:
                 memory.gpu_uuid_fingerprint is not None
                 and expected_gpu_fingerprint is not None
                 and memory.gpu_uuid_fingerprint != expected_gpu_fingerprint
+            )
+            selected_gpu_status, selected_gpu_warning_codes, gpu_reasons = (
+                _gpu_calibration_assessment(
+                    selected_gpu=selected_gpu,
+                    job_environment=job_environment,
+                    memory=memory,
+                    memory_identity_mismatch=memory_identity_mismatch,
+                )
             )
             summary_memory = (
                 _invalidate_memory_summary_identity(memory)
@@ -300,25 +421,20 @@ class TrainingPerformanceCollector:
                         | {"gpu_environment_changed_since_recommendation"}
                     )
                 )
-            if selected_gpu_changed or memory_gpu_changed:
-                exclusion_reasons = tuple(
-                    sorted(set(exclusion_reasons) | {"gpu_changed_during_job"})
+            exclusion_reasons = tuple(
+                sorted(
+                    set(exclusion_reasons) | {reason.value for reason in gpu_reasons}
                 )
-            if memory_identity_mismatch:
-                exclusion_reasons = tuple(
-                    sorted(set(exclusion_reasons) | {"gpu_identity_mismatch"})
-                )
+            )
             failure_category = classification.category
+            gpu_calibration_usable = _gpu_calibration_is_usable(gpu_reasons)
             usable_speed = (
-                not exclusion_reasons
+                gpu_calibration_usable
+                and not exclusion_reasons
                 and failure_category is TrainingFailureCategory.NONE
             )
             usable_memory = (
-                selected_gpu is not None
-                and selected_gpu.status == "ok"
-                and not selected_gpu_changed
-                and not memory_gpu_changed
-                and not memory_identity_mismatch
+                gpu_calibration_usable
                 and gpu_fingerprint is not None
                 and memory.target_peak_allocated_bytes is not None
                 and memory.process_identity_verified
@@ -354,6 +470,8 @@ class TrainingPerformanceCollector:
                 usable_speed=usable_speed,
                 usable_memory=usable_memory,
                 exclusion_reasons=exclusion_reasons,
+                selected_gpu_status=selected_gpu_status,
+                selected_gpu_warning_codes=selected_gpu_warning_codes,
                 settings_fingerprint=settings_fingerprint,
                 recommendation_id=recommendation_id,
                 environment_snapshot_id=environment_snapshot_id,
@@ -402,6 +520,8 @@ def _make_summary(
     usable_speed: bool,
     usable_memory: bool,
     exclusion_reasons: tuple[str, ...],
+    selected_gpu_status: SelectedGpuStatus | None,
+    selected_gpu_warning_codes: tuple[str, ...],
     settings_fingerprint: str,
     recommendation_id: UUID | None,
     environment_snapshot_id: UUID | None,
@@ -424,6 +544,8 @@ def _make_summary(
         "managed_model_id": UUID(job.managed_model_id),
         "job_result_status": job.status,
         "gpu_identity_fingerprint": gpu_fingerprint,
+        "selected_gpu_status": selected_gpu_status,
+        "selected_gpu_warning_codes": selected_gpu_warning_codes,
         "gpu_architecture": gpu_architecture,
         "gpu_index": gpu_index,
         "physical_gpu_index": physical_gpu_index,
@@ -513,6 +635,8 @@ def _make_summary(
             "usable_for_memory_calibration",
             "collector_version",
             "classifier_version",
+            "selected_gpu_status",
+            "selected_gpu_warning_codes",
         }
     }
     content_fingerprint = _fingerprint(content_values)
@@ -527,6 +651,8 @@ def _make_summary(
             "usable_for_speed": usable_speed,
             "usable_for_memory": usable_memory,
             "exclusion_reasons": exclusion_reasons,
+            "selected_gpu_status": selected_gpu_status,
+            "selected_gpu_warning_codes": selected_gpu_warning_codes,
             "collector_version": TrainingPerformanceCollector.version,
             "classifier_version": classifier_version,
         }
@@ -554,6 +680,12 @@ def _summary_from_record(
         job_result_status=record.job_result_status,
         gpu_identity_fingerprint=record.gpu_identity_fingerprint,
         settings_fingerprint=record.settings_fingerprint,
+        selected_gpu_status=(
+            normalize_selected_gpu_status(record.selected_gpu_status)
+            if record.selected_gpu_status
+            else None
+        ),
+        selected_gpu_warning_codes=_json_tuple(record.selected_gpu_warning_codes_json),
         recommendation_id=UUID(record.recommendation_id)
         if record.recommendation_id
         else None,
@@ -677,10 +809,17 @@ def _record_values(summary: TrainingExecutionSummary) -> dict[str, object]:
     values["memory_failure_codes_json"] = json.dumps(
         summary.memory_failure_codes, sort_keys=True
     )
+    values["selected_gpu_status"] = (
+        summary.selected_gpu_status.value if summary.selected_gpu_status else None
+    )
+    values["selected_gpu_warning_codes_json"] = json.dumps(
+        summary.selected_gpu_warning_codes, sort_keys=True
+    )
     values.pop("failure_evidence_codes")
     values.pop("exclusion_reasons")
     values.pop("memory_warning_codes")
     values.pop("memory_failure_codes")
+    values.pop("selected_gpu_warning_codes")
     return values
 
 
@@ -798,7 +937,7 @@ def _invalidate_memory_summary_identity(
         other_process_ratio=None,
         confidence=CalibrationConfidence.NONE,
         failure_codes=tuple(
-            sorted(set(memory.failure_codes) | {"GPU_IDENTITY_MISMATCH"})
+            sorted(set(memory.failure_codes) | {GPU_IDENTITY_MISMATCH_CODE})
         ),
     )
 

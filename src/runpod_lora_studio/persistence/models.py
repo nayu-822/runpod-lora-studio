@@ -1127,6 +1127,10 @@ class TrainingExecutionSummaryRecord(Base):
     gpu_identity_fingerprint: Mapped[str | None] = mapped_column(
         String(128), nullable=True
     )
+    selected_gpu_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    selected_gpu_warning_codes_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]"
+    )
     gpu_architecture: Mapped[str | None] = mapped_column(String(128), nullable=True)
     gpu_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     physical_gpu_index: Mapped[int | None] = mapped_column(Integer, nullable=True)

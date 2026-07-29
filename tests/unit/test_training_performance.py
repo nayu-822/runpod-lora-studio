@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from unittest.mock import Mock
 from uuid import uuid4
 
 from runpod_lora_studio.domain.recommendation_models import (
@@ -10,13 +12,17 @@ from runpod_lora_studio.domain.recommendation_models import (
     PhysicalGpuInfo,
     TrainingRecommendation,
 )
+from runpod_lora_studio.domain.training_environment_models import SelectedGpuStatus
 from runpod_lora_studio.domain.training_performance_models import (
     CalibrationConfidence,
+    GpuCalibrationExclusionReason,
     GpuMemorySample,
+    GpuMemorySummary,
     TrainingExecutionSummary,
     TrainingFailureCategory,
 )
 from runpod_lora_studio.persistence.models import (
+    TrainingExecutionSummaryRecord,
     TrainingJobSelectedGpuRecord,
     TrainingMemoryAggregateRecord,
 )
@@ -25,6 +31,9 @@ from runpod_lora_studio.services.gpu_memory_metrics import (
     StaticGpuMemoryMetricsAdapter,
     gpu_uuid_fingerprint,
     summarize_gpu_memory,
+)
+from runpod_lora_studio.services.recommendation_calibration_service import (
+    _refresh_summary_fingerprints,
 )
 from runpod_lora_studio.services.training_calibration_service import (
     CalibratedRecommendationService,
@@ -44,6 +53,11 @@ from runpod_lora_studio.services.training_memory_monitor import (
     _confidence,
     _merge_sample,
     _select_sample,
+)
+from runpod_lora_studio.services.training_performance_service import (
+    _gpu_calibration_assessment,
+    _gpu_calibration_is_usable,
+    _mark_related_calibrations_stale,
 )
 
 
@@ -274,6 +288,121 @@ def test_memory_gpu_change_does_not_merge_gpu_b_into_gpu_a() -> None:
     assert not record.gpu_identity_verified
     assert not record.process_identity_verified
     assert _confidence(record) == CalibrationConfidence.NONE.value
+
+
+def test_gpu_calibration_exclusion_reasons_are_classified() -> None:
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def selected(
+        status: SelectedGpuStatus, warnings: tuple[str, ...] = ()
+    ) -> TrainingJobSelectedGpuRecord:
+        return TrainingJobSelectedGpuRecord(
+            id=str(uuid4()),
+            training_job_id=str(uuid4()),
+            gpu_uuid_fingerprint="gpu-a",
+            selected_at=timestamp,
+            selection_source="target_process",
+            status=status.value,
+            warning_codes_json=json.dumps(warnings),
+        )
+
+    cases = (
+        (
+            selected(SelectedGpuStatus.CHANGED),
+            GpuMemorySummary(),
+            False,
+            GpuCalibrationExclusionReason.GPU_CHANGED_DURING_JOB,
+        ),
+        (
+            selected(SelectedGpuStatus.PHYSICAL_GPU_NOT_FOUND),
+            GpuMemorySummary(),
+            False,
+            GpuCalibrationExclusionReason.PHYSICAL_GPU_NOT_FOUND,
+        ),
+        (
+            selected(SelectedGpuStatus.IDENTITY_UNVERIFIED),
+            GpuMemorySummary(),
+            False,
+            GpuCalibrationExclusionReason.GPU_IDENTITY_UNVERIFIED,
+        ),
+        (
+            selected(SelectedGpuStatus.AMBIGUOUS_SELECTION),
+            GpuMemorySummary(),
+            False,
+            GpuCalibrationExclusionReason.AMBIGUOUS_GPU_SELECTION,
+        ),
+        (
+            selected(SelectedGpuStatus.OK),
+            GpuMemorySummary(failure_codes=("TARGET_PID_NOT_FOUND",)),
+            False,
+            GpuCalibrationExclusionReason.TARGET_PROCESS_GPU_NOT_FOUND,
+        ),
+        (
+            selected(SelectedGpuStatus.OK),
+            GpuMemorySummary(),
+            True,
+            GpuCalibrationExclusionReason.SELECTED_GPU_MEMORY_MISMATCH,
+        ),
+    )
+
+    for selected_gpu, memory, memory_mismatch, expected_reason in cases:
+        _, _, reasons = _gpu_calibration_assessment(
+            selected_gpu=selected_gpu,
+            job_environment=None,
+            memory=memory,
+            memory_identity_mismatch=memory_mismatch,
+        )
+        assert expected_reason in reasons
+        assert not _gpu_calibration_is_usable(reasons)
+
+
+def test_gpu_calibration_same_gpu_has_no_exclusion_reason() -> None:
+    _, _, reasons = _gpu_calibration_assessment(
+        selected_gpu=TrainingJobSelectedGpuRecord(
+            id=str(uuid4()),
+            training_job_id=str(uuid4()),
+            gpu_uuid_fingerprint="gpu-a",
+            selected_at=datetime(2026, 1, 1, tzinfo=UTC),
+            selection_source="target_process",
+            status=SelectedGpuStatus.OK.value,
+            warning_codes_json="[]",
+        ),
+        job_environment=None,
+        memory=GpuMemorySummary(
+            gpu_uuid_fingerprint="gpu-a", failure_codes=(), warning_codes=()
+        ),
+        memory_identity_mismatch=False,
+    )
+    assert reasons == ()
+    assert _gpu_calibration_is_usable(reasons)
+
+
+def test_gpu_reason_change_updates_calibration_fingerprint_and_stales_sources() -> None:
+    record = TrainingExecutionSummaryRecord()
+    record.selected_gpu_status = SelectedGpuStatus.OK.value
+    record.selected_gpu_warning_codes_json = "[]"
+    record.memory_failure_codes_json = "[]"
+    record.exclusion_reasons_json = "[]"
+    record.usable_for_speed_calibration = True
+    record.usable_for_memory_calibration = True
+    record.summary_content_fingerprint = ""
+    _refresh_summary_fingerprints(record)
+    previous_state = record.calibration_state_fingerprint
+
+    record.exclusion_reasons_json = json.dumps(
+        [GpuCalibrationExclusionReason.GPU_IDENTITY_UNVERIFIED.value]
+    )
+    record.usable_for_speed_calibration = False
+    record.usable_for_memory_calibration = False
+    _refresh_summary_fingerprints(record)
+    assert record.calibration_state_fingerprint != previous_state
+
+    session = Mock()
+    session.scalars.return_value.all.return_value = ["calibration-a"]
+    _mark_related_calibrations_stale(session, "summary-a")
+    session.query.return_value.filter.return_value.update.assert_called_once_with(
+        {"stale": True}, synchronize_session=False
+    )
 
 
 def test_nvidia_smi_attributes_target_pid_per_gpu_and_rejects_over_total(

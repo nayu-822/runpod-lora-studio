@@ -5,6 +5,8 @@ from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
 
+from runpod_lora_studio.domain.training_environment_models import SelectedGpuStatus
+
 
 class TrainingFailureCategory(StrEnum):
     NONE = "none"
@@ -26,6 +28,17 @@ class CalibrationConfidence(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+
+
+class GpuCalibrationExclusionReason(StrEnum):
+    """Stable, user-independent reasons for excluding GPU calibration data."""
+
+    GPU_CHANGED_DURING_JOB = "gpu_changed_during_job"
+    GPU_IDENTITY_UNVERIFIED = "gpu_identity_unverified"
+    PHYSICAL_GPU_NOT_FOUND = "physical_gpu_not_found"
+    AMBIGUOUS_GPU_SELECTION = "ambiguous_gpu_selection"
+    TARGET_PROCESS_GPU_NOT_FOUND = "target_process_gpu_not_found"
+    SELECTED_GPU_MEMORY_MISMATCH = "selected_gpu_memory_mismatch"
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +126,8 @@ class TrainingExecutionSummary:
     job_result_status: str
     gpu_identity_fingerprint: str | None
     settings_fingerprint: str | None
+    selected_gpu_status: SelectedGpuStatus | None = None
+    selected_gpu_warning_codes: tuple[str, ...] = ()
     gpu_architecture: str | None = None
     gpu_index: int | None = None
     physical_gpu_index: int | None = None

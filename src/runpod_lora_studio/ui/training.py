@@ -10,6 +10,9 @@ from runpod_lora_studio.domain.recommendation_models import (
     RecommendationInput,
     SpeedProfile,
 )
+from runpod_lora_studio.domain.training_performance_models import (
+    GpuCalibrationExclusionReason,
+)
 from runpod_lora_studio.services.dataset_statistics_service import (
     DatasetStatisticsService,
 )
@@ -45,6 +48,45 @@ def mark_recommendation_edited(mode: str | None) -> str:
         "recommended_edited"
         if mode in {"recommended", "recommended_edited"}
         else "manual"
+    )
+
+
+_EXCLUSION_REASON_LABELS = {
+    GpuCalibrationExclusionReason.GPU_CHANGED_DURING_JOB.value: (
+        "学習中にGPUが変更されました"
+    ),
+    GpuCalibrationExclusionReason.GPU_IDENTITY_UNVERIFIED.value: (
+        "GPU identityを検証できませんでした"
+    ),
+    GpuCalibrationExclusionReason.PHYSICAL_GPU_NOT_FOUND.value: (
+        "対応する物理GPUを取得できませんでした"
+    ),
+    GpuCalibrationExclusionReason.AMBIGUOUS_GPU_SELECTION.value: (
+        "使用GPUを一意に特定できませんでした"
+    ),
+    GpuCalibrationExclusionReason.TARGET_PROCESS_GPU_NOT_FOUND.value: (
+        "学習プロセスが使用したGPUを確認できませんでした"
+    ),
+    GpuCalibrationExclusionReason.SELECTED_GPU_MEMORY_MISMATCH.value: (
+        "実行GPUとメモリ測定GPUが一致しません"
+    ),
+    "job_not_succeeded": "学習が正常終了しませんでした",
+    "steps_missing": "学習ステップを確認できませんでした",
+    "steps_invalid": "学習ステップが不正です",
+    "elapsed_missing": "経過時間を確認できませんでした",
+    "speed_measurement_missing": "速度を測定できませんでした",
+    "resume_offset_ambiguous": "再開位置を特定できませんでした",
+    "progress_parser_warning": "進捗を正確に解析できませんでした",
+    "gpu_environment_changed_since_recommendation": "推奨時からGPU環境が変化しました",
+}
+
+
+def _format_exclusion_reasons(reasons: tuple[str, ...]) -> str:
+    return (
+        "、".join(
+            _EXCLUSION_REASON_LABELS.get(reason, "校正対象外") for reason in reasons
+        )
+        or "なし"
     )
 
 
@@ -563,7 +605,8 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
                     f"samples: `{summary.memory_sample_count}`",
                     f"- OOM: `{summary.oom_detected}` / "
                     f"speed calibration: `{summary.usable_for_speed_calibration}`",
-                    f"- exclusion: `{', '.join(summary.exclusion_reasons) or 'none'}`",
+                    f"- 校正除外理由: "
+                    f"{_format_exclusion_reasons(summary.exclusion_reasons)}",
                 ]
             )
         except (OSError, ValueError) as exc:
@@ -581,7 +624,7 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
                 str(item.peak_reserved_vram_bytes or ""),
                 str(item.oom_detected),
                 str(item.calibration_included),
-                ", ".join(item.exclusion_reasons) or "",
+                _format_exclusion_reasons(item.exclusion_reasons),
             ]
             for item in summaries
         ]

@@ -17,8 +17,10 @@ from runpod_lora_studio.domain.recommendation_models import (
     PhysicalGpuInfo,
 )
 from runpod_lora_studio.domain.training_environment_models import (
+    SelectedGpuStatus,
     TrainingJobEnvironmentSnapshot,
     TrainingJobSelectedGpu,
+    normalize_selected_gpu_status,
 )
 from runpod_lora_studio.external.compute_environment import (
     ComputeEnvironmentAdapter,
@@ -194,7 +196,11 @@ class TrainingJobEnvironmentService:
             total_vram_bytes=physical.total_vram_bytes if physical else None,
             selected_at=selected_at,
             selection_source=selection_source,
-            status="ok" if physical else "warning",
+            status=(
+                SelectedGpuStatus.OK
+                if physical
+                else SelectedGpuStatus.PHYSICAL_GPU_NOT_FOUND
+            ),
             warning_codes=() if physical else ("PHYSICAL_GPU_NOT_FOUND",),
             last_observed_gpu_uuid_fingerprint=gpu_uuid_fingerprint,
         )
@@ -499,7 +505,7 @@ def _record_from_selected_gpu(
         total_vram_bytes=selected.total_vram_bytes,
         selected_at=selected.selected_at,
         selection_source=selected.selection_source,
-        status=selected.status,
+        status=normalize_selected_gpu_status(selected.status).value,
         warning_codes_json=json.dumps(selected.warning_codes, sort_keys=True),
         last_observed_gpu_uuid_fingerprint=selected.last_observed_gpu_uuid_fingerprint
         or selected.gpu_uuid_fingerprint,
@@ -522,7 +528,7 @@ def _selected_gpu_from_record(
         total_vram_bytes=record.total_vram_bytes,
         selected_at=record.selected_at,
         selection_source=record.selection_source,
-        status=record.status,
+        status=normalize_selected_gpu_status(record.status),
         warning_codes=_json_values(record.warning_codes_json),
         last_observed_gpu_uuid_fingerprint=record.last_observed_gpu_uuid_fingerprint,
         gpu_change_detected_at=record.gpu_change_detected_at,
@@ -558,7 +564,7 @@ def _record_selected_gpu_observation(
     if record.gpu_change_detected_at is None:
         record.gpu_change_detected_at = observed_at
     warnings = _json_values(record.warning_codes_json)
-    record.status = "changed"
+    record.status = SelectedGpuStatus.CHANGED.value
     record.warning_codes_json = json.dumps(
         sorted(set(warnings) | {"GPU_CHANGED_DURING_JOB"})
     )
