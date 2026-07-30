@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import email.utils
 import json
+import math
 import os
 import re
 import threading
@@ -11,7 +13,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from ipaddress import ip_address
 from typing import Any, Protocol
 
@@ -200,7 +202,12 @@ class SourceRateLimiter:
         self.rate_limit_count = 0
         self.backoff_active = False
 
-    def acquire(self, retry_after: float | None = None) -> None:
+    def acquire(
+        self,
+        retry_after: float | None = None,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> None:
         self._semaphore.acquire()
         try:
             now = self.clock()
@@ -213,7 +220,11 @@ class SourceRateLimiter:
                 wait = max(wait, max(0.0, retry_after))
                 self.backoff_active = retry_after > 0
             if wait:
-                self.sleeper(wait)
+                interruptible_sleep(
+                    wait,
+                    cancel_requested=cancel_requested,
+                    sleeper=self.sleeper,
+                )
             self.last_request_at = self.clock()
         except Exception:
             self._semaphore.release()
@@ -295,7 +306,7 @@ class DanbooruApiClient:
                 raise DanbooruSourceError(
                     AcquisitionErrorCode.CANCELED, "search canceled"
                 )
-            self.limiter.acquire()
+            self.limiter.acquire(cancel_requested=cancel_requested)
             try:
                 response = self.transport.get(params)
             except DanbooruSourceError as exc:
@@ -305,12 +316,20 @@ class DanbooruApiClient:
                 if not exc.retryable or attempt + 1 >= self.retry_policy.max_attempts:
                     raise
                 retries += 1
-                retry_after = exc.retry_after or self.retry_policy.delay(attempt)
+                retry_after = (
+                    exc.retry_after
+                    if exc.retry_after is not None
+                    else self.retry_policy.delay(attempt)
+                )
                 if cancel_requested and cancel_requested():
                     raise DanbooruSourceError(
                         AcquisitionErrorCode.CANCELED, "search canceled"
                     ) from exc
-                self.sleeper(retry_after)
+                interruptible_sleep(
+                    retry_after,
+                    cancel_requested=cancel_requested,
+                    sleeper=self.sleeper,
+                )
                 continue
             finally:
                 self.limiter.release()
@@ -532,13 +551,51 @@ def _parse_datetime(value: object) -> datetime | None:
         return None
 
 
-def _retry_after_seconds(value: str | None) -> float | None:
+def _retry_after_seconds(
+    value: str | None, *, now: datetime | None = None
+) -> float | None:
     if value is None:
         return None
     try:
-        return max(0.0, min(float(value), 300.0))
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            return None
+        return max(0.0, min(numeric, 300.0))
     except ValueError:
-        return None
+        try:
+            parsed = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        reference = now or datetime.now(UTC)
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=UTC)
+        seconds = (parsed.astimezone(UTC) - reference.astimezone(UTC)).total_seconds()
+        return max(0.0, min(seconds, 300.0))
+
+
+def interruptible_sleep(
+    seconds: float,
+    *,
+    cancel_requested: Callable[[], bool] | None,
+    sleeper: Callable[[float], None],
+    interval_seconds: float = 0.25,
+) -> None:
+    """Sleep in bounded chunks so cancellation does not wait for backoff expiry."""
+    if seconds < 0 or interval_seconds <= 0:
+        raise ValueError("sleep duration must be non-negative")
+    remaining = seconds
+    while remaining > 0:
+        if cancel_requested and cancel_requested():
+            raise DanbooruSourceError(AcquisitionErrorCode.CANCELED, "search canceled")
+        chunk = min(interval_seconds, remaining)
+        sleeper(chunk)
+        remaining -= chunk
+    if cancel_requested and cancel_requested():
+        raise DanbooruSourceError(AcquisitionErrorCode.CANCELED, "search canceled")
 
 
 def validate_source_url(value: str | None, *, allow_post_url: bool = False) -> bool:

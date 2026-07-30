@@ -29,13 +29,19 @@ from runpod_lora_studio.external.image_sources import (
     FakeImageSourceAdapter,
     HttpResponse,
     SourceRateLimiter,
+    _retry_after_seconds,
+    interruptible_sleep,
     normalize_danbooru_post,
 )
 from runpod_lora_studio.persistence.database import (
     create_engine_for_settings,
     create_session_factory,
 )
-from runpod_lora_studio.persistence.models import Base, ProjectRecord
+from runpod_lora_studio.persistence.models import (
+    Base,
+    ImageSourceSearchRecord,
+    ProjectRecord,
+)
 from runpod_lora_studio.services.acquisition_service import (
     AcquisitionValidationError,
     ImageAcquisitionService,
@@ -207,7 +213,59 @@ def test_retry_after_is_bounded_and_counted_once() -> None:
     assert retries == 1
     assert rate_limits == 1
     assert limiter.rate_limit_count == 1
-    assert sleeps == [2.0]
+    assert sleeps == [0.25] * 8
+
+
+def test_retry_after_accepts_seconds_and_http_date_with_bounds() -> None:
+    now = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+    assert _retry_after_seconds("12", now=now) == 12.0
+    assert _retry_after_seconds("-1", now=now) == 0.0
+    assert _retry_after_seconds("999", now=now) == 300.0
+    assert _retry_after_seconds("Thu, 30 Jul 2026 12:00:10 GMT", now=now) == 10.0
+    assert _retry_after_seconds("Thu, 30 Jul 2026 11:59:00 GMT", now=now) == 0.0
+    assert _retry_after_seconds("not-a-date", now=now) is None
+
+
+def test_interruptible_sleep_stops_before_retry_request() -> None:
+    sleeps: list[float] = []
+    canceled = False
+
+    def request_cancel() -> bool:
+        return canceled
+
+    def sleeper(seconds: float) -> None:
+        nonlocal canceled
+        sleeps.append(seconds)
+        canceled = True
+
+    with pytest.raises(DanbooruSourceError) as error:
+        interruptible_sleep(
+            10.0,
+            cancel_requested=request_cancel,
+            sleeper=sleeper,
+        )
+    assert error.value.code is AcquisitionErrorCode.CANCELED
+    assert sleeps == [0.25]
+
+
+def test_api_retry_cancellation_prevents_follow_up_request() -> None:
+    transport = _FakeTransport()
+    canceled = False
+
+    def sleeper(_: float) -> None:
+        nonlocal canceled
+        canceled = True
+
+    client = DanbooruApiClient(
+        transport,
+        limiter=SourceRateLimiter(minimum_interval_seconds=0),
+        retry_policy=DanbooruRetryPolicy(max_attempts=2),
+        sleeper=sleeper,
+    )
+    with pytest.raises(DanbooruSourceError) as error:
+        client.get_json({"tags": "solo"}, cancel_requested=lambda: canceled)
+    assert error.value.code is AcquisitionErrorCode.CANCELED
+    assert transport.calls == 1
 
 
 def test_authentication_failure_is_not_retried() -> None:
@@ -290,3 +348,90 @@ def test_search_preview_and_confirm_are_idempotent_and_revalidated(
     assert service.confirm_plan(preview) == plan_id
     with pytest.raises(AcquisitionValidationError):
         service.confirm_plan(replace(preview, plan_fingerprint="tampered"))
+
+
+def test_search_claim_is_atomic_and_old_token_cannot_update(
+    test_workspace: Path,
+) -> None:
+    settings = AppSettings(
+        workspace_root=test_workspace / "runtime",
+        projects_dir=test_workspace / "runtime" / "projects",
+        models_dir=test_workspace / "runtime" / "models",
+        outputs_dir=test_workspace / "runtime" / "outputs",
+        logs_dir=test_workspace / "runtime" / "logs",
+        temp_dir=test_workspace / "runtime" / "tmp",
+        database_path=test_workspace / "runtime" / "database" / "studio.sqlite3",
+    )
+    ensure_runtime_directories(settings)
+    engine = create_engine_for_settings(settings)
+    Base.metadata.create_all(engine)
+    project_id = uuid4()
+    now = datetime.now(UTC)
+    session_factory = create_session_factory(settings)
+    with session_factory() as session:
+        session.add(
+            ProjectRecord(
+                id=str(project_id),
+                name="claim-test",
+                description="",
+                concept_type="character",
+                trigger_words="[]",
+                status="draft",
+                schema_version=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.flush()
+        search_id = uuid4()
+        session.add(
+            ImageSourceSearchRecord(
+                id=str(search_id),
+                project_id=str(project_id),
+                source_type="danbooru",
+                normalized_query="tags=solo",
+                query_fingerprint="q" * 64,
+                query_version="test",
+                adapter_version="test",
+                status="queued",
+                requested_candidate_count=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.commit()
+    service = ImageAcquisitionService(settings, adapter=FakeImageSourceAdapter({}))
+
+    assert service._claim_search(search_id, "worker-a", "token-a")
+    assert not service._claim_search(search_id, "worker-b", "token-b")
+    with session_factory() as session:
+        record = session.scalar(
+            select(ImageSourceSearchRecord).where(
+                ImageSourceSearchRecord.id == str(search_id)
+            )
+        )
+        assert record is not None
+        assert record.worker_generation == 1
+        record.status = "stale"
+        record.worker_id = None
+        record.claim_token = None
+        session.commit()
+
+    assert service._claim_search(search_id, "worker-c", "token-c")
+    assert not service._increment_search(
+        search_id,
+        worker_id="worker-a",
+        claim_token="token-a",
+        pages=1,
+    )
+    with session_factory() as session:
+        record = session.scalar(
+            select(ImageSourceSearchRecord).where(
+                ImageSourceSearchRecord.id == str(search_id)
+            )
+        )
+        assert record is not None
+        assert record.worker_generation == 2
+        assert record.worker_id == "worker-c"
+        assert record.claim_token == "token-c"
+        assert record.page_count == 0

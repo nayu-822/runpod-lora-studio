@@ -561,7 +561,8 @@ Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は�
 
 - `ImageSourceAdapter` Protocol、Danbooruアダプター、Fake adapter、固定source registryを追加した。queryはタグ・rating・数値・拡張子を正規化し、固定query fingerprintを生成する。任意URL、任意rating文字列、制御文字、bool数値は受け付けない。
 - `ExternalImagePost`、`ImageSourceSearch`、検索結果、`ImageAcquisitionPlan`、plan item、外部postと既存ImageAssetのlinkをAlembic `0027_phase8a_image_acquisition`へ追加した。source type + external post IDとplan fingerprintにunique制約を持たせ、MD5やURL単独では同一postと判定しない。
-- Danbooru APIは固定HTTPS host、JSON content type、応答サイズ上限、redirect拒否、環境変数認証、単一workerのmonotonic rate limiter、429／408／5xx／timeoutのbounded retry、Retry-After優先、キャンセルを使用する。raw responseと認証情報は保存しない。
-- 検索はqueued/running/completed/partially_failed/failed/canceled/staleを保存し、cursor loop、ページ／request上限、重複post、worker claim、heartbeat、キャンセルを扱う。候補は`MISSING_FILE_URL`等の固定除外理由と利用可否を保存する。
-- 取得計画のpreview fingerprintには検索fingerprint、adapter version、候補メタデータを含める。confirm時にDBを再検証し、確定済みplanは不変・冪等で、画像ダウンロードは行わない。UIは外部画像を表示せず、ratingと除外理由を日本語で表示する。
+- Danbooru APIは固定HTTPS host、JSON content type、応答サイズ上限、redirect拒否、環境変数認証、単一workerのmonotonic rate limiter、429／408／5xx／timeoutのbounded retry、秒数およびHTTP-date形式のRetry-After、待機中キャンセルを使用する。raw responseと認証情報は保存しない。
+- 検索はqueued/running/completed/partially_failed/failed/canceled/staleを保存し、`0028_phase8a_claim_reservations`でworker generationとclaim tokenを追加した。claim、heartbeat、cursor、候補保存、終端更新はsearch ID・worker ID・claim tokenの条件付き更新で保護し、stale searchは保存済みcursorから再claimできる。候補は`MISSING_FILE_URL`等の固定除外理由と利用可否を保存する。
+- 候補のexternal postとsearch resultはDBの一意制約付きupsertで冪等に保存する。取得計画にはsource type + external post IDのreservationを作成し、別planとの同時確定をDBレベルで防止する。
+- 取得計画のpreview fingerprintには検索fingerprint、adapter version、plan状態、選択件数、候補メタデータを含める。confirm時にDBを再検証し、確定済みplanは不変・冪等で、画像ダウンロードは行わない。UIは外部画像を表示せず、ratingと除外理由を日本語で表示する。
 - Phase 8Bの画像取得、ファイル検証、ImageRecord登録、サムネイル、ZIP、他source、tagger／dataset／Drive連携は未実装である。

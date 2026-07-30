@@ -1714,6 +1714,8 @@ class ImageSourceSearchRecord(Base):
         Integer, nullable=False, default=False
     )
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    worker_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -1840,6 +1842,31 @@ class ImageAcquisitionPlanItemRecord(Base):
     expected_height: Mapped[int | None] = mapped_column(Integer, nullable=True)
     expected_extension: Mapped[str | None] = mapped_column(String(16), nullable=True)
     skip_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ImageAcquisitionReservationRecord(Base):
+    __tablename__ = "image_acquisition_reservations"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_type",
+            "external_post_id",
+            name="uq_image_acquisition_reservation_source_post",
+        ),
+        Index("ix_image_acquisition_reservations_plan", "plan_id"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    plan_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("image_acquisition_plans.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_post_id: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )

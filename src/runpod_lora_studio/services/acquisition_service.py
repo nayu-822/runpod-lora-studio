@@ -4,11 +4,13 @@ import json
 import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 
 from runpod_lora_studio.config.settings import AppSettings
 from runpod_lora_studio.domain.acquisition_models import (
@@ -21,6 +23,7 @@ from runpod_lora_studio.domain.acquisition_models import (
     CandidateStatus,
     DanbooruSearchCriteria,
     ImageRating,
+    ImageSearchCursor,
     ImageSearchSort,
     ImageSearchStatus,
     ImageSourcePost,
@@ -46,6 +49,7 @@ from runpod_lora_studio.persistence.models import (
     ExternalImagePostRecord,
     ImageAcquisitionPlanItemRecord,
     ImageAcquisitionPlanRecord,
+    ImageAcquisitionReservationRecord,
     ImageSourceSearchRecord,
     ImageSourceSearchResultRecord,
     ProjectRecord,
@@ -302,10 +306,11 @@ class ImageAcquisitionService:
         *,
         worker_id: str = "synchronous-search",
     ) -> None:
-        if not self._claim_search(search_id, worker_id):
+        claim_token = uuid4().hex
+        if not self._claim_search(search_id, worker_id, claim_token):
             return
         adapter = self._adapter(validated.criteria.source_type)
-        cursor = None
+        cursor = self._resume_cursor(search_id, worker_id, claim_token)
         seen_cursors: set[str] = set()
         seen_posts: set[str] = set()
         try:
@@ -323,22 +328,34 @@ class ImageAcquisitionService:
                     cursor,
                     cancel_requested=lambda: self._is_cancel_requested(search_id),
                 )
-                self._increment_search(
+                if not self._increment_search(
                     search_id,
+                    worker_id=worker_id,
+                    claim_token=claim_token,
                     returned=len(page.posts),
                     pages=1,
                     requests=page.request_count,
                     retries=page.retry_count,
                     rate_limits=page.rate_limit_count,
                     cursor=page.next_cursor.opaque_value if page.next_cursor else None,
-                )
+                ):
+                    raise DanbooruSourceError(AcquisitionErrorCode.WORKER_CLAIM_LOST)
                 if not page.posts:
                     break
                 for post in page.posts:
                     if post.external_post_id in seen_posts:
                         continue
                     seen_posts.add(post.external_post_id)
-                    self._save_candidate(search_id, post, validated)
+                    if not self._save_candidate(
+                        search_id,
+                        post,
+                        validated,
+                        worker_id=worker_id,
+                        claim_token=claim_token,
+                    ):
+                        raise DanbooruSourceError(
+                            AcquisitionErrorCode.WORKER_CLAIM_LOST
+                        )
                     if len(seen_posts) >= validated.criteria.maximum_candidate_count:
                         cursor = None
                         break
@@ -359,7 +376,12 @@ class ImageAcquisitionService:
                     raise DanbooruSourceError(
                         AcquisitionErrorCode.REQUEST_LIMIT_EXCEEDED
                     )
-            self._finish_search(search_id, ImageSearchStatus.COMPLETED)
+            self._finish_search(
+                search_id,
+                ImageSearchStatus.COMPLETED,
+                worker_id=worker_id,
+                claim_token=claim_token,
+            )
         except DanbooruSourceError as exc:
             status = (
                 ImageSearchStatus.CANCELED
@@ -368,13 +390,22 @@ class ImageAcquisitionService:
                 if self._search_returned_count(search_id) > 0
                 else ImageSearchStatus.FAILED
             )
-            self._finish_search(search_id, status, exc.code.value)
+            if exc.code is not AcquisitionErrorCode.WORKER_CLAIM_LOST:
+                self._finish_search(
+                    search_id,
+                    status,
+                    exc.code.value,
+                    worker_id=worker_id,
+                    claim_token=claim_token,
+                )
         except Exception:
             logger.exception("image_source_search_failed search_id=%s", search_id)
             self._finish_search(
                 search_id,
                 ImageSearchStatus.PARTIALLY_FAILED,
                 AcquisitionErrorCode.UNKNOWN_SOURCE_ERROR.value,
+                worker_id=worker_id,
+                claim_token=claim_token,
             )
 
     def cancel_search(self, search_id: UUID) -> None:
@@ -382,6 +413,12 @@ class ImageAcquisitionService:
             record = self._get_search_record(session, search_id)
             if record is not None:
                 record.cancellation_requested = True
+                if record.status in {
+                    ImageSearchStatus.QUEUED.value,
+                    ImageSearchStatus.STALE.value,
+                }:
+                    record.status = ImageSearchStatus.CANCELED.value
+                    record.completed_at = datetime.now(UTC)
                 record.updated_at = datetime.now(UTC)
                 session.commit()
 
@@ -389,9 +426,32 @@ class ImageAcquisitionService:
         with self.session_factory() as session:
             record = self._get_search_record(session, search_id)
             if record and self._is_stale(record):
-                record.status = ImageSearchStatus.STALE.value
-                record.updated_at = datetime.now(UTC)
+                now = datetime.now(UTC)
+                session.execute(
+                    update(ImageSourceSearchRecord)
+                    .where(
+                        ImageSourceSearchRecord.id == str(search_id),
+                        ImageSourceSearchRecord.status
+                        == ImageSearchStatus.RUNNING.value,
+                        ImageSourceSearchRecord.heartbeat_at
+                        < now
+                        - timedelta(
+                            seconds=getattr(
+                                self.settings,
+                                "image_search_stale_after_seconds",
+                                SEARCH_STALE_SECONDS,
+                            )
+                        ),
+                    )
+                    .values(
+                        status=ImageSearchStatus.STALE.value,
+                        worker_id=None,
+                        claim_token=None,
+                        updated_at=now,
+                    )
+                )
                 session.commit()
+                record = self._get_search_record(session, search_id)
             return record
 
     def list_candidates(self, search_id: UUID) -> list[SearchCandidateView]:
@@ -537,7 +597,11 @@ class ImageAcquisitionService:
                 )
             )
             if existing is not None:
-                return UUID(existing.id)
+                if existing.status != AcquisitionPlanStatus.CONFIRMED.value:
+                    raise AcquisitionValidationError("plan is not confirmable")
+                if self._existing_plan_matches(session, existing, preview):
+                    return UUID(existing.id)
+                raise AcquisitionValidationError("existing plan content changed")
             search = self._get_search_record(session, preview.search_id)
             if search is None or search.project_id != str(preview.project_id):
                 raise AcquisitionValidationError("search does not belong to project")
@@ -581,8 +645,28 @@ class ImageAcquisitionService:
                 )
                 if row is None or post is None or row.exclusion_reasons_json != "[]":
                     raise AcquisitionValidationError("plan candidate changed")
+                if row.external_post_id != item.external_post_id:
+                    raise AcquisitionValidationError("candidate post changed")
                 if post.metadata_fingerprint != item.metadata_fingerprint:
                     raise AcquisitionValidationError("candidate metadata changed")
+                if row.metadata_fingerprint_at_search != item.metadata_fingerprint:
+                    raise AcquisitionValidationError("search result metadata changed")
+                if (
+                    (fingerprint(post.file_url) if post.file_url else None)
+                    != item.file_url_fingerprint
+                    or post.source_md5 != item.source_md5
+                    or post.file_extension != item.extension
+                    or post.width != item.width
+                    or post.height != item.height
+                ):
+                    raise AcquisitionValidationError("candidate file metadata changed")
+                if (
+                    bool(row.already_imported) != item.already_imported
+                    or bool(row.already_planned) != item.already_planned
+                ):
+                    raise AcquisitionValidationError(
+                        "candidate reservation state changed"
+                    )
                 if not post.file_url or not validate_source_url(post.file_url):
                     raise AcquisitionValidationError(
                         "candidate file URL is not allowed"
@@ -618,6 +702,10 @@ class ImageAcquisitionService:
                         created_at=datetime.now(UTC),
                     )
                 )
+            if fingerprint(self._plan_fingerprint_values(search, preview.items)) != (
+                preview.plan_fingerprint
+            ):
+                raise AcquisitionValidationError("plan content changed")
             plan_id = uuid4()
             now = datetime.now(UTC)
             plan = ImageAcquisitionPlanRecord(
@@ -637,10 +725,68 @@ class ImageAcquisitionService:
                 updated_at=now,
             )
             session.add(plan)
-            session.flush()
+            try:
+                session.flush()
+            except IntegrityError as exc:
+                session.rollback()
+                concurrent = session.scalar(
+                    select(ImageAcquisitionPlanRecord).where(
+                        ImageAcquisitionPlanRecord.plan_fingerprint
+                        == preview.plan_fingerprint
+                    )
+                )
+                if (
+                    concurrent is not None
+                    and concurrent.status == (AcquisitionPlanStatus.CONFIRMED.value)
+                    and self._existing_plan_matches(session, concurrent, preview)
+                ):
+                    return UUID(concurrent.id)
+                raise AcquisitionValidationError("plan confirmation conflict") from exc
             for item in plan_items:
                 item.plan_id = str(plan_id)
                 session.add(item)
+            for item in plan_items:
+                reserved = session.execute(
+                    sqlite_insert(ImageAcquisitionReservationRecord)
+                    .values(
+                        id=str(uuid4()),
+                        plan_id=str(plan_id),
+                        source_type=search.source_type,
+                        external_post_id=item.external_post_id,
+                        created_at=now,
+                    )
+                    .on_conflict_do_nothing(
+                        index_elements=["source_type", "external_post_id"]
+                    )
+                    .returning(ImageAcquisitionReservationRecord.id)
+                ).scalar_one_or_none()
+                if reserved is None:
+                    reservation = session.scalar(
+                        select(ImageAcquisitionReservationRecord).where(
+                            ImageAcquisitionReservationRecord.source_type
+                            == search.source_type,
+                            ImageAcquisitionReservationRecord.external_post_id
+                            == item.external_post_id,
+                        )
+                    )
+                    reservation_plan_id = reservation.plan_id if reservation else None
+                    session.rollback()
+                    concurrent = (
+                        session.scalar(
+                            select(ImageAcquisitionPlanRecord).where(
+                                ImageAcquisitionPlanRecord.id == reservation_plan_id
+                            )
+                        )
+                        if reservation_plan_id is not None
+                        else None
+                    )
+                    if (
+                        concurrent is not None
+                        and concurrent.status == (AcquisitionPlanStatus.CONFIRMED.value)
+                        and self._existing_plan_matches(session, concurrent, preview)
+                    ):
+                        return UUID(concurrent.id)
+                    raise AcquisitionValidationError("candidate is already planned")
             session.commit()
             return plan_id
 
@@ -653,14 +799,17 @@ class ImageAcquisitionService:
         search: ImageSourceSearchRecord,
         items: Iterable[AcquisitionPlanPreviewItem],
     ) -> dict[str, object]:
+        materialized_items = tuple(items)
         return {
             "project_id": search.project_id,
             "search_id": search.id,
             "source_type": search.source_type,
-            "items": [asdict(item) for item in items],
+            "items": [asdict(item) for item in materialized_items],
             "query_fingerprint": search.query_fingerprint,
             "adapter_version": search.adapter_version,
-            "generator_version": PLAN_VERSION,
+            "plan_version": PLAN_VERSION,
+            "plan_status": AcquisitionPlanStatus.CONFIRMED.value,
+            "selected_count": len(materialized_items),
         }
 
     @staticmethod
@@ -672,7 +821,9 @@ class ImageAcquisitionService:
             "items": [asdict(item) for item in preview.items],
             "query_fingerprint": preview.query_fingerprint,
             "adapter_version": preview.adapter_version,
-            "generator_version": preview.generator_version,
+            "plan_version": preview.generator_version,
+            "plan_status": AcquisitionPlanStatus.CONFIRMED.value,
+            "selected_count": len(preview.items),
         }
 
     def _adapter(self, source_type: ImageSourceType) -> ImageSourceAdapter:
@@ -681,71 +832,147 @@ class ImageAcquisitionService:
         except KeyError as exc:
             raise AcquisitionValidationError("source is not enabled") from exc
 
-    def _claim_search(self, search_id: UUID, worker_id: str) -> bool:
-        with self.session_factory() as session:
-            record = self._get_search_record(session, search_id)
-            if record is None or record.status != ImageSearchStatus.QUEUED.value:
+    def _existing_plan_matches(
+        self,
+        session: Any,
+        plan: ImageAcquisitionPlanRecord,
+        preview: AcquisitionPlanPreview,
+    ) -> bool:
+        if (
+            plan.project_id != str(preview.project_id)
+            or plan.source_type != preview.source_type.value
+            or plan.source_search_id != str(preview.search_id)
+            or plan.selected_count != len(preview.items)
+            or plan.query_fingerprint != preview.query_fingerprint
+            or plan.adapter_version != preview.adapter_version
+        ):
+            return False
+        search = self._get_search_record(session, preview.search_id)
+        if search is None:
+            return False
+        stored_items = session.scalars(
+            select(ImageAcquisitionPlanItemRecord)
+            .where(ImageAcquisitionPlanItemRecord.plan_id == plan.id)
+            .order_by(ImageAcquisitionPlanItemRecord.display_order.asc())
+        ).all()
+        if len(stored_items) != len(preview.items):
+            return False
+        for stored, expected in zip(stored_items, preview.items, strict=True):
+            if (
+                stored.external_post_id != expected.external_post_id
+                or stored.search_result_id != str(expected.search_result_id)
+                or stored.expected_metadata_fingerprint != expected.metadata_fingerprint
+                or stored.expected_file_url_fingerprint != expected.file_url_fingerprint
+                or stored.expected_md5 != expected.source_md5
+                or stored.expected_extension != expected.extension
+                or stored.expected_width != expected.width
+                or stored.expected_height != expected.height
+                or expected.already_imported
+                or expected.already_planned
+            ):
                 return False
+        return bool(
+            fingerprint(self._plan_fingerprint_values(search, preview.items))
+            == plan.plan_fingerprint
+            == preview.plan_fingerprint
+        )
+
+    def _claim_search(
+        self, search_id: UUID, worker_id: str, claim_token: str | None = None
+    ) -> bool:
+        token = claim_token or uuid4().hex
+        with self.session_factory() as session:
             now = datetime.now(UTC)
-            record.status = ImageSearchStatus.RUNNING.value
-            record.worker_id = worker_id
-            record.started_at = now
-            record.heartbeat_at = now
-            record.updated_at = now
+            statement = (
+                update(ImageSourceSearchRecord)
+                .where(
+                    ImageSourceSearchRecord.id == str(search_id),
+                    ImageSourceSearchRecord.status.in_(
+                        [
+                            ImageSearchStatus.QUEUED.value,
+                            ImageSearchStatus.STALE.value,
+                        ]
+                    ),
+                    ImageSourceSearchRecord.worker_id.is_(None),
+                    ImageSourceSearchRecord.claim_token.is_(None),
+                    ImageSourceSearchRecord.cancellation_requested == False,  # noqa: E712
+                )
+                .values(
+                    status=ImageSearchStatus.RUNNING.value,
+                    worker_id=worker_id,
+                    worker_generation=ImageSourceSearchRecord.worker_generation + 1,
+                    claim_token=token,
+                    started_at=now,
+                    heartbeat_at=now,
+                    updated_at=now,
+                )
+                .returning(ImageSourceSearchRecord.id)
+            )
+            claimed_id = session.execute(statement).scalar_one_or_none()
             session.commit()
-            return True
+            return claimed_id is not None
 
     def _save_candidate(
         self,
         search_id: UUID,
         post: ImageSourcePost,
         query: ValidatedImageSearchQuery,
-    ) -> None:
+        *,
+        worker_id: str,
+        claim_token: str,
+    ) -> bool:
         with self.session_factory() as session:
-            search = self._get_search_record(session, search_id)
-            if search is None:
-                return
             now = datetime.now(UTC)
-            existing = session.scalar(
-                select(ExternalImagePostRecord).where(
-                    ExternalImagePostRecord.source_type == post.source_type.value,
-                    ExternalImagePostRecord.external_post_id == post.external_post_id,
+            metadata = _metadata_fingerprint(post)
+            claim = self._touch_claim(session, search_id, worker_id, claim_token, now)
+            if not claim:
+                session.rollback()
+                return False
+            values = {
+                "id": str(uuid4()),
+                "source_type": post.source_type.value,
+                "external_post_id": post.external_post_id,
+                "post_url": post.post_url,
+                "file_url": post.file_url,
+                "preview_url": post.preview_url,
+                "sample_url": post.sample_url,
+                "width": post.width,
+                "height": post.height,
+                "file_size": post.file_size,
+                "file_extension": post.file_extension,
+                "rating": post.rating.value if post.rating else None,
+                "score": post.score,
+                "source_md5": post.source_md5,
+                "normalized_tags_json": json.dumps(post.tag_names, sort_keys=True),
+                "metadata_fingerprint": metadata,
+                "source_metadata_json": json.dumps(
+                    post.source_metadata, sort_keys=True
+                ),
+                "is_deleted": post.is_deleted,
+                "is_pending": post.is_pending,
+                "is_flagged": post.is_flagged,
+                "first_seen_at": now,
+                "last_seen_at": now,
+                "created_at": now,
+                "updated_at": now,
+            }
+            post_update_values = dict(values)
+            post_update_values.pop("id")
+            post_update_values.pop("first_seen_at")
+            post_update_values.pop("created_at")
+            post_update_values["last_seen_at"] = now
+            session.execute(
+                sqlite_insert(ExternalImagePostRecord)
+                .values(**values)
+                .on_conflict_do_update(
+                    index_elements=["source_type", "external_post_id"],
+                    set_=post_update_values,
                 )
             )
-            metadata = _metadata_fingerprint(post)
-            if existing is None:
-                existing = ExternalImagePostRecord(
-                    id=str(uuid4()),
-                    source_type=post.source_type.value,
-                    external_post_id=post.external_post_id,
-                    post_url=post.post_url,
-                    file_url=post.file_url,
-                    preview_url=post.preview_url,
-                    sample_url=post.sample_url,
-                    width=post.width,
-                    height=post.height,
-                    file_size=post.file_size,
-                    file_extension=post.file_extension,
-                    rating=post.rating.value if post.rating else None,
-                    score=post.score,
-                    source_md5=post.source_md5,
-                    normalized_tags_json=json.dumps(post.tag_names, sort_keys=True),
-                    metadata_fingerprint=metadata,
-                    source_metadata_json=json.dumps(
-                        post.source_metadata, sort_keys=True
-                    ),
-                    is_deleted=post.is_deleted,
-                    is_pending=post.is_pending,
-                    is_flagged=post.is_flagged,
-                    first_seen_at=now,
-                    last_seen_at=now,
-                    created_at=now,
-                    updated_at=now,
-                )
-                session.add(existing)
-            else:
-                for key, value in _external_post_values(post, metadata, now).items():
-                    setattr(existing, key, value)
+            search = self._get_search_record(session, search_id)
+            if search is None:
+                session.rollback()
+                return False
             imported = self._already_imported(
                 session, post.source_type.value, post.external_post_id
             )
@@ -755,64 +982,147 @@ class ImageAcquisitionService:
             reasons = filter_source_post(
                 post, query, already_imported=imported, already_planned=planned
             )
-            result = ImageSourceSearchResultRecord(
-                id=str(uuid4()),
-                search_id=str(search_id),
-                external_post_id=post.external_post_id,
-                result_order=search.returned_post_count,
-                candidate_status=(
+            result_values = {
+                "id": str(uuid4()),
+                "search_id": str(search_id),
+                "external_post_id": post.external_post_id,
+                "result_order": search.returned_post_count,
+                "candidate_status": (
                     CandidateStatus.ACCEPTED
                     if not reasons
                     else CandidateStatus.EXCLUDED
                 ).value,
-                exclusion_reasons_json=json.dumps(
+                "exclusion_reasons_json": json.dumps(
                     [reason.value for reason in reasons], sort_keys=True
                 ),
-                already_imported=imported,
-                already_planned=planned,
-                selected=False,
-                metadata_fingerprint_at_search=metadata,
-                created_at=now,
-                updated_at=now,
-            )
-            session.add(result)
-            search.returned_post_count += 1
-            search.accepted_candidate_count += int(not reasons)
-            search.excluded_candidate_count += int(bool(reasons))
+                "already_imported": imported,
+                "already_planned": planned,
+                "selected": False,
+                "metadata_fingerprint_at_search": metadata,
+                "created_at": now,
+                "updated_at": now,
+            }
+            inserted_id = session.execute(
+                sqlite_insert(ImageSourceSearchResultRecord)
+                .values(**result_values)
+                .on_conflict_do_nothing(
+                    index_elements=["search_id", "external_post_id"]
+                )
+                .returning(ImageSourceSearchResultRecord.id)
+            ).scalar_one_or_none()
+            if inserted_id is not None:
+                search.returned_post_count += 1
+                search.accepted_candidate_count += int(not reasons)
+                search.excluded_candidate_count += int(bool(reasons))
             search.heartbeat_at = now
             search.updated_at = now
             session.commit()
+            return True
 
-    def _increment_search(self, search_id: UUID, **values: object) -> None:
+    def _increment_search(self, search_id: UUID, **values: object) -> bool:
         with self.session_factory() as session:
-            record = self._get_search_record(session, search_id)
-            if record is None:
-                return
-            record.page_count += _integer_value(values.get("pages", 0))
-            record.api_request_count += _integer_value(values.get("requests", 0))
-            record.retry_count += _integer_value(values.get("retries", 0))
-            record.rate_limit_count += _integer_value(values.get("rate_limits", 0))
-            record.current_cursor = (
-                values.get("cursor") if isinstance(values.get("cursor"), str) else None
+            worker_id = values.pop("worker_id", None)
+            claim_token = values.pop("claim_token", None)
+            if not isinstance(worker_id, str) or not isinstance(claim_token, str):
+                return False
+            now = datetime.now(UTC)
+            statement = (
+                update(ImageSourceSearchRecord)
+                .where(
+                    ImageSourceSearchRecord.id == str(search_id),
+                    ImageSourceSearchRecord.status == ImageSearchStatus.RUNNING.value,
+                    ImageSourceSearchRecord.worker_id == worker_id,
+                    ImageSourceSearchRecord.claim_token == claim_token,
+                )
+                .values(
+                    page_count=ImageSourceSearchRecord.page_count
+                    + _integer_value(values.get("pages", 0)),
+                    api_request_count=ImageSourceSearchRecord.api_request_count
+                    + _integer_value(values.get("requests", 0)),
+                    retry_count=ImageSourceSearchRecord.retry_count
+                    + _integer_value(values.get("retries", 0)),
+                    rate_limit_count=ImageSourceSearchRecord.rate_limit_count
+                    + _integer_value(values.get("rate_limits", 0)),
+                    current_cursor=(
+                        values.get("cursor")
+                        if isinstance(values.get("cursor"), str)
+                        else None
+                    ),
+                    heartbeat_at=now,
+                    updated_at=now,
+                )
+                .returning(ImageSourceSearchRecord.id)
             )
-            record.heartbeat_at = datetime.now(UTC)
-            record.updated_at = datetime.now(UTC)
+            updated_id = session.execute(statement).scalar_one_or_none()
             session.commit()
+            return updated_id is not None
 
     def _finish_search(
-        self, search_id: UUID, status: ImageSearchStatus, error_code: str | None = None
+        self,
+        search_id: UUID,
+        status: ImageSearchStatus,
+        error_code: str | None = None,
+        *,
+        worker_id: str,
+        claim_token: str,
     ) -> None:
         with self.session_factory() as session:
-            record = self._get_search_record(session, search_id)
-            if record is None:
-                return
             now = datetime.now(UTC)
-            record.status = status.value
-            record.error_code = error_code
-            record.completed_at = now
-            record.heartbeat_at = now
-            record.updated_at = now
+            session.execute(
+                update(ImageSourceSearchRecord)
+                .where(
+                    ImageSourceSearchRecord.id == str(search_id),
+                    ImageSourceSearchRecord.status == ImageSearchStatus.RUNNING.value,
+                    ImageSourceSearchRecord.worker_id == worker_id,
+                    ImageSourceSearchRecord.claim_token == claim_token,
+                )
+                .values(
+                    status=status.value,
+                    error_code=error_code,
+                    completed_at=now,
+                    heartbeat_at=now,
+                    updated_at=now,
+                    worker_id=None,
+                    claim_token=None,
+                )
+            )
             session.commit()
+
+    def _touch_claim(
+        self,
+        session: Any,
+        search_id: UUID,
+        worker_id: str,
+        claim_token: str,
+        now: datetime,
+    ) -> bool:
+        statement = (
+            update(ImageSourceSearchRecord)
+            .where(
+                ImageSourceSearchRecord.id == str(search_id),
+                ImageSourceSearchRecord.status == ImageSearchStatus.RUNNING.value,
+                ImageSourceSearchRecord.worker_id == worker_id,
+                ImageSourceSearchRecord.claim_token == claim_token,
+            )
+            .values(heartbeat_at=now, updated_at=now)
+            .returning(ImageSourceSearchRecord.id)
+        )
+        return session.execute(statement).scalar_one_or_none() is not None
+
+    def _resume_cursor(
+        self, search_id: UUID, worker_id: str, claim_token: str
+    ) -> ImageSearchCursor | None:
+        with self.session_factory() as session:
+            record = self._get_search_record(session, search_id)
+            if (
+                record is None
+                or record.worker_id != worker_id
+                or record.claim_token != claim_token
+            ):
+                return None
+            if record.current_cursor is None:
+                return None
+            return ImageSearchCursor(record.current_cursor)
 
     def _is_cancel_requested(self, search_id: UUID) -> bool:
         with self.session_factory() as session:
@@ -889,12 +1199,16 @@ class ImageAcquisitionService:
     def _already_planned(session: Any, source_type: str, external_post_id: str) -> bool:
         return bool(
             session.scalar(
-                select(ImageAcquisitionPlanItemRecord.id)
-                .join(
-                    ImageAcquisitionPlanRecord,
-                    ImageAcquisitionPlanRecord.id
-                    == ImageAcquisitionPlanItemRecord.plan_id,
+                select(ImageAcquisitionReservationRecord.id).where(
+                    ImageAcquisitionReservationRecord.source_type == source_type,
+                    ImageAcquisitionReservationRecord.external_post_id
+                    == external_post_id,
                 )
+            )
+            is not None
+            or session.scalar(
+                select(ImageAcquisitionPlanItemRecord.id)
+                .join(ImageAcquisitionPlanRecord)
                 .where(
                     ImageAcquisitionPlanRecord.source_type == source_type,
                     ImageAcquisitionPlanRecord.status

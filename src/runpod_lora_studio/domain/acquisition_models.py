@@ -68,6 +68,7 @@ class AcquisitionErrorCode(StrEnum):
     SOURCE_UNAVAILABLE = "SOURCE_UNAVAILABLE"
     CANCELED = "CANCELED"
     UNKNOWN_SOURCE_ERROR = "UNKNOWN_SOURCE_ERROR"
+    WORKER_CLAIM_LOST = "WORKER_CLAIM_LOST"
 
 
 class CandidateExclusionReason(StrEnum):

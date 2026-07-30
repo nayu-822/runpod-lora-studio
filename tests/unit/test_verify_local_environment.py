@@ -145,7 +145,7 @@ def test_migration_check_requires_current_to_equal_head(test_workspace: Path) ->
     check = _check_migration(settings)
 
     assert check.ok
-    assert "current=0027_phase8a_image_acquisition" in check.detail
+    assert "current=0028_phase8a_claim_reservations" in check.detail
 
 
 def test_migration_check_rejects_unmigrated_database(test_workspace: Path) -> None:

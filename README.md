@@ -283,7 +283,7 @@ Phase 5では、rcloneを介してGoogle Driveのモデルを一覧表示し、R
 
 「画像取得」タブでは、必須／除外タグ、rating、スコア、解像度、拡張子、候補数を検証してDanbooruの公開メタデータAPIを検索できます。検索結果はsource typeと外部post IDをキーにSQLiteへ保存し、既存画像・既存計画・URL・拡張子・rating・解像度をローカルで再確認します。除外理由は候補ごとに固定コードで保持し、UIでは日本語で表示します。
 
-Phase 8Aは画像本体をダウンロードせず、外部画像を初期表示せず、確定時も不変の取得計画だけを保存します。API通信は固定HTTPSエンドポイント、応答サイズ上限、JSON schema確認、1ワーカーのレート制限、429等の限定的な指数バックオフ、キャンセルを使用します。認証が必要な場合は`DANBOORU_LOGIN`と`DANBOORU_API_KEY`を環境変数へ設定します。これらはDB、ログ、UI、fingerprintへ保存しません。
+Phase 8Aは画像本体をダウンロードせず、外部画像を初期表示せず、確定時も不変の取得計画だけを保存します。API通信は固定HTTPSエンドポイント、応答サイズ上限、JSON schema確認、1ワーカーのレート制限、429等の限定的な指数バックオフ、秒数またはHTTP-date形式のRetry-After、待機中キャンセルを使用します。認証が必要な場合は`DANBOORU_LOGIN`と`DANBOORU_API_KEY`を環境変数へ設定します。これらはDB、ログ、UI、fingerprintへ保存しません。検索workerのclaimはDBの条件付き更新とclaim tokenで保護され、stale searchはcursorから安全に再claimされます。取得計画のexternal post reservationにより、同じpostを複数のplanへ同時確定しません。
 
 検索結果の確認と計画確定の間にメタデータや重複状態が変わった場合は確定を拒否します。確定済み計画はfingerprintで冪等に再取得できます。画像ファイルの取得、`.part`、magic bytes／SHA検証、ImageRecord登録、サムネイル生成、ZIP化はPhase 8B以降の対象です。
 ## Phase 6A: SDXL LoRA学習ジョブ基盤

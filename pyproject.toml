@@ -74,6 +74,10 @@ ignore_missing_imports = true
 module = ["torch"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["imagehash"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
