@@ -10,6 +10,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      RUNPOD_LORA_STUDIO_WORKSPACE_ROOT: ${{ runner.temp }}/runpod-lora-studio
+      RUNPOD_LORA_STUDIO_PROJECTS_DIR: ${{ runner.temp }}/runpod-lora-studio/projects
+      RUNPOD_LORA_STUDIO_MODELS_DIR: ${{ runner.temp }}/runpod-lora-studio/models
+      RUNPOD_LORA_STUDIO_OUTPUTS_DIR: ${{ runner.temp }}/runpod-lora-studio/outputs
+      RUNPOD_LORA_STUDIO_LOGS_DIR: ${{ runner.temp }}/runpod-lora-studio/logs
+      RUNPOD_LORA_STUDIO_TEMP_DIR: ${{ runner.temp }}/runpod-lora-studio/tmp
+      RUNPOD_LORA_STUDIO_DATABASE_PATH: ${{ runner.temp }}/runpod-lora-studio/database/ldts.sqlite3
 
     steps:
       - name: Checkout

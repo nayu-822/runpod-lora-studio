@@ -8,7 +8,18 @@ from pydantic import SecretStr, ValidationError
 from runpod_lora_studio.config.settings import AppSettings, ensure_runtime_directories
 
 
-def test_settings_defaults() -> None:
+def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "RUNPOD_LORA_STUDIO_WORKSPACE_ROOT",
+        "RUNPOD_LORA_STUDIO_PROJECTS_DIR",
+        "RUNPOD_LORA_STUDIO_MODELS_DIR",
+        "RUNPOD_LORA_STUDIO_OUTPUTS_DIR",
+        "RUNPOD_LORA_STUDIO_LOGS_DIR",
+        "RUNPOD_LORA_STUDIO_TEMP_DIR",
+        "RUNPOD_LORA_STUDIO_DATABASE_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
     settings = AppSettings()
 
     assert settings.app_title == "RunPod LoRA Studio"
