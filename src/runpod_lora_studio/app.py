@@ -12,6 +12,9 @@ from runpod_lora_studio.config.settings import (
 )
 from runpod_lora_studio.environment import EnvironmentReport, collect_environment_report
 from runpod_lora_studio.logging.config import configure_logging
+from runpod_lora_studio.services.acquisition_download_service import (
+    ImageAcquisitionDownloadService,
+)
 from runpod_lora_studio.services.acquisition_service import ImageAcquisitionService
 from runpod_lora_studio.services.dataset_snapshot_service import DatasetSnapshotService
 from runpod_lora_studio.services.image_service import ImageService
@@ -97,11 +100,15 @@ def create_app(
     storage = StorageService(runtime_settings, datasets=datasets)
     training = TrainingService(runtime_settings)
     acquisition = ImageAcquisitionService(runtime_settings)
+    acquisition_download = ImageAcquisitionDownloadService(
+        runtime_settings, projects=projects
+    )
     datasets.recover_finalized_snapshots()
     datasets.recover_stale()
     storage.recover_stale_jobs()
     training.reconcile_stale_jobs()
     training.reconcile_progress()
+    acquisition_download.recover_stale_jobs()
     path_rows = build_paths_dataframe(runtime_settings)
 
     with gr.Blocks(title=runtime_settings.app_title) as demo:
@@ -130,7 +137,7 @@ def create_app(
         with gr.Tab("画像"):
             build_image_tab(images, selected_project, project_table, image_refresh)
         with gr.Tab("画像取得"):
-            build_acquisition_tab(acquisition, selected_project)
+            build_acquisition_tab(acquisition, selected_project, acquisition_download)
         with gr.Tab("近似重複"):
             build_similarity_tab(similarity, selected_project, image_refresh)
         with gr.Tab("タグ付け・キャプション"):

@@ -701,6 +701,7 @@ class ImageAcquisitionService:
                         expected_width=post.width,
                         expected_height=post.height,
                         expected_extension=post.file_extension,
+                        expected_file_size=post.file_size,
                         created_at=datetime.now(UTC),
                     )
                 )

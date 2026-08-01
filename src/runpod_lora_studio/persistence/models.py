@@ -1878,6 +1878,7 @@ class ImageAcquisitionPlanItemRecord(Base):
     expected_width: Mapped[int | None] = mapped_column(Integer, nullable=True)
     expected_height: Mapped[int | None] = mapped_column(Integer, nullable=True)
     expected_extension: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    expected_file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     skip_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
@@ -1917,7 +1918,6 @@ class ExternalImageAssetLinkRecord(Base):
             "external_post_id",
             name="uq_external_image_asset_source_post",
         ),
-        UniqueConstraint("image_asset_id", "source_type", name="uq_image_asset_source"),
     )
 
     internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -1925,8 +1925,203 @@ class ExternalImageAssetLinkRecord(Base):
     image_asset_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("image_assets.id", ondelete="CASCADE"), nullable=False
     )
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
     external_post_id: Mapped[str] = mapped_column(String(32), nullable=False)
     source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_md5: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source_metadata_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    acquisition_plan_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("image_acquisition_plans.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    acquisition_job_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("image_acquisition_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    acquisition_job_item_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("image_acquisition_job_items.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    linked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ImageAcquisitionJobRecord(Base):
+    __tablename__ = "image_acquisition_jobs"
+    __table_args__ = (
+        UniqueConstraint("active_key", name="uq_image_acquisition_job_active_key"),
+        Index("ix_image_acquisition_jobs_project", "project_id", "created_at"),
+        Index("ix_image_acquisition_jobs_plan", "plan_id", "created_at"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    plan_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("image_acquisition_plans.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    plan_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    active_key: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    worker_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cancellation_requested: Mapped[bool] = mapped_column(
+        Integer, nullable=False, default=False
+    )
+    requested_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pending_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    downloading_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    downloaded_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    validated_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    imported_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    linked_existing_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    skipped_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    received_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    expected_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    current_item_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    manifest_relative_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    manifest_warning: Mapped[str | None] = mapped_column(Text, nullable=True)
+    downloader_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    validator_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    importer_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    job_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ImageAcquisitionJobItemRecord(Base):
+    __tablename__ = "image_acquisition_job_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "plan_item_id", name="uq_image_acquisition_job_item_plan"
+        ),
+        Index("ix_image_acquisition_job_items_job", "job_id", "display_order"),
+        Index("ix_image_acquisition_job_items_job_status", "job_id", "status"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    job_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("image_acquisition_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    plan_item_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("image_acquisition_plan_items.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_post_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    expected_metadata_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    expected_file_url_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    expected_md5: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    expected_width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expected_height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expected_extension: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    expected_file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expected_file_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    received_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    part_relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    etag: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    last_modified: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    accept_ranges: Mapped[bool] = mapped_column(Integer, nullable=False, default=False)
+    range_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    calculated_md5: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    calculated_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    detected_format: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    detected_mime_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    detected_width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    detected_height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    detected_file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    image_asset_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("image_assets.id", ondelete="SET NULL"), nullable=True
+    )
+    failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    failure_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retryable: Mapped[bool] = mapped_column(Integer, nullable=False, default=False)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ImageAcquisitionAttemptRecord(Base):
+    __tablename__ = "image_acquisition_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_item_id", "attempt_number", name="uq_image_acquisition_attempt_number"
+        ),
+        Index("ix_image_acquisition_attempts_item", "job_item_id", "attempt_number"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    job_item_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("image_acquisition_job_items.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    retryable: Mapped[bool] = mapped_column(Integer, nullable=False, default=False)
+    received_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )

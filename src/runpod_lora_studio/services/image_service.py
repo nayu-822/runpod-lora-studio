@@ -4,14 +4,13 @@ import hashlib
 import logging
 import os
 import shutil
-import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from PIL import Image, ImageFile, ImageOps
+from PIL import ImageFile
 
 from runpod_lora_studio.config.settings import AppSettings
 from runpod_lora_studio.domain.models import ImageAsset, SelectionState
@@ -19,6 +18,10 @@ from runpod_lora_studio.persistence.database import create_session_factory
 from runpod_lora_studio.persistence.repositories import (
     ImageRepository,
     ProjectRepository,
+)
+from runpod_lora_studio.services.image_ingestion_service import (
+    ImageVerificationError,
+    VerifiedImageIngestionService,
 )
 from runpod_lora_studio.services.project_service import ProjectService, UserFacingError
 
@@ -51,6 +54,7 @@ class ImageService:
         self.settings = settings
         self.projects = projects or ProjectService(settings)
         self.session_factory = create_session_factory(settings)
+        self._ingestion = VerifiedImageIngestionService(settings, self.projects)
 
     def register_uploads(
         self, project_id: UUID, uploads: Iterable[str | Path]
@@ -162,25 +166,14 @@ class ImageService:
 
     def _inspect_image(self, path: Path) -> tuple[str, int, int]:
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(path) as image:
-                    image.verify()
-                with Image.open(path) as image:
-                    image_format = (image.format or "").upper()
-                    width, height = image.size
-                    if width * height > self.settings.max_image_pixels:
-                        raise UserFacingError("画像のピクセル数上限を超えています。")
-                    image.load()
-        except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
-            raise UserFacingError("画像のピクセル数上限を超えています。") from exc
-        except UserFacingError:
-            raise
-        except Exception as exc:
-            raise UserFacingError("画像を読み込めないか、破損しています。") from exc
-        if image_format not in {"JPEG", "PNG", "WEBP"}:
-            raise UserFacingError("対応形式はJPEG、PNG、WebPです。")
-        return image_format, width, height
+            verified = self._ingestion.inspect_image(path)
+        except ImageVerificationError as exc:
+            if exc.code == "IMAGE_PIXEL_LIMIT_EXCEEDED":
+                raise UserFacingError("画像のピクセル数上限を超えています。") from exc
+            if exc.code == "UNSUPPORTED_IMAGE_TYPE":
+                raise UserFacingError("対応形式はJPEG、PNG、WebPです。") from exc
+            raise UserFacingError("画像が破損しています。") from exc
+        return verified.detected_format, verified.width, verified.height
 
     @staticmethod
     def _format_details(image_format: str) -> tuple[str, str]:
@@ -192,19 +185,10 @@ class ImageService:
         return values[image_format]
 
     def _create_thumbnail(self, source: Path, destination: Path) -> None:
-        temporary = self.settings.temp_dir / f"{uuid4()}.thumbnail"
         try:
-            with Image.open(source) as image:
-                image = ImageOps.exif_transpose(image)
-                image.thumbnail(
-                    (self.settings.thumbnail_size, self.settings.thumbnail_size)
-                )
-                if image.mode not in {"RGB", "RGBA"}:
-                    image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
-                image.save(temporary, format="PNG")
-            os.replace(temporary, destination)
-        except Exception as exc:
-            self._cleanup_paths((temporary,))
+            self._ingestion.create_thumbnail(source, destination)
+        except ImageVerificationError as exc:
+            self._cleanup_paths((destination,))
             raise UserFacingError("サムネイル生成に失敗しました。") from exc
 
     def list_images(

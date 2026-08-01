@@ -185,6 +185,37 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     image_search_max_requests: int = Field(default=200, ge=1, le=20_000)
     image_search_stale_after_seconds: float = Field(default=300.0, gt=0.0)
 
+    # Phase 8B verified image download defaults. The worker always streams to
+    # a UUID-named project staging file and never exposes the source URL.
+    image_download_connect_timeout_seconds: float = Field(
+        default=10.0, gt=0.0, le=300.0
+    )
+    image_download_read_timeout_seconds: float = Field(default=60.0, gt=0.0, le=1800.0)
+    image_download_max_header_bytes: int = Field(
+        default=64 * 1024, ge=1024, le=4 * 1024 * 1024
+    )
+    image_download_max_redirects: int = Field(default=3, ge=0, le=8)
+    image_download_chunk_size: int = Field(
+        default=256 * 1024, ge=1024, le=4 * 1024 * 1024
+    )
+    image_download_max_file_size_bytes: int = Field(default=50 * 1024 * 1024, ge=1)
+    image_download_unknown_size_limit_bytes: int = Field(default=50 * 1024 * 1024, ge=1)
+    image_download_retry_max_attempts: int = Field(default=4, ge=1, le=8)
+    image_download_retry_base_backoff_seconds: float = Field(
+        default=1.0, ge=0.0, le=60.0
+    )
+    image_download_retry_max_backoff_seconds: float = Field(
+        default=30.0, ge=0.0, le=600.0
+    )
+    image_download_heartbeat_interval_seconds: float = Field(
+        default=2.0, gt=0.1, le=60.0
+    )
+    image_download_stale_after_seconds: float = Field(default=300.0, gt=0.0)
+    image_download_disk_safety_margin_bytes: int = Field(
+        default=256 * 1024 * 1024, ge=0
+    )
+    image_download_generator_version: str = "phase8b-worker-v1"
+
     runpod_pod_id: str | None = Field(default=None, validation_alias="RUNPOD_POD_ID")
     # Tokens and credentials added later must use SecretStr and repr=False as well.
     runpod_api_key: SecretStr | None = Field(

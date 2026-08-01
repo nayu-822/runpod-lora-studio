@@ -1,0 +1,1882 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shutil
+import threading
+import time
+from collections.abc import Callable, Iterable, Mapping
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, cast
+from uuid import UUID, uuid4
+
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError, OperationalError
+
+from runpod_lora_studio.config.settings import AppSettings
+from runpod_lora_studio.domain.acquisition_download_models import (
+    AcquisitionItemView,
+    AcquisitionJobView,
+    DownloadFailureCode,
+    ImageAcquisitionItemStatus,
+    ImageAcquisitionJobStatus,
+    ImageSourceProvenance,
+    VerifiedImageFile,
+)
+from runpod_lora_studio.domain.acquisition_models import (
+    ImageSourcePost,
+    ImageSourceType,
+    fingerprint,
+)
+from runpod_lora_studio.external.image_download import (
+    DOWNLOAD_TRANSPORT_VERSION,
+    DownloadRequest,
+    DownloadResponse,
+    DownloadTransport,
+    DownloadTransportError,
+    HttpImageDownloadTransport,
+    validate_download_url,
+)
+from runpod_lora_studio.external.image_sources import (
+    DanbooruApiClient,
+    DanbooruHttpTransport,
+    DanbooruImageSourceAdapter,
+    DanbooruSourceError,
+    ImageSourceAdapter,
+    SourceRateLimiter,
+    interruptible_sleep,
+)
+from runpod_lora_studio.persistence.database import create_session_factory
+from runpod_lora_studio.persistence.models import (
+    ExternalImageAssetLinkRecord,
+    ImageAcquisitionAttemptRecord,
+    ImageAcquisitionJobItemRecord,
+    ImageAcquisitionJobRecord,
+    ImageAcquisitionPlanItemRecord,
+    ImageAcquisitionPlanRecord,
+)
+from runpod_lora_studio.services.image_ingestion_service import (
+    IMPORTER_VERSION,
+    VALIDATOR_VERSION,
+    ImageVerificationError,
+    VerifiedImageIngestionService,
+)
+from runpod_lora_studio.services.project_service import ProjectService
+
+logger = logging.getLogger("runpod_lora_studio.acquisition_download")
+CONTENT_RANGE_RE = re.compile(r"^bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)$")
+RETRYABLE_CODES = frozenset(
+    {
+        DownloadFailureCode.AUTHENTICATION_FAILED,
+        DownloadFailureCode.RATE_LIMITED,
+        DownloadFailureCode.REQUEST_TIMEOUT,
+        DownloadFailureCode.CONNECTION_FAILED,
+        DownloadFailureCode.SOURCE_POST_UNAVAILABLE,
+    }
+)
+PERMANENT_CODES = frozenset(
+    {
+        DownloadFailureCode.PLAN_NOT_CONFIRMED,
+        DownloadFailureCode.PLAN_METADATA_CHANGED,
+        DownloadFailureCode.SOURCE_POST_NOT_FOUND,
+        DownloadFailureCode.SOURCE_METADATA_CHANGED,
+        DownloadFailureCode.FILE_URL_MISSING,
+        DownloadFailureCode.FILE_URL_NOT_ALLOWED,
+        DownloadFailureCode.REDIRECT_NOT_ALLOWED,
+        DownloadFailureCode.PERMISSION_DENIED,
+        DownloadFailureCode.RETRY_EXHAUSTED,
+        DownloadFailureCode.CONTENT_LENGTH_INVALID,
+        DownloadFailureCode.FILE_TOO_LARGE,
+        DownloadFailureCode.RECEIVED_SIZE_MISMATCH,
+        DownloadFailureCode.EMPTY_FILE,
+        DownloadFailureCode.RANGE_NOT_SUPPORTED,
+        DownloadFailureCode.CONTENT_RANGE_INVALID,
+        DownloadFailureCode.REMOTE_FILE_CHANGED,
+        DownloadFailureCode.SOURCE_MD5_INVALID,
+        DownloadFailureCode.SOURCE_MD5_MISMATCH,
+        DownloadFailureCode.UNSUPPORTED_IMAGE_TYPE,
+        DownloadFailureCode.IMAGE_FORMAT_MISMATCH,
+        DownloadFailureCode.IMAGE_DIMENSION_MISMATCH,
+        DownloadFailureCode.IMAGE_PIXEL_LIMIT_EXCEEDED,
+        DownloadFailureCode.IMAGE_CORRUPTED,
+        DownloadFailureCode.INSUFFICIENT_STORAGE,
+        DownloadFailureCode.STAGING_PATH_INVALID,
+        DownloadFailureCode.DUPLICATE_SOURCE_CONFLICT,
+    }
+)
+
+
+class AcquisitionDownloadError(ValueError):
+    def __init__(self, code: DownloadFailureCode, message: str | None = None) -> None:
+        super().__init__(message or code.value)
+        self.code = code
+
+
+class _Canceled(Exception):
+    pass
+
+
+class _ClaimLost(Exception):
+    pass
+
+
+class _RetryableDownload(Exception):
+    def __init__(
+        self, code: DownloadFailureCode, retry_after: float | None = None
+    ) -> None:
+        self.code = code
+        self.retry_after = retry_after
+
+
+class ImageAcquisitionDownloadService:
+    """Run confirmed acquisition plans as restartable, claimed workers."""
+
+    def __init__(
+        self,
+        settings: AppSettings,
+        *,
+        projects: ProjectService | None = None,
+        adapter: ImageSourceAdapter | None = None,
+        adapters: Mapping[ImageSourceType, ImageSourceAdapter] | None = None,
+        transport: DownloadTransport | None = None,
+        ingestion: VerifiedImageIngestionService | None = None,
+        disk_usage: Callable[[str], Any] = shutil.disk_usage,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+        auto_start: bool = True,
+    ) -> None:
+        self.settings = settings
+        self.projects = projects or ProjectService(settings)
+        self.session_factory = create_session_factory(settings)
+        self.ingestion = ingestion or VerifiedImageIngestionService(
+            settings, self.projects
+        )
+        self.disk_usage = disk_usage
+        self.clock = clock
+        self.sleeper = sleeper
+        self.auto_start = auto_start
+        self._adapters = dict(adapters or {})
+        if adapter is not None:
+            self._adapters[ImageSourceType.DANBOORU] = adapter
+        if ImageSourceType.DANBOORU not in self._adapters:
+            metadata_transport = DanbooruHttpTransport(
+                connect_timeout_seconds=settings.image_search_connect_timeout_seconds,
+                read_timeout_seconds=settings.image_search_read_timeout_seconds,
+                max_response_bytes=settings.image_search_max_response_bytes,
+            )
+            self._adapters[ImageSourceType.DANBOORU] = DanbooruImageSourceAdapter(
+                client=DanbooruApiClient(
+                    metadata_transport,
+                    limiter=SourceRateLimiter(
+                        minimum_interval_seconds=settings.image_search_min_interval_seconds
+                    ),
+                )
+            )
+        self.transport = transport or HttpImageDownloadTransport(
+            connect_timeout_seconds=settings.image_download_connect_timeout_seconds,
+            read_timeout_seconds=settings.image_download_read_timeout_seconds,
+            max_header_bytes=settings.image_download_max_header_bytes,
+            max_redirects=settings.image_download_max_redirects,
+        )
+
+    def start_job(self, plan_id: UUID, *, auto_start: bool | None = None) -> UUID:
+        existing = self._active_or_finished_job(plan_id)
+        if existing is not None:
+            if auto_start is not False and existing.status in {
+                ImageAcquisitionJobStatus.QUEUED.value,
+                ImageAcquisitionJobStatus.STALE.value,
+            }:
+                self._start_thread(UUID(existing.id))
+            return UUID(existing.id)
+        plan, items = self._load_confirmed_plan(plan_id)
+        fresh_posts = self._revalidate_plan(plan, items)
+        job_id = uuid4()
+        now = datetime.now(UTC)
+        expected_bytes = sum(item.expected_file_size or 0 for item in items) or None
+        job = ImageAcquisitionJobRecord(
+            id=str(job_id),
+            project_id=plan.project_id,
+            plan_id=plan.id,
+            plan_fingerprint=plan.plan_fingerprint,
+            source_type=plan.source_type,
+            status=ImageAcquisitionJobStatus.QUEUED.value,
+            active_key=plan.id,
+            requested_count=len(items),
+            pending_count=len(items),
+            expected_bytes=expected_bytes,
+            downloader_version=DOWNLOAD_TRANSPORT_VERSION,
+            validator_version=VALIDATOR_VERSION,
+            importer_version=IMPORTER_VERSION,
+            job_fingerprint=fingerprint(
+                {"plan": plan.plan_fingerprint, "version": "phase8b"}
+            ),
+            created_at=now,
+            updated_at=now,
+        )
+        with self.session_factory() as session:
+            session.add(job)
+            session.flush()
+            for order, item in enumerate(items):
+                item_id = str(uuid4())
+                session.add(
+                    ImageAcquisitionJobItemRecord(
+                        id=item_id,
+                        job_id=str(job_id),
+                        plan_item_id=item.id,
+                        source_type=plan.source_type,
+                        external_post_id=item.external_post_id,
+                        display_order=order,
+                        status=ImageAcquisitionItemStatus.PENDING.value,
+                        expected_metadata_fingerprint=item.expected_metadata_fingerprint,
+                        expected_file_url_fingerprint=item.expected_file_url_fingerprint,
+                        expected_md5=item.expected_md5,
+                        expected_width=item.expected_width,
+                        expected_height=item.expected_height,
+                        expected_extension=item.expected_extension,
+                        expected_file_size=item.expected_file_size,
+                        expected_file_url=fresh_posts[item.external_post_id].file_url,
+                        part_relative_path=f"acquisition/jobs/{job_id}/parts/{item_id}.part",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                concurrent = self._active_or_finished_job(plan_id)
+                if concurrent is not None:
+                    return UUID(concurrent.id)
+                raise AcquisitionDownloadError(
+                    DownloadFailureCode.DUPLICATE_SOURCE_CONFLICT
+                ) from exc
+        if auto_start is not False and self.auto_start:
+            self._start_thread(job_id)
+        return job_id
+
+    def resume_job(self, job_id: UUID, *, auto_start: bool | None = None) -> UUID:
+        with self.session_factory() as session:
+            job = session.scalar(
+                select(ImageAcquisitionJobRecord).where(
+                    ImageAcquisitionJobRecord.id == str(job_id)
+                )
+            )
+            if job is None:
+                raise AcquisitionDownloadError(
+                    DownloadFailureCode.SOURCE_POST_NOT_FOUND
+                )
+            if job.status not in {
+                ImageAcquisitionJobStatus.STALE.value,
+                ImageAcquisitionJobStatus.CANCELED.value,
+                ImageAcquisitionJobStatus.PARTIALLY_COMPLETED.value,
+                ImageAcquisitionJobStatus.FAILED.value,
+            }:
+                return job_id
+            now = datetime.now(UTC)
+            existing_items = session.scalars(
+                select(ImageAcquisitionJobItemRecord).where(
+                    ImageAcquisitionJobItemRecord.job_id == str(job_id)
+                )
+            ).all()
+            if not any(
+                item.status
+                not in {
+                    ImageAcquisitionItemStatus.IMPORTED.value,
+                    ImageAcquisitionItemStatus.LINKED_EXISTING.value,
+                    ImageAcquisitionItemStatus.SKIPPED.value,
+                }
+                and (
+                    item.status != ImageAcquisitionItemStatus.FAILED.value
+                    or item.retryable
+                )
+                for item in existing_items
+            ):
+                return job_id
+            job.status = ImageAcquisitionJobStatus.QUEUED.value
+            job.cancellation_requested = False
+            job.worker_id = None
+            job.claim_token = None
+            job.error_code = None
+            job.error_summary = None
+            job.completed_at = None
+            job.updated_at = now
+            for item in session.scalars(
+                select(ImageAcquisitionJobItemRecord).where(
+                    ImageAcquisitionJobItemRecord.job_id == str(job_id)
+                )
+            ).all():
+                if item.status in {
+                    ImageAcquisitionItemStatus.IMPORTED.value,
+                    ImageAcquisitionItemStatus.LINKED_EXISTING.value,
+                    ImageAcquisitionItemStatus.SKIPPED.value,
+                }:
+                    continue
+                if (
+                    item.status == ImageAcquisitionItemStatus.FAILED.value
+                    and not item.retryable
+                ):
+                    continue
+                item.status = ImageAcquisitionItemStatus.PENDING.value
+                item.failure_code = None
+                item.failure_message = None
+                item.updated_at = now
+            job.active_key = job.plan_id
+            session.commit()
+        if auto_start is not False and self.auto_start:
+            self._start_thread(job_id)
+        return job_id
+
+    retry_job = resume_job
+
+    def cancel_job(self, job_id: UUID) -> None:
+        with self.session_factory() as session:
+            job = session.scalar(
+                select(ImageAcquisitionJobRecord).where(
+                    ImageAcquisitionJobRecord.id == str(job_id)
+                )
+            )
+            if job is None:
+                return
+            job.cancellation_requested = True
+            if job.status in {
+                ImageAcquisitionJobStatus.QUEUED.value,
+                ImageAcquisitionJobStatus.STALE.value,
+            }:
+                job.status = ImageAcquisitionJobStatus.CANCELED.value
+                job.completed_at = datetime.now(UTC)
+                job.active_key = None
+                job.worker_id = None
+                job.claim_token = None
+            job.updated_at = datetime.now(UTC)
+            session.commit()
+
+    def recover_stale_jobs(self) -> int:
+        threshold = datetime.now(UTC) - timedelta(
+            seconds=self.settings.image_download_stale_after_seconds
+        )
+        try:
+            with self.session_factory() as session:
+                rows = session.scalars(
+                    select(ImageAcquisitionJobRecord).where(
+                        ImageAcquisitionJobRecord.status
+                        == ImageAcquisitionJobStatus.RUNNING.value,
+                        ImageAcquisitionJobRecord.heartbeat_at < threshold,
+                    )
+                ).all()
+                now = datetime.now(UTC)
+                for job in rows:
+                    job.status = ImageAcquisitionJobStatus.STALE.value
+                    job.worker_id = None
+                    job.claim_token = None
+                    job.current_item_id = None
+                    job.updated_at = now
+                    for item in session.scalars(
+                        select(ImageAcquisitionJobItemRecord).where(
+                            ImageAcquisitionJobItemRecord.job_id == job.id
+                        )
+                    ).all():
+                        if item.status == ImageAcquisitionItemStatus.DOWNLOADING.value:
+                            item.status = ImageAcquisitionItemStatus.PENDING.value
+                            item.updated_at = now
+                session.commit()
+                return len(rows)
+        except OperationalError as exc:
+            if "no such table: image_acquisition_jobs" not in str(exc):
+                raise
+            logger.warning("acquisition_jobs_table_not_migrated")
+            return 0
+
+    def run_job(self, job_id: UUID, *, worker_id: str | None = None) -> None:
+        worker = worker_id or f"acquisition-worker-{uuid4().hex[:12]}"
+        token = uuid4().hex
+        generation = self._claim_job(job_id, worker, token)
+        if generation is None:
+            return
+        try:
+            self._run_claimed_job(job_id, worker, token, generation)
+        except _ClaimLost:
+            logger.warning("acquisition_worker_claim_lost job_id=%s", job_id)
+        except Exception:
+            logger.exception("acquisition_worker_failed job_id=%s", job_id)
+            self._finish_job(
+                job_id,
+                worker,
+                token,
+                ImageAcquisitionJobStatus.FAILED,
+                DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR,
+            )
+
+    def _start_thread(self, job_id: UUID) -> None:
+        threading.Thread(
+            target=self.run_job,
+            args=(job_id,),
+            kwargs={"worker_id": f"acquisition-worker-{uuid4().hex[:12]}"},
+            daemon=True,
+        ).start()
+
+    def get_job(self, job_id: UUID) -> AcquisitionJobView | None:
+        self.recover_stale_jobs()
+        with self.session_factory() as session:
+            job = session.scalar(
+                select(ImageAcquisitionJobRecord).where(
+                    ImageAcquisitionJobRecord.id == str(job_id)
+                )
+            )
+            return _job_view(job) if job else None
+
+    def list_items(self, job_id: UUID) -> list[AcquisitionItemView]:
+        with self.session_factory() as session:
+            rows = session.scalars(
+                select(ImageAcquisitionJobItemRecord)
+                .where(ImageAcquisitionJobItemRecord.job_id == str(job_id))
+                .order_by(ImageAcquisitionJobItemRecord.display_order.asc())
+            ).all()
+            return [_item_view(row) for row in rows]
+
+    def run_job_sync(self, job_id: UUID) -> None:
+        self.run_job(job_id, worker_id="acquisition-test-worker")
+
+    def _run_claimed_job(
+        self, job_id: UUID, worker: str, token: str, generation: int
+    ) -> None:
+        plan, plan_items = self._load_confirmed_plan(job_id, by_job=True)
+        try:
+            self._revalidate_plan(plan, plan_items)
+        except AcquisitionDownloadError as exc:
+            self._fail_all_unfinished(job_id, worker, token, exc.code)
+            self._finish_job(
+                job_id, worker, token, ImageAcquisitionJobStatus.FAILED, exc.code
+            )
+            return
+        while True:
+            item_id = self._next_item(job_id)
+            if item_id is None:
+                break
+            if self._is_cancel_requested(job_id):
+                self._finish_job(
+                    job_id,
+                    worker,
+                    token,
+                    ImageAcquisitionJobStatus.CANCELED,
+                    DownloadFailureCode.CANCELED,
+                )
+                return
+            if not self._claim_item(job_id, item_id, worker, token, generation):
+                raise _ClaimLost()
+            try:
+                self._process_item(job_id, item_id, plan, worker, token)
+            except _Canceled:
+                self._set_item_failure(
+                    job_id,
+                    item_id,
+                    worker,
+                    token,
+                    DownloadFailureCode.CANCELED,
+                    False,
+                    canceled=True,
+                )
+                self._finish_job(
+                    job_id,
+                    worker,
+                    token,
+                    ImageAcquisitionJobStatus.CANCELED,
+                    DownloadFailureCode.CANCELED,
+                )
+                return
+            except _ClaimLost:
+                raise
+            except Exception:
+                logger.exception("acquisition_item_failed job_id=%s", job_id)
+                self._set_item_failure(
+                    job_id,
+                    item_id,
+                    worker,
+                    token,
+                    DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR,
+                    False,
+                )
+        status = self._job_terminal_status(job_id)
+        self._write_manifest(job_id, worker, token, status)
+        self._finish_job(job_id, worker, token, status, None)
+
+    def _process_item(
+        self,
+        job_id: UUID,
+        item_id: str,
+        plan: ImageAcquisitionPlanRecord,
+        worker: str,
+        token: str,
+    ) -> None:
+        with self.session_factory() as session:
+            item = session.scalar(
+                select(ImageAcquisitionJobItemRecord).where(
+                    ImageAcquisitionJobItemRecord.id == item_id
+                )
+            )
+            plan_item = (
+                session.scalar(
+                    select(ImageAcquisitionPlanItemRecord).where(
+                        ImageAcquisitionPlanItemRecord.id == item.plan_item_id
+                    )
+                )
+                if item
+                else None
+            )
+            if item is None or plan_item is None:
+                raise _ClaimLost()
+            source_type = ImageSourceType(item.source_type)
+            external_post_id = item.external_post_id
+        adapter = self._adapter(source_type)
+        try:
+            post = adapter.get_post(external_post_id)
+        except DanbooruSourceError as exc:
+            code = _source_failure(exc)
+            attempt = self._item_attempt_count(item_id)
+            if attempt >= self.settings.image_download_retry_max_attempts:
+                self._set_item_failure(
+                    job_id,
+                    item_id,
+                    worker,
+                    token,
+                    DownloadFailureCode.RETRY_EXHAUSTED,
+                    False,
+                )
+            else:
+                self._conditional_item_update(
+                    job_id,
+                    item_id,
+                    worker,
+                    token,
+                    attempt_count=attempt + 1,
+                    status=ImageAcquisitionItemStatus.FAILED.value,
+                    failure_code=code.value,
+                    retryable=True,
+                    updated_at=datetime.now(UTC),
+                )
+            return
+        if post is None:
+            self._set_item_failure(
+                job_id,
+                item_id,
+                worker,
+                token,
+                DownloadFailureCode.SOURCE_POST_NOT_FOUND,
+                False,
+            )
+            return
+        if not self._matches_plan_item(item_id, post):
+            self._set_item_failure(
+                job_id,
+                item_id,
+                worker,
+                token,
+                DownloadFailureCode.SOURCE_METADATA_CHANGED,
+                False,
+            )
+            self._remove_part(job_id, item_id)
+            return
+        if self._source_link_exists(post.source_type.value, post.external_post_id):
+            self._mark_linked_existing(job_id, item_id, worker, token)
+            return
+        if not post.file_url:
+            self._set_item_failure(
+                job_id,
+                item_id,
+                worker,
+                token,
+                DownloadFailureCode.FILE_URL_MISSING,
+                False,
+            )
+            return
+        if not validate_download_url(post.file_url):
+            self._set_item_failure(
+                job_id,
+                item_id,
+                worker,
+                token,
+                DownloadFailureCode.FILE_URL_NOT_ALLOWED,
+                False,
+            )
+            return
+        try:
+            self._check_storage(job_id, item_id, post.file_size)
+        except AcquisitionDownloadError as exc:
+            self._set_item_failure(job_id, item_id, worker, token, exc.code, False)
+            return
+        max_attempts = self.settings.image_download_retry_max_attempts
+        for attempt in range(1, max_attempts + 1):
+            self._set_attempt_started(job_id, item_id, worker, token, attempt)
+            try:
+                verified = self._download_and_validate(
+                    job_id, item_id, post, worker, token
+                )
+                try:
+                    self._import_item(
+                        job_id, item_id, plan, post, verified, worker, token
+                    )
+                except OSError as exc:
+                    raise AcquisitionDownloadError(
+                        DownloadFailureCode.IMPORT_FAILED
+                    ) from exc
+                return
+            except _Canceled:
+                raise
+            except _ClaimLost:
+                raise
+            except _RetryableDownload as exc:
+                if attempt >= max_attempts:
+                    self._set_item_failure(
+                        job_id,
+                        item_id,
+                        worker,
+                        token,
+                        DownloadFailureCode.RETRY_EXHAUSTED,
+                        False,
+                    )
+                    return
+                self._record_attempt_failure(
+                    job_id, item_id, worker, token, attempt, exc.code, True
+                )
+                self._retry_backoff(exc.retry_after, attempt, job_id)
+            except ImageVerificationError as exc:
+                code = _failure_code(exc.code)
+                self._set_item_failure(job_id, item_id, worker, token, code, False)
+                self._remove_part(job_id, item_id)
+                return
+            except DownloadTransportError as exc:
+                if exc.code in RETRYABLE_CODES:
+                    if attempt >= max_attempts:
+                        self._set_item_failure(
+                            job_id,
+                            item_id,
+                            worker,
+                            token,
+                            DownloadFailureCode.RETRY_EXHAUSTED,
+                            False,
+                        )
+                        return
+                    self._record_attempt_failure(
+                        job_id, item_id, worker, token, attempt, exc.code, True
+                    )
+                    self._retry_backoff(exc.retry_after, attempt, job_id)
+                    continue
+                self._set_item_failure(job_id, item_id, worker, token, exc.code, False)
+                self._remove_part(job_id, item_id)
+                return
+            except AcquisitionDownloadError as exc:
+                self._set_item_failure(job_id, item_id, worker, token, exc.code, False)
+                self._remove_part(job_id, item_id)
+                return
+            except OSError:
+                if attempt >= max_attempts:
+                    self._set_item_failure(
+                        job_id,
+                        item_id,
+                        worker,
+                        token,
+                        DownloadFailureCode.DISK_FULL_DURING_DOWNLOAD,
+                        False,
+                    )
+                    return
+                self._record_attempt_failure(
+                    job_id,
+                    item_id,
+                    worker,
+                    token,
+                    attempt,
+                    DownloadFailureCode.CONNECTION_FAILED,
+                    True,
+                )
+                self._retry_backoff(None, attempt, job_id)
+            except Exception:
+                self._set_item_failure(
+                    job_id,
+                    item_id,
+                    worker,
+                    token,
+                    DownloadFailureCode.IMPORT_FAILED,
+                    False,
+                )
+                return
+
+    def _download_and_validate(
+        self, job_id: UUID, item_id: str, post: ImageSourcePost, worker: str, token: str
+    ) -> VerifiedImageFile:
+        path, item = self._item_path(job_id, item_id)
+        self._set_item_status(
+            job_id, item_id, worker, token, ImageAcquisitionItemStatus.DOWNLOADING
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        resume_start = self._resume_start(path, item, post)
+        request = DownloadRequest(
+            post.file_url or "",
+            range_start=resume_start,
+            etag=item.etag,
+            last_modified=item.last_modified,
+        )
+        response = self.transport.open(request)
+        actual_start = resume_start
+        if resume_start is not None and response.status == 200:
+            actual_start = None
+            self._truncate_part(path)
+        elif resume_start is not None and response.status == 206:
+            self._validate_range_response(response, resume_start, item)
+        elif response.status == 416 and resume_start is not None:
+            response.close()
+            self._truncate_part(path)
+            return self._download_and_validate(job_id, item_id, post, worker, token)
+        elif response.status != 200:
+            response.close()
+            raise DownloadTransportError(
+                _status_failure(response.status), status=response.status
+            )
+        headers = _normalized_headers(response.headers)
+        length = _parse_content_length(headers.get("content-length"))
+        if headers.get("content-length") is not None and length is None:
+            response.close()
+            raise AcquisitionDownloadError(DownloadFailureCode.CONTENT_LENGTH_INVALID)
+        expected_size = post.file_size
+        if (
+            length is not None
+            and length > self.settings.image_download_max_file_size_bytes
+        ):
+            response.close()
+            raise AcquisitionDownloadError(DownloadFailureCode.FILE_TOO_LARGE)
+        if (
+            actual_start is None
+            and expected_size is not None
+            and length is not None
+            and length != expected_size
+        ):
+            response.close()
+            raise AcquisitionDownloadError(DownloadFailureCode.RECEIVED_SIZE_MISMATCH)
+        if (
+            actual_start is not None
+            and expected_size is not None
+            and length is not None
+            and length != expected_size - actual_start
+        ):
+            response.close()
+            raise AcquisitionDownloadError(DownloadFailureCode.CONTENT_RANGE_INVALID)
+        mode = "ab" if actual_start is not None else "wb"
+        received = path.stat().st_size if mode == "ab" and path.exists() else 0
+        self._update_response_metadata(
+            job_id, item_id, worker, token, headers, received, actual_start
+        )
+        try:
+            with path.open(mode) as handle:
+                for chunk in response.iter_chunks(
+                    self.settings.image_download_chunk_size
+                ):
+                    self._check_cancel_or_claim(job_id, worker, token)
+                    if not isinstance(chunk, bytes) or not chunk:
+                        continue
+                    received += len(chunk)
+                    if received > self.settings.image_download_max_file_size_bytes:
+                        raise AcquisitionDownloadError(
+                            DownloadFailureCode.FILE_TOO_LARGE
+                        )
+                    try:
+                        handle.write(chunk)
+                        handle.flush()
+                    except OSError as exc:
+                        raise OSError("staging write failed") from exc
+                    self._update_received(job_id, item_id, worker, token, received)
+                os.fsync(handle.fileno())
+        except _Canceled:
+            raise
+        except _ClaimLost:
+            raise
+        except DownloadTransportError:
+            raise
+        except OSError as exc:
+            raise OSError("download stream interrupted") from exc
+        finally:
+            response.close()
+        if received <= 0:
+            raise AcquisitionDownloadError(DownloadFailureCode.EMPTY_FILE)
+        if expected_size is not None and received != expected_size:
+            raise AcquisitionDownloadError(DownloadFailureCode.RECEIVED_SIZE_MISMATCH)
+        self._set_item_status(
+            job_id, item_id, worker, token, ImageAcquisitionItemStatus.DOWNLOADED
+        )
+        self._set_item_status(
+            job_id, item_id, worker, token, ImageAcquisitionItemStatus.VALIDATING
+        )
+        verified = self.ingestion.inspect_image(
+            path,
+            expected_md5=post.source_md5,
+            expected_file_size=expected_size,
+            expected_width=post.width,
+            expected_height=post.height,
+            expected_extension=post.file_extension,
+        )
+        self._set_verified(job_id, item_id, worker, token, verified)
+        return verified
+
+    def _import_item(
+        self,
+        job_id: UUID,
+        item_id: str,
+        plan: ImageAcquisitionPlanRecord,
+        post: ImageSourcePost,
+        verified: VerifiedImageFile,
+        worker: str,
+        token: str,
+    ) -> None:
+        self._set_item_status(
+            job_id, item_id, worker, token, ImageAcquisitionItemStatus.IMPORTING
+        )
+        provenance = ImageSourceProvenance(
+            source_type=post.source_type,
+            external_post_id=post.external_post_id,
+            source_post_url=post.post_url,
+            source_md5=post.source_md5,
+            source_metadata_fingerprint=_post_metadata_fingerprint(post),
+            acquisition_plan_id=UUID(plan.id),
+            acquisition_job_id=job_id,
+            acquisition_job_item_id=UUID(item_id),
+        )
+        result = self.ingestion.import_verified(
+            UUID(plan.project_id), verified, provenance
+        )
+        status = (
+            ImageAcquisitionItemStatus.LINKED_EXISTING
+            if result.linked_existing
+            else ImageAcquisitionItemStatus.IMPORTED
+        )
+        self._set_item_complete(job_id, item_id, worker, token, status, result.image.id)
+        self._remove_part(job_id, item_id)
+
+    def _revalidate_plan(
+        self,
+        plan: ImageAcquisitionPlanRecord,
+        items: Iterable[ImageAcquisitionPlanItemRecord],
+    ) -> dict[str, ImageSourcePost]:
+        if plan.status != "confirmed":
+            raise AcquisitionDownloadError(DownloadFailureCode.PLAN_NOT_CONFIRMED)
+        adapter = self._adapter(ImageSourceType(plan.source_type))
+        fresh_posts: dict[str, ImageSourcePost] = {}
+        for item in items:
+            try:
+                post = adapter.get_post(item.external_post_id)
+            except DanbooruSourceError as exc:
+                raise AcquisitionDownloadError(_source_failure(exc)) from exc
+            if post is None:
+                raise AcquisitionDownloadError(
+                    DownloadFailureCode.SOURCE_POST_NOT_FOUND
+                )
+            if not self._item_matches_values(item, post):
+                raise AcquisitionDownloadError(
+                    DownloadFailureCode.PLAN_METADATA_CHANGED
+                )
+            if post.file_url is None:
+                raise AcquisitionDownloadError(DownloadFailureCode.FILE_URL_MISSING)
+            if not validate_download_url(post.file_url):
+                raise AcquisitionDownloadError(DownloadFailureCode.FILE_URL_NOT_ALLOWED)
+            fresh_posts[item.external_post_id] = post
+        return fresh_posts
+
+    def _load_confirmed_plan(
+        self, plan_id: UUID, *, by_job: bool = False
+    ) -> tuple[ImageAcquisitionPlanRecord, list[ImageAcquisitionPlanItemRecord]]:
+        with self.session_factory() as session:
+            if by_job:
+                job = session.scalar(
+                    select(ImageAcquisitionJobRecord).where(
+                        ImageAcquisitionJobRecord.id == str(plan_id)
+                    )
+                )
+                if job is None:
+                    raise AcquisitionDownloadError(
+                        DownloadFailureCode.PLAN_NOT_CONFIRMED
+                    )
+                actual_plan_id = job.plan_id
+            else:
+                actual_plan_id = str(plan_id)
+            plan = session.scalar(
+                select(ImageAcquisitionPlanRecord).where(
+                    ImageAcquisitionPlanRecord.id == actual_plan_id
+                )
+            )
+            if plan is None or plan.status != "confirmed":
+                raise AcquisitionDownloadError(DownloadFailureCode.PLAN_NOT_CONFIRMED)
+            items = session.scalars(
+                select(ImageAcquisitionPlanItemRecord)
+                .where(
+                    ImageAcquisitionPlanItemRecord.plan_id == plan.id,
+                    ImageAcquisitionPlanItemRecord.planned_status == "planned",
+                )
+                .order_by(ImageAcquisitionPlanItemRecord.display_order.asc())
+            ).all()
+            return plan, items
+
+    def _adapter(self, source_type: ImageSourceType) -> ImageSourceAdapter:
+        try:
+            return self._adapters[source_type]
+        except KeyError as exc:
+            raise AcquisitionDownloadError(
+                DownloadFailureCode.SOURCE_POST_UNAVAILABLE
+            ) from exc
+
+    def _active_or_finished_job(
+        self, plan_id: UUID
+    ) -> ImageAcquisitionJobRecord | None:
+        with self.session_factory() as session:
+            result = session.scalar(
+                select(ImageAcquisitionJobRecord)
+                .where(
+                    ImageAcquisitionJobRecord.plan_id == str(plan_id),
+                    ImageAcquisitionJobRecord.status.in_(
+                        [
+                            status.value
+                            for status in ImageAcquisitionJobStatus
+                            if status != ImageAcquisitionJobStatus.FAILED
+                        ]
+                    ),
+                )
+                .order_by(ImageAcquisitionJobRecord.created_at.desc())
+            )
+            return cast(ImageAcquisitionJobRecord | None, result)
+
+    def _claim_job(self, job_id: UUID, worker: str, token: str) -> int | None:
+        with self.session_factory() as session:
+            now = datetime.now(UTC)
+            result = session.execute(
+                update(ImageAcquisitionJobRecord)
+                .where(
+                    ImageAcquisitionJobRecord.id == str(job_id),
+                    ImageAcquisitionJobRecord.status.in_(
+                        [
+                            ImageAcquisitionJobStatus.QUEUED.value,
+                            ImageAcquisitionJobStatus.STALE.value,
+                        ]
+                    ),
+                    ImageAcquisitionJobRecord.cancellation_requested == False,  # noqa: E712
+                    ImageAcquisitionJobRecord.worker_id.is_(None),
+                    ImageAcquisitionJobRecord.claim_token.is_(None),
+                )
+                .values(
+                    status=ImageAcquisitionJobStatus.RUNNING.value,
+                    worker_id=worker,
+                    claim_token=token,
+                    worker_generation=ImageAcquisitionJobRecord.worker_generation + 1,
+                    heartbeat_at=now,
+                    started_at=now,
+                    updated_at=now,
+                )
+                .returning(ImageAcquisitionJobRecord.worker_generation)
+            ).scalar_one_or_none()
+            session.commit()
+            return int(result) if result is not None else None
+
+    def _claim_item(
+        self, job_id: UUID, item_id: str, worker: str, token: str, generation: int
+    ) -> bool:
+        with self.session_factory() as session:
+            result = session.execute(
+                update(ImageAcquisitionJobItemRecord)
+                .where(
+                    ImageAcquisitionJobItemRecord.id == item_id,
+                    ImageAcquisitionJobItemRecord.job_id == str(job_id),
+                    ImageAcquisitionJobItemRecord.status.in_(
+                        [
+                            ImageAcquisitionItemStatus.PENDING.value,
+                            ImageAcquisitionItemStatus.FAILED.value,
+                        ]
+                    ),
+                    ImageAcquisitionJobItemRecord.retryable.in_([True, False]),
+                    select(ImageAcquisitionJobRecord.id)
+                    .where(
+                        ImageAcquisitionJobRecord.id == str(job_id),
+                        ImageAcquisitionJobRecord.status
+                        == ImageAcquisitionJobStatus.RUNNING.value,
+                        ImageAcquisitionJobRecord.worker_id == worker,
+                        ImageAcquisitionJobRecord.claim_token == token,
+                        ImageAcquisitionJobRecord.worker_generation == generation,
+                    )
+                    .exists(),
+                )
+                .values(
+                    status=ImageAcquisitionItemStatus.DOWNLOADING.value,
+                    started_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                )
+                .returning(ImageAcquisitionJobItemRecord.id)
+            ).scalar_one_or_none()
+            if result is not None:
+                session.execute(
+                    update(ImageAcquisitionJobRecord)
+                    .where(
+                        ImageAcquisitionJobRecord.id == str(job_id),
+                        ImageAcquisitionJobRecord.status
+                        == ImageAcquisitionJobStatus.RUNNING.value,
+                        ImageAcquisitionJobRecord.worker_id == worker,
+                        ImageAcquisitionJobRecord.claim_token == token,
+                        ImageAcquisitionJobRecord.worker_generation == generation,
+                    )
+                    .values(current_item_id=item_id, updated_at=datetime.now(UTC))
+                )
+            session.commit()
+            return result is not None
+
+    def _next_item(self, job_id: UUID) -> str | None:
+        with self.session_factory() as session:
+            item = session.scalar(
+                select(ImageAcquisitionJobItemRecord)
+                .where(
+                    ImageAcquisitionJobItemRecord.job_id == str(job_id),
+                    ImageAcquisitionJobItemRecord.status.in_(
+                        [
+                            ImageAcquisitionItemStatus.PENDING.value,
+                            ImageAcquisitionItemStatus.FAILED.value,
+                        ]
+                    ),
+                    (
+                        ImageAcquisitionJobItemRecord.status
+                        == ImageAcquisitionItemStatus.PENDING.value
+                    )
+                    | (ImageAcquisitionJobItemRecord.retryable == True),  # noqa: E712
+                )
+                .order_by(ImageAcquisitionJobItemRecord.display_order.asc())
+            )
+            return item.id if item else None
+
+    def _check_cancel_or_claim(self, job_id: UUID, worker: str, token: str) -> None:
+        with self.session_factory() as session:
+            job = session.scalar(
+                select(ImageAcquisitionJobRecord).where(
+                    ImageAcquisitionJobRecord.id == str(job_id),
+                    ImageAcquisitionJobRecord.status
+                    == ImageAcquisitionJobStatus.RUNNING.value,
+                    ImageAcquisitionJobRecord.worker_id == worker,
+                    ImageAcquisitionJobRecord.claim_token == token,
+                )
+            )
+            if job is None:
+                raise _ClaimLost()
+            if job.cancellation_requested:
+                raise _Canceled()
+
+    def _set_item_status(
+        self,
+        job_id: UUID,
+        item_id: str,
+        worker: str,
+        token: str,
+        status: ImageAcquisitionItemStatus,
+    ) -> None:
+        self._conditional_item_update(
+            job_id,
+            item_id,
+            worker,
+            token,
+            status=status.value,
+            updated_at=datetime.now(UTC),
+        )
+
+    def _set_item_complete(
+        self,
+        job_id: UUID,
+        item_id: str,
+        worker: str,
+        token: str,
+        status: ImageAcquisitionItemStatus,
+        image_id: UUID,
+    ) -> None:
+        self._conditional_item_update(
+            job_id,
+            item_id,
+            worker,
+            token,
+            status=status.value,
+            image_asset_id=str(image_id),
+            completed_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            failure_code=None,
+            retryable=False,
+        )
+
+    def _set_verified(
+        self,
+        job_id: UUID,
+        item_id: str,
+        worker: str,
+        token: str,
+        verified: VerifiedImageFile,
+    ) -> None:
+        self._conditional_item_update(
+            job_id,
+            item_id,
+            worker,
+            token,
+            status=ImageAcquisitionItemStatus.VALIDATED.value,
+            calculated_md5=verified.md5,
+            calculated_sha256=verified.sha256,
+            detected_format=verified.detected_format,
+            detected_mime_type=verified.mime_type,
+            detected_width=verified.width,
+            detected_height=verified.height,
+            detected_file_size=verified.file_size,
+            updated_at=datetime.now(UTC),
+        )
+
+    def _conditional_item_update(
+        self, job_id: UUID, item_id: str, worker: str, token: str, **values: Any
+    ) -> None:
+        with self.session_factory() as session:
+            result = session.execute(
+                update(ImageAcquisitionJobItemRecord)
+                .where(
+                    ImageAcquisitionJobItemRecord.id == item_id,
+                    ImageAcquisitionJobItemRecord.job_id == str(job_id),
+                    select(ImageAcquisitionJobRecord.id)
+                    .where(
+                        ImageAcquisitionJobRecord.id == str(job_id),
+                        ImageAcquisitionJobRecord.status
+                        == ImageAcquisitionJobStatus.RUNNING.value,
+                        ImageAcquisitionJobRecord.worker_id == worker,
+                        ImageAcquisitionJobRecord.claim_token == token,
+                    )
+                    .exists(),
+                )
+                .values(**values)
+                .returning(ImageAcquisitionJobItemRecord.id)
+            ).scalar_one_or_none()
+            session.commit()
+            if result is None:
+                raise _ClaimLost()
+        self._recompute_counts(job_id, worker, token)
+
+    def _update_received(
+        self, job_id: UUID, item_id: str, worker: str, token: str, received: int
+    ) -> None:
+        self._conditional_item_update(
+            job_id,
+            item_id,
+            worker,
+            token,
+            received_bytes=received,
+            updated_at=datetime.now(UTC),
+        )
+        with self.session_factory() as session:
+            session.execute(
+                update(ImageAcquisitionJobRecord)
+                .where(
+                    ImageAcquisitionJobRecord.id == str(job_id),
+                    ImageAcquisitionJobRecord.worker_id == worker,
+                    ImageAcquisitionJobRecord.claim_token == token,
+                )
+                .values(heartbeat_at=datetime.now(UTC), updated_at=datetime.now(UTC))
+            )
+            session.commit()
+
+    def _update_response_metadata(
+        self,
+        job_id: UUID,
+        item_id: str,
+        worker: str,
+        token: str,
+        headers: Mapping[str, str],
+        received: int,
+        range_start: int | None,
+    ) -> None:
+        self._conditional_item_update(
+            job_id,
+            item_id,
+            worker,
+            token,
+            etag=headers.get("etag"),
+            last_modified=headers.get("last-modified"),
+            accept_ranges=headers.get("accept-ranges", "").lower() == "bytes",
+            range_start=range_start,
+            received_bytes=received,
+            updated_at=datetime.now(UTC),
+        )
+
+    def _set_attempt_started(
+        self, job_id: UUID, item_id: str, worker: str, token: str, attempt: int
+    ) -> None:
+        self._conditional_item_update(
+            job_id,
+            item_id,
+            worker,
+            token,
+            attempt_count=attempt,
+            updated_at=datetime.now(UTC),
+        )
+        with self.session_factory() as session:
+            session.add(
+                ImageAcquisitionAttemptRecord(
+                    id=str(uuid4()),
+                    job_item_id=item_id,
+                    attempt_number=attempt,
+                    status="running",
+                    started_at=datetime.now(UTC),
+                    created_at=datetime.now(UTC),
+                )
+            )
+            session.commit()
+
+    def _record_attempt_failure(
+        self,
+        job_id: UUID,
+        item_id: str,
+        worker: str,
+        token: str,
+        attempt: int,
+        code: DownloadFailureCode,
+        retryable: bool,
+    ) -> None:
+        self._conditional_item_update(
+            job_id,
+            item_id,
+            worker,
+            token,
+            failure_code=code.value,
+            retryable=retryable,
+            retry_count=ImageAcquisitionJobItemRecord.retry_count + 1,
+            updated_at=datetime.now(UTC),
+        )
+        with self.session_factory() as session:
+            row = session.scalar(
+                select(ImageAcquisitionAttemptRecord).where(
+                    ImageAcquisitionAttemptRecord.job_item_id == item_id,
+                    ImageAcquisitionAttemptRecord.attempt_number == attempt,
+                )
+            )
+            if row:
+                row.status = "failed"
+                row.failure_code = code.value
+                row.retryable = retryable
+                row.completed_at = datetime.now(UTC)
+                session.commit()
+
+    def _retry_item(
+        self,
+        job_id: UUID,
+        item_id: str,
+        worker: str,
+        token: str,
+        code: DownloadFailureCode,
+    ) -> None:
+        self._set_item_failure(job_id, item_id, worker, token, code, True)
+
+    def _item_attempt_count(self, item_id: str) -> int:
+        with self.session_factory() as session:
+            value = session.scalar(
+                select(ImageAcquisitionJobItemRecord.attempt_count).where(
+                    ImageAcquisitionJobItemRecord.id == item_id
+                )
+            )
+            return int(value or 0)
+
+    def _set_item_failure(
+        self,
+        job_id: UUID,
+        item_id: str,
+        worker: str,
+        token: str,
+        code: DownloadFailureCode,
+        retryable: bool,
+        *,
+        canceled: bool = False,
+    ) -> None:
+        status = (
+            ImageAcquisitionItemStatus.CANCELED
+            if canceled
+            else ImageAcquisitionItemStatus.FAILED
+        )
+        self._conditional_item_update(
+            job_id,
+            item_id,
+            worker,
+            token,
+            status=status.value,
+            failure_code=code.value,
+            failure_message=code.value,
+            retryable=retryable,
+            completed_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+
+    def _mark_linked_existing(
+        self, job_id: UUID, item_id: str, worker: str, token: str
+    ) -> None:
+        with self.session_factory() as session:
+            item = session.scalar(
+                select(ImageAcquisitionJobItemRecord).where(
+                    ImageAcquisitionJobItemRecord.id == item_id
+                )
+            )
+            if item is None:
+                raise _ClaimLost()
+            link = session.scalar(
+                select(ExternalImageAssetLinkRecord).where(
+                    ExternalImageAssetLinkRecord.source_type == item.source_type,
+                    ExternalImageAssetLinkRecord.external_post_id
+                    == item.external_post_id,
+                )
+            )
+            image_asset_id = link.image_asset_id if link else None
+        self._conditional_item_update(
+            job_id,
+            item_id,
+            worker,
+            token,
+            status=(
+                ImageAcquisitionItemStatus.LINKED_EXISTING.value
+                if image_asset_id
+                else ImageAcquisitionItemStatus.SKIPPED.value
+            ),
+            image_asset_id=image_asset_id,
+            completed_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+
+    def _source_link_exists(self, source_type: str, external_post_id: str) -> bool:
+        with self.session_factory() as session:
+            return (
+                session.scalar(
+                    select(ExternalImageAssetLinkRecord.id).where(
+                        ExternalImageAssetLinkRecord.source_type == source_type,
+                        ExternalImageAssetLinkRecord.external_post_id
+                        == external_post_id,
+                    )
+                )
+                is not None
+            )
+
+    def _matches_plan_item(self, item_id: str, post: ImageSourcePost) -> bool:
+        with self.session_factory() as session:
+            item = session.scalar(
+                select(ImageAcquisitionJobItemRecord).where(
+                    ImageAcquisitionJobItemRecord.id == item_id
+                )
+            )
+            return item is not None and self._item_matches_values(item, post)
+
+    @staticmethod
+    def _item_matches_values(item: Any, post: ImageSourcePost) -> bool:
+        return bool(
+            item.expected_metadata_fingerprint == _post_metadata_fingerprint(post)
+            and item.expected_file_url_fingerprint
+            == (fingerprint(post.file_url) if post.file_url else None)
+            and item.expected_md5 == post.source_md5
+            and item.expected_width == post.width
+            and item.expected_height == post.height
+            and item.expected_extension == post.file_extension
+        )
+
+    def _item_path(
+        self, job_id: UUID, item_id: str
+    ) -> tuple[Path, ImageAcquisitionJobItemRecord]:
+        with self.session_factory() as session:
+            item = session.scalar(
+                select(ImageAcquisitionJobItemRecord).where(
+                    ImageAcquisitionJobItemRecord.id == item_id,
+                    ImageAcquisitionJobItemRecord.job_id == str(job_id),
+                )
+            )
+            if item is None:
+                raise _ClaimLost()
+            root = self.projects.project_root(UUID(self._project_id(job_id))).resolve()
+            path = (root / item.part_relative_path).resolve()
+            staging = (root / "acquisition" / "jobs").resolve()
+            if (
+                not path.is_relative_to(staging)
+                or path.name != f"{item_id}.part"
+                or path.is_symlink()
+            ):
+                raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
+            return path, item
+
+    def _project_id(self, job_id: UUID) -> str:
+        with self.session_factory() as session:
+            value = session.scalar(
+                select(ImageAcquisitionJobRecord.project_id).where(
+                    ImageAcquisitionJobRecord.id == str(job_id)
+                )
+            )
+            if value is None:
+                raise _ClaimLost()
+            return str(value)
+
+    def _resume_start(
+        self, path: Path, item: ImageAcquisitionJobItemRecord, post: ImageSourcePost
+    ) -> int | None:
+        if not path.is_file() or path.is_symlink():
+            return None
+        size = path.stat().st_size
+        if (
+            size <= 0
+            or item.received_bytes != size
+            or not item.etag
+            and not item.last_modified
+            or not item.accept_ranges
+        ):
+            if size and item.received_bytes != size:
+                self._truncate_part(path)
+            return None
+        if post.file_size is not None and size >= post.file_size:
+            return None
+        return size
+
+    def _validate_range_response(
+        self,
+        response: DownloadResponse,
+        start: int,
+        item: ImageAcquisitionJobItemRecord,
+    ) -> None:
+        headers = _normalized_headers(response.headers)
+        value = headers.get("content-range")
+        match = CONTENT_RANGE_RE.fullmatch(value or "")
+        if response.status != 206 or match is None or int(match.group(1)) != start:
+            response.close()
+            raise AcquisitionDownloadError(DownloadFailureCode.CONTENT_RANGE_INVALID)
+        validator = headers.get("etag") or headers.get("last-modified")
+        if validator and (
+            (item.etag and validator != item.etag)
+            or (item.last_modified and validator != item.last_modified)
+        ):
+            response.close()
+            raise AcquisitionDownloadError(DownloadFailureCode.REMOTE_FILE_CHANGED)
+        total = match.group(3)
+        if (
+            total != "*"
+            and int(total) > self.settings.image_download_max_file_size_bytes
+        ):
+            response.close()
+            raise AcquisitionDownloadError(DownloadFailureCode.FILE_TOO_LARGE)
+        if (
+            total != "*"
+            and item.expected_file_size is not None
+            and int(total) != item.expected_file_size
+        ):
+            response.close()
+            raise AcquisitionDownloadError(DownloadFailureCode.CONTENT_RANGE_INVALID)
+
+    def _truncate_part(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("wb"):
+            pass
+
+    def _remove_part(self, job_id: UUID, item_id: str) -> None:
+        try:
+            path, _ = self._item_path(job_id, item_id)
+            path.unlink(missing_ok=True)
+        except (OSError, AcquisitionDownloadError, _ClaimLost):
+            logger.warning("acquisition_part_cleanup_failed item_id=%s", item_id)
+
+    def _check_storage(
+        self, job_id: UUID, item_id: str, expected_size: int | None
+    ) -> None:
+        path, _ = self._item_path(job_id, item_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        free = int(self.disk_usage(str(path.parent)).free)
+        if expected_size is None:
+            expected_size = self.settings.image_download_unknown_size_limit_bytes
+        if free < expected_size + self.settings.image_download_disk_safety_margin_bytes:
+            raise AcquisitionDownloadError(DownloadFailureCode.INSUFFICIENT_STORAGE)
+
+    def _retry_backoff(
+        self, retry_after: float | None, attempt: int, job_id: UUID
+    ) -> None:
+        delay = (
+            retry_after
+            if retry_after is not None
+            else min(
+                self.settings.image_download_retry_max_backoff_seconds,
+                self.settings.image_download_retry_base_backoff_seconds
+                * (2 ** (attempt - 1)),
+            )
+        )
+        try:
+            interruptible_sleep(
+                delay,
+                cancel_requested=lambda: self._is_cancel_requested(job_id),
+                sleeper=self.sleeper,
+            )
+        except DanbooruSourceError as exc:
+            if getattr(exc.code, "value", str(exc.code)) == "CANCELED":
+                raise _Canceled() from exc
+            raise
+
+    def _is_cancel_requested(self, job_id: UUID) -> bool:
+        with self.session_factory() as session:
+            return bool(
+                session.scalar(
+                    select(ImageAcquisitionJobRecord.cancellation_requested).where(
+                        ImageAcquisitionJobRecord.id == str(job_id)
+                    )
+                )
+            )
+
+    def _recompute_counts(
+        self, job_id: UUID, worker: str | None = None, token: str | None = None
+    ) -> None:
+        with self.session_factory() as session:
+            job = session.scalar(
+                select(ImageAcquisitionJobRecord).where(
+                    ImageAcquisitionJobRecord.id == str(job_id)
+                )
+            )
+            items = session.scalars(
+                select(ImageAcquisitionJobItemRecord).where(
+                    ImageAcquisitionJobItemRecord.job_id == str(job_id)
+                )
+            ).all()
+            if job is None:
+                return
+            values = {
+                "pending_count": sum(
+                    item.status == ImageAcquisitionItemStatus.PENDING.value
+                    for item in items
+                ),
+                "downloading_count": sum(
+                    item.status
+                    in {
+                        ImageAcquisitionItemStatus.DOWNLOADING.value,
+                        ImageAcquisitionItemStatus.VALIDATING.value,
+                        ImageAcquisitionItemStatus.IMPORTING.value,
+                    }
+                    for item in items
+                ),
+                "downloaded_count": sum(
+                    item.status
+                    in {
+                        ImageAcquisitionItemStatus.DOWNLOADED.value,
+                        ImageAcquisitionItemStatus.VALIDATED.value,
+                        ImageAcquisitionItemStatus.IMPORTING.value,
+                        ImageAcquisitionItemStatus.IMPORTED.value,
+                        ImageAcquisitionItemStatus.LINKED_EXISTING.value,
+                    }
+                    for item in items
+                ),
+                "validated_count": sum(
+                    item.status
+                    in {
+                        ImageAcquisitionItemStatus.VALIDATED.value,
+                        ImageAcquisitionItemStatus.IMPORTING.value,
+                        ImageAcquisitionItemStatus.IMPORTED.value,
+                        ImageAcquisitionItemStatus.LINKED_EXISTING.value,
+                    }
+                    for item in items
+                ),
+                "imported_count": sum(
+                    item.status == ImageAcquisitionItemStatus.IMPORTED.value
+                    for item in items
+                ),
+                "linked_existing_count": sum(
+                    item.status == ImageAcquisitionItemStatus.LINKED_EXISTING.value
+                    for item in items
+                ),
+                "skipped_count": sum(
+                    item.status == ImageAcquisitionItemStatus.SKIPPED.value
+                    for item in items
+                ),
+                "failed_count": sum(
+                    item.status == ImageAcquisitionItemStatus.FAILED.value
+                    for item in items
+                ),
+                "received_bytes": sum(item.received_bytes for item in items),
+                "updated_at": datetime.now(UTC),
+            }
+            if (
+                worker is not None
+                and token is not None
+                and (job.worker_id != worker or job.claim_token != token)
+            ):
+                return
+            for key, value in values.items():
+                setattr(job, key, value)
+            session.commit()
+
+    def _job_terminal_status(self, job_id: UUID) -> ImageAcquisitionJobStatus:
+        with self.session_factory() as session:
+            items = session.scalars(
+                select(ImageAcquisitionJobItemRecord).where(
+                    ImageAcquisitionJobItemRecord.job_id == str(job_id)
+                )
+            ).all()
+            if any(
+                item.status == ImageAcquisitionItemStatus.FAILED.value
+                and item.retryable
+                for item in items
+            ):
+                return (
+                    ImageAcquisitionJobStatus.PARTIALLY_COMPLETED
+                    if any(
+                        item.status
+                        in {
+                            ImageAcquisitionItemStatus.IMPORTED.value,
+                            ImageAcquisitionItemStatus.LINKED_EXISTING.value,
+                            ImageAcquisitionItemStatus.SKIPPED.value,
+                        }
+                        for item in items
+                    )
+                    else ImageAcquisitionJobStatus.FAILED
+                )
+            if any(
+                item.status
+                in {
+                    ImageAcquisitionItemStatus.FAILED.value,
+                    ImageAcquisitionItemStatus.CANCELED.value,
+                }
+                for item in items
+            ):
+                return (
+                    ImageAcquisitionJobStatus.PARTIALLY_COMPLETED
+                    if any(
+                        item.status
+                        in {
+                            ImageAcquisitionItemStatus.IMPORTED.value,
+                            ImageAcquisitionItemStatus.LINKED_EXISTING.value,
+                            ImageAcquisitionItemStatus.SKIPPED.value,
+                        }
+                        for item in items
+                    )
+                    else ImageAcquisitionJobStatus.FAILED
+                )
+            return ImageAcquisitionJobStatus.COMPLETED
+
+    def _finish_job(
+        self,
+        job_id: UUID,
+        worker: str,
+        token: str,
+        status: ImageAcquisitionJobStatus,
+        error: DownloadFailureCode | None,
+    ) -> None:
+        with self.session_factory() as session:
+            job = session.scalar(
+                select(ImageAcquisitionJobRecord).where(
+                    ImageAcquisitionJobRecord.id == str(job_id),
+                    ImageAcquisitionJobRecord.worker_id == worker,
+                    ImageAcquisitionJobRecord.claim_token == token,
+                )
+            )
+            if job is None:
+                return
+            job.status = status.value
+            job.error_code = error.value if error else None
+            job.error_summary = error.value if error else None
+            job.completed_at = datetime.now(UTC)
+            job.heartbeat_at = job.completed_at
+            job.worker_id = None
+            job.claim_token = None
+            job.current_item_id = None
+            job.active_key = None
+            job.updated_at = job.completed_at
+            session.commit()
+        self._recompute_counts(job_id)
+
+    def _fail_all_unfinished(
+        self, job_id: UUID, worker: str, token: str, code: DownloadFailureCode
+    ) -> None:
+        with self.session_factory() as session:
+            items = session.scalars(
+                select(ImageAcquisitionJobItemRecord).where(
+                    ImageAcquisitionJobItemRecord.job_id == str(job_id),
+                    ImageAcquisitionJobItemRecord.status.in_(
+                        [
+                            ImageAcquisitionItemStatus.PENDING.value,
+                            ImageAcquisitionItemStatus.DOWNLOADING.value,
+                        ]
+                    ),
+                )
+            ).all()
+            for item in items:
+                item.status = ImageAcquisitionItemStatus.FAILED.value
+                item.failure_code = code.value
+                item.failure_message = code.value
+                item.retryable = False
+                item.updated_at = datetime.now(UTC)
+            session.commit()
+
+    def _write_manifest(
+        self,
+        job_id: UUID,
+        worker: str,
+        token: str,
+        final_status: ImageAcquisitionJobStatus,
+    ) -> None:
+        with self.session_factory() as session:
+            job = session.scalar(
+                select(ImageAcquisitionJobRecord).where(
+                    ImageAcquisitionJobRecord.id == str(job_id),
+                    ImageAcquisitionJobRecord.worker_id == worker,
+                    ImageAcquisitionJobRecord.claim_token == token,
+                )
+            )
+            if job is None:
+                raise _ClaimLost()
+            project_root = self.projects.project_root(UUID(job.project_id)).resolve()
+            manifest_dir = project_root / "acquisition" / "jobs" / job.id / "manifests"
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            manifest = {
+                "schema_version": "phase8b-manifest-v1",
+                "job_id": job.id,
+                "plan_id": job.plan_id,
+                "project_id": job.project_id,
+                "status": final_status.value,
+                "items": [
+                    {
+                        "external_post_id": item.external_post_id,
+                        "status": item.status,
+                        "attempt_count": item.attempt_count,
+                        "file_size": item.detected_file_size,
+                        "sha256": item.calculated_sha256,
+                        "format": item.detected_format,
+                        "width": item.detected_width,
+                        "height": item.detected_height,
+                        "failure_code": item.failure_code,
+                    }
+                    for item in session.scalars(
+                        select(ImageAcquisitionJobItemRecord)
+                        .where(ImageAcquisitionJobItemRecord.job_id == job.id)
+                        .order_by(ImageAcquisitionJobItemRecord.display_order)
+                    ).all()
+                ],
+            }
+            temporary = manifest_dir / ".manifest.tmp"
+            final = manifest_dir / "manifest.json"
+            try:
+                temporary.parent.mkdir(parents=True, exist_ok=True)
+                with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                    json.dump(
+                        manifest,
+                        handle,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, final)
+                job.manifest_relative_path = (
+                    f"acquisition/jobs/{job.id}/manifests/manifest.json"
+                )
+                session.commit()
+            except OSError as exc:
+                temporary.unlink(missing_ok=True)
+                job.manifest_warning = "manifest generation failed"
+                logger.warning(
+                    "acquisition_manifest_write_failed job_id=%s error_type=%s",
+                    job.id,
+                    type(exc).__name__,
+                )
+                session.commit()
+
+
+def _job_view(job: ImageAcquisitionJobRecord) -> AcquisitionJobView:
+    return AcquisitionJobView(
+        UUID(job.id),
+        UUID(job.plan_id),
+        UUID(job.project_id),
+        ImageAcquisitionJobStatus(job.status),
+        job.requested_count,
+        job.pending_count,
+        job.downloading_count,
+        job.downloaded_count,
+        job.validated_count,
+        job.imported_count,
+        job.linked_existing_count,
+        job.skipped_count,
+        job.failed_count,
+        job.received_bytes,
+        job.expected_bytes,
+        UUID(job.current_item_id) if job.current_item_id else None,
+        job.error_code,
+        job.started_at,
+        job.completed_at,
+    )
+
+
+def _item_view(item: ImageAcquisitionJobItemRecord) -> AcquisitionItemView:
+    return AcquisitionItemView(
+        UUID(item.id),
+        item.external_post_id,
+        ImageAcquisitionItemStatus(item.status),
+        item.attempt_count,
+        item.received_bytes,
+        item.expected_file_size,
+        item.detected_format,
+        item.detected_width,
+        item.detected_height,
+        item.calculated_sha256[:12] if item.calculated_sha256 else None,
+        item.failure_code,
+        bool(item.retryable),
+    )
+
+
+def _post_metadata_fingerprint(post: ImageSourcePost) -> str:
+    return fingerprint(
+        {
+            "source_type": post.source_type.value,
+            "external_post_id": post.external_post_id,
+            "file_url": post.file_url,
+            "preview_url": post.preview_url,
+            "sample_url": post.sample_url,
+            "width": post.width,
+            "height": post.height,
+            "file_size": post.file_size,
+            "file_extension": post.file_extension,
+            "rating": post.rating.value if post.rating else None,
+            "score": post.score,
+            "tag_names": post.tag_names,
+            "source_md5": post.source_md5,
+            "is_deleted": post.is_deleted,
+            "is_pending": post.is_pending,
+            "is_flagged": post.is_flagged,
+        }
+    )
+
+
+def _normalized_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    return {str(key).lower(): str(value) for key, value in headers.items()}
+
+
+def _parse_content_length(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _status_failure(status: int) -> DownloadFailureCode:
+    return {
+        401: DownloadFailureCode.AUTHENTICATION_FAILED,
+        403: DownloadFailureCode.PERMISSION_DENIED,
+        404: DownloadFailureCode.SOURCE_POST_NOT_FOUND,
+        408: DownloadFailureCode.REQUEST_TIMEOUT,
+        429: DownloadFailureCode.RATE_LIMITED,
+        500: DownloadFailureCode.SOURCE_POST_UNAVAILABLE,
+        502: DownloadFailureCode.SOURCE_POST_UNAVAILABLE,
+        503: DownloadFailureCode.SOURCE_POST_UNAVAILABLE,
+        504: DownloadFailureCode.SOURCE_POST_UNAVAILABLE,
+    }.get(status, DownloadFailureCode.CONNECTION_FAILED)
+
+
+def _source_failure(error: DanbooruSourceError) -> DownloadFailureCode:
+    return {
+        "AUTHENTICATION_FAILED": DownloadFailureCode.AUTHENTICATION_FAILED,
+        "PERMISSION_DENIED": DownloadFailureCode.PERMISSION_DENIED,
+        "RATE_LIMITED": DownloadFailureCode.RATE_LIMITED,
+        "REQUEST_TIMEOUT": DownloadFailureCode.REQUEST_TIMEOUT,
+        "CONNECTION_FAILED": DownloadFailureCode.CONNECTION_FAILED,
+        "SOURCE_UNAVAILABLE": DownloadFailureCode.SOURCE_POST_UNAVAILABLE,
+    }.get(error.code.value, DownloadFailureCode.SOURCE_POST_UNAVAILABLE)
+
+
+def _failure_code(value: str) -> DownloadFailureCode:
+    try:
+        return DownloadFailureCode(value)
+    except ValueError:
+        return DownloadFailureCode.IMAGE_CORRUPTED

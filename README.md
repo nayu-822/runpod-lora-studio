@@ -287,7 +287,13 @@ Phase 8Aは画像本体をダウンロードせず、外部画像を初期表示
 
 検索ページは、APIへ渡した`request_cursor`を先に保存し、ページ内候補のupsertと保存完了を示す`current_cursor`／`page_count`のcheckpointを同一transactionで確定します。途中停止・claim喪失・DB commit失敗では未完了ページのnext cursorを進めず、stale再開時は保存済みrequest cursorから同じページを冪等に再実行します。cursor履歴はfingerprintでDBへ保存し、worker世代をまたぐcursor loopを検出します。候補数上限に到達した場合は未処理の残りページを再開対象にせず、`candidate_limit`として検索をcompletedにします。
 
-検索結果の確認と計画確定の間にメタデータや重複状態が変わった場合は確定を拒否します。確定済み計画はfingerprintで冪等に再取得できます。画像ファイルの取得、`.part`、magic bytes／SHA検証、ImageRecord登録、サムネイル生成、ZIP化はPhase 8B以降の対象です。
+検索結果の確認と計画確定の間にメタデータや重複状態が変わった場合は確定を拒否します。確定済み計画はfingerprintで冪等に再取得できます。
+
+## Phase 8B: 画像本体の安全な取得・検証・登録
+
+確定済み取得計画は、画像本体をUUID命名の`.part`へストリーミングし、許可済みHTTPSホスト、応答サイズ、Content-Range、MD5、画像実体、拡張子、寸法、ピクセル数を検証してからPhase 1の`ImageAsset`へ登録します。検証前のファイルは公開領域へ置かず、登録は原画像・PNGサムネイル・DB・外部post provenanceを二段階で確定します。既存SHA-256画像は再利用し、外部postのlinkだけを追加します。
+
+取得workerはjob/item/attempt、claim token、heartbeat、キャンセル、stale復旧、指数バックオフ、Range再開をSQLiteへ保存します。UIにはURL、絶対パス、秘密情報を表示せず、manifestにも含めません。`FakeDownloadTransport`を使った破損、サイズ不一致、再開、同一SHA linkのテストを用意しています。Google Drive同期、完了manifestのDriveコピー、Pod Stop／TerminateはPhase 9の対象です。
 ## Phase 6A: SDXL LoRA学習ジョブ基盤
 
 Phase 6Aでは、完成済みデータセットスナップショットと検証済みローカルモデルを入力に、学習設定・ジョブをSQLiteへ保存し、安全な引数配列で `sdxl_train_network.py` を起動します。ジョブはPID、worker heartbeat、stdout/stderrログ、終了コードを記録し、キャンセル、stale復旧、boundedなログ末尾取得に対応します。

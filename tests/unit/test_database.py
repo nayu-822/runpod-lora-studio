@@ -67,7 +67,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0029_phase8a_page_checkpoints"
+            "0030_phase8b_acquisition_downloads"
         )
 
 
@@ -260,6 +260,61 @@ def test_phase8a_acquisition_tables_have_source_and_plan_constraints(
     assert plan_unique
 
 
+def test_phase8b_acquisition_download_schema_is_migrated(
+    test_workspace: Path,
+) -> None:
+    settings = migrate(test_workspace)
+    inspector = inspect(create_engine_for_settings(settings))
+    tables = set(inspector.get_table_names())
+    assert {
+        "image_acquisition_jobs",
+        "image_acquisition_job_items",
+        "image_acquisition_attempts",
+    }.issubset(tables)
+    job_columns = {
+        column["name"] for column in inspector.get_columns("image_acquisition_jobs")
+    }
+    assert {
+        "worker_generation",
+        "claim_token",
+        "heartbeat_at",
+        "current_item_id",
+        "manifest_relative_path",
+        "downloader_version",
+    }.issubset(job_columns)
+    item_columns = {
+        column["name"]
+        for column in inspector.get_columns("image_acquisition_job_items")
+    }
+    assert {
+        "part_relative_path",
+        "expected_file_url",
+        "range_start",
+        "calculated_sha256",
+        "detected_format",
+        "failure_code",
+    }.issubset(item_columns)
+    link_columns = {
+        column["name"] for column in inspector.get_columns("external_image_asset_links")
+    }
+    assert {
+        "project_id",
+        "source_md5",
+        "source_metadata_fingerprint",
+        "acquisition_job_id",
+        "acquisition_job_item_id",
+        "linked_at",
+    }.issubset(link_columns)
+    assert "expected_file_size" in {
+        column["name"]
+        for column in inspector.get_columns("image_acquisition_plan_items")
+    }
+    assert "uq_image_asset_source" not in {
+        constraint["name"]
+        for constraint in inspector.get_unique_constraints("external_image_asset_links")
+    }
+
+
 def test_phase8a_page_checkpoint_migration_downgrade_and_reupgrade(
     test_workspace: Path,
 ) -> None:
@@ -288,7 +343,7 @@ def test_phase8a_page_checkpoint_migration_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0029_phase8a_page_checkpoints"
+            "0030_phase8b_acquisition_downloads"
         )
 
 
@@ -345,7 +400,7 @@ def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0029_phase8a_page_checkpoints"
+            "0030_phase8b_acquisition_downloads"
         )
 
 
@@ -373,7 +428,7 @@ def test_phase4_downgrade_and_reupgrade_preserves_phase3_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0029_phase8a_page_checkpoints"
+            "0030_phase8b_acquisition_downloads"
         )
 
 
@@ -387,7 +442,7 @@ def test_phase5_upgrades_existing_0006_database_to_head(
         assert "managed_models" in tables
         assert "storage_transfer_jobs" in tables
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0029_phase8a_page_checkpoints"
+            "0030_phase8b_acquisition_downloads"
         )
 
 
@@ -408,7 +463,7 @@ def test_phase5_heartbeat_migration_upgrades_existing_0007_database(
             "current_file_transferred_bytes",
         }.issubset(columns)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0029_phase8a_page_checkpoints"
+            "0030_phase8b_acquisition_downloads"
         )
 
 
@@ -456,7 +511,7 @@ def test_phase5_progress_migration_upgrades_existing_0008_database(
         ).one()
         assert row == ("running", 0, 0)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0029_phase8a_page_checkpoints"
+            "0030_phase8b_acquisition_downloads"
         )
 
 
@@ -483,7 +538,7 @@ def test_phase5_progress_downgrade_and_reupgrade(test_workspace: Path) -> None:
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0029_phase8a_page_checkpoints"
+            "0030_phase8b_acquisition_downloads"
         )
 
 

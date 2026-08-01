@@ -10,6 +10,10 @@ from runpod_lora_studio.domain.acquisition_models import (
     ImageRating,
     ImageSearchSort,
 )
+from runpod_lora_studio.services.acquisition_download_service import (
+    AcquisitionDownloadError,
+    ImageAcquisitionDownloadService,
+)
 from runpod_lora_studio.services.acquisition_service import (
     AcquisitionValidationError,
     ImageAcquisitionService,
@@ -84,7 +88,9 @@ def _status_text(service: ImageAcquisitionService, search_id: str | None) -> str
 
 
 def build_acquisition_tab(
-    service: ImageAcquisitionService, selected_project: gr.State
+    service: ImageAcquisitionService,
+    selected_project: gr.State,
+    download_service: ImageAcquisitionDownloadService | None = None,
 ) -> None:
     """Build the Phase 8A metadata search and immutable plan UI."""
 
@@ -144,6 +150,41 @@ def build_acquisition_tab(
         preview_button = gr.Button("取得計画をプレビュー")
         confirm_button = gr.Button("取得計画を確定", variant="primary")
     plan_message = gr.Markdown()
+    download_plan_state = gr.State(value=None)
+    download_job_state = gr.State(value=None)
+
+    download_status = None
+    download_items = None
+    download_plan_id = None
+    if download_service is not None:
+        gr.Markdown("### 確定済み計画の画像取得")
+        download_plan_id = gr.Textbox(
+            label="確定済み計画ID（確認用）",
+            interactive=False,
+        )
+        with gr.Row():
+            download_start = gr.Button("画像取得を開始", variant="primary")
+            download_cancel = gr.Button("取得をキャンセル")
+            download_resume = gr.Button("停止・失敗項目を再開")
+            download_refresh = gr.Button("取得状態を更新")
+        download_status = gr.Markdown()
+        download_items = gr.Dataframe(
+            headers=[
+                "項目ID",
+                "投稿ID",
+                "状態",
+                "試行回数",
+                "受信bytes",
+                "予定bytes",
+                "形式",
+                "寸法",
+                "SHA-256",
+                "失敗コード",
+                "再試行可",
+            ],
+            interactive=False,
+            label="取得項目（URL・保存先は表示しません）",
+        )
 
     def query_values(
         project_id: str | None,
@@ -272,17 +313,89 @@ def build_acquisition_tab(
         except (AcquisitionValidationError, ValueError) as exc:
             return f"エラー: {exc}", None
 
-    def confirm(value: Any) -> str:
+    def confirm(value: Any) -> str | tuple[str, str | None, str | None]:
         if value is None:
-            return "エラー: 先に取得計画をプレビューしてください。"
+            message = "エラー: 先に取得計画をプレビューしてください。"
+            return (message, None, None) if download_service else message
         try:
             plan_id = service.confirm_plan(value)
-            return (
-                f"取得計画を確定しました（{str(plan_id)[:8]}）。"
-                "画像のダウンロードは行っていません。"
-            )
         except (AcquisitionValidationError, ValueError) as exc:
-            return f"エラー: {exc}"
+            message = f"エラー: {exc}"
+            return (message, None, None) if download_service else message
+        message = f"確定済み計画: {str(plan_id)[:8]} / 画像本体の取得を開始できます。"
+        return (message, str(plan_id), str(plan_id)) if download_service else message
+
+    def _download_rows(current_job: UUID) -> list[list[str]]:
+        if download_service is None:
+            return []
+        return [
+            [
+                str(item.id)[:8],
+                item.external_post_id,
+                item.status.value,
+                str(item.attempt_count),
+                str(item.received_bytes),
+                str(item.expected_file_size or ""),
+                item.detected_format or "",
+                f"{item.detected_width or '?'}x{item.detected_height or '?'}",
+                item.sha256_prefix or "",
+                item.failure_code or "",
+                "yes" if item.retryable else "no",
+            ]
+            for item in download_service.list_items(current_job)
+        ]
+
+    def _download_status(current_job: str | None) -> tuple[str, list[list[str]]]:
+        if download_service is None or not current_job:
+            return "取得ジョブはまだ開始されていません。", []
+        try:
+            job_id = UUID(current_job)
+        except ValueError:
+            return "取得ジョブIDが不正です。", []
+        job = download_service.get_job(job_id)
+        if job is None:
+            return "取得ジョブが見つかりません。", []
+        detail = (
+            f"状態: `{job.status.value}` / 成功: {job.imported_count} / 既存link: "
+            f"{job.linked_existing_count} / skip: {job.skipped_count} / "
+            f"失敗: {job.failed_count} / "
+            f"受信: {job.received_bytes} bytes"
+        )
+        if job.error_code:
+            detail += f" / failure: `{job.error_code}`"
+        return detail, _download_rows(job_id)
+
+    def start_download(
+        plan_value: str | None,
+    ) -> tuple[str, list[list[str]], str | None]:
+        if download_service is None or not plan_value:
+            return "確定済み計画を先に作成してください。", [], None
+        try:
+            job_id = download_service.start_job(UUID(plan_value))
+            status_text, rows = _download_status(str(job_id))
+            return status_text, rows, str(job_id)
+        except (AcquisitionDownloadError, ValueError) as exc:
+            code = getattr(exc, "code", None)
+            return (
+                f"取得を開始できません: `{getattr(code, 'value', str(exc))}`",
+                [],
+                None,
+            )
+
+    def cancel_download(job_value: str | None) -> tuple[str, list[list[str]]]:
+        if download_service is not None and job_value:
+            download_service.cancel_job(UUID(job_value))
+        return _download_status(job_value)
+
+    def resume_download(job_value: str | None) -> tuple[str, list[list[str]]]:
+        if download_service is None or not job_value:
+            return _download_status(job_value)
+        try:
+            download_service.resume_job(UUID(job_value))
+        except (AcquisitionDownloadError, ValueError) as exc:
+            code = getattr(exc, "code", None)
+            return f"取得を再開できません: `{getattr(code, 'value', str(exc))}`", []
+        return _download_status(job_value)
 
     search_button.click(
         start,
@@ -320,7 +433,34 @@ def build_acquisition_tab(
         inputs=[search_id, candidate_choices],
         outputs=[plan_message, plan_state],
     )
-    confirm_button.click(confirm, inputs=[plan_state], outputs=[plan_message])
+    confirm_button.click(
+        confirm,
+        inputs=[plan_state],
+        outputs=[plan_message, download_plan_state, download_plan_id]
+        if download_service is not None
+        else [plan_message],
+    )
+    if download_service is not None:
+        download_start.click(
+            start_download,
+            inputs=[download_plan_state],
+            outputs=[download_status, download_items, download_job_state],
+        )
+        download_cancel.click(
+            cancel_download,
+            inputs=[download_job_state],
+            outputs=[download_status, download_items],
+        )
+        download_resume.click(
+            resume_download,
+            inputs=[download_job_state],
+            outputs=[download_status, download_items],
+        )
+        download_refresh.click(
+            _download_status,
+            inputs=[download_job_state],
+            outputs=[download_status, download_items],
+        )
 
     def clear_on_project_change(_: str | None) -> tuple[str, Any, Any, Any]:
         return (

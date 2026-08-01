@@ -316,6 +316,16 @@ Phase 5のレビュー対応を完了し、完了扱いへ更新する。Alembic
 - API制限時に安全に待機・再試行する
 - 将来別取得元を追加できる構造になっている
 
+### Phase 8B: 画像本体の安全なダウンロード・停止再開・ファイル検証・Phase 1登録
+
+- 確定済みplanをjob/item/attemptとして保存し、claim token、heartbeat、キャンセル、stale復旧に対応する
+- 許可済みHTTPSホストからUUID命名の`.part`へストリーミングし、Content-Length、Content-Range、サイズ上限、Range再開を検証する
+- Pillowの実体検証、MD5／SHA-256、拡張子、寸法、ピクセル数を確認してからPhase 1の原画像・サムネイル・DBへ登録する
+- 同一SHA-256は既存ImageAssetを再利用し、外部post provenanceを追加する
+- URL、絶対パス、秘密情報をUI、ログ、取得manifestへ出さず、固定failure codeとattempt監査を保存する
+
+Phase 8Bの実装は完了。Google Driveへの成果物同期、完了manifestのDrive保存、PodのStop／TerminateはPhase 9で実装する。
+
 ## Phase 9: 完了処理・Google Drive同期・Pod終了
 
 ### 実装内容
@@ -566,4 +576,4 @@ Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は�
 - ページ処理ではAPI request countとcommitted page countを分離する。APIへ渡すrequest cursorを先に保存し、ページ内候補のupsert、accepted／excluded／returned counter、committed next cursor、page count、cursor履歴を同一transactionで確定する。途中停止やclaim喪失時はtransactionをrollbackし、stale searchは最後の完全checkpointまたは処理中ページのrequest cursorから冪等に再実行する。候補数上限到達時は`candidate_limit`としてcompletedにし、未処理残りのnext cursorは保存しない。候補は`MISSING_FILE_URL`等の固定除外理由と利用可否を保存する。
 - 候補のexternal postとsearch resultはDBの一意制約付きupsertで冪等に保存する。取得計画にはsource type + external post IDのreservationを作成し、別planとの同時確定をDBレベルで防止する。
 - 取得計画のpreview fingerprintには検索fingerprint、adapter version、plan状態、選択件数、候補メタデータを含める。confirm時にDBを再検証し、確定済みplanは不変・冪等で、画像ダウンロードは行わない。UIは外部画像を表示せず、ratingと除外理由を日本語で表示する。
-- Phase 8Bの画像取得、ファイル検証、ImageRecord登録、サムネイル、ZIP、他source、tagger／dataset／Drive連携は未実装である。
+- Phase 8Bの画像取得、ファイル検証、ImageRecord登録、サムネイル、外部post provenance、停止再開は実装済みである。ZIP、他source、tagger／dataset／Drive連携は未実装であり、成果物のDrive同期とPod終了はPhase 9の対象である。

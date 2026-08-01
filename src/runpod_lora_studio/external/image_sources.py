@@ -602,7 +602,14 @@ def validate_source_url(value: str | None, *, allow_post_url: bool = False) -> b
     if not value or len(value) > 2048:
         return False
     parsed = urllib.parse.urlparse(value)
-    if parsed.scheme != "https" or not parsed.hostname:
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or parsed.port not in (None, 443)
+    ):
         return False
     host = parsed.hostname.lower().rstrip(".")
     if allow_post_url and host == DANBOORU_API_HOST:
@@ -613,4 +620,11 @@ def validate_source_url(value: str | None, *, allow_post_url: bool = False) -> b
         address = ip_address(host)
     except ValueError:
         return True
-    return not (address.is_private or address.is_loopback or address.is_link_local)
+    return not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_unspecified
+        or address.is_reserved
+    )
