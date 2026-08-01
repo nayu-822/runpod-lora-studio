@@ -294,6 +294,10 @@ Phase 8Aは画像本体をダウンロードせず、外部画像を初期表示
 確定済み取得計画は、画像本体をUUID命名の`.part`へストリーミングし、許可済みHTTPSホスト、応答サイズ、Content-Range、MD5、画像実体、拡張子、寸法、ピクセル数を検証してからPhase 1の`ImageAsset`へ登録します。検証前のファイルは公開領域へ置かず、登録は原画像・PNGサムネイル・DB・外部post provenanceを二段階で確定します。既存SHA-256画像は再利用し、外部postのlinkだけを追加します。
 
 取得workerはjob/item/attempt、claim token、heartbeat、キャンセル、stale復旧、指数バックオフ、Range再開をSQLiteへ保存します。UIにはURL、絶対パス、秘密情報を表示せず、manifestにも含めません。`FakeDownloadTransport`を使った破損、サイズ不一致、再開、同一SHA linkのテストを用意しています。Google Drive同期、完了manifestのDriveコピー、Pod Stop／TerminateはPhase 9の対象です。
+
+取得開始時はplanの不変構造を一括検証し、worker実行時の外部post再確認はitem単位で行います。そのため、削除・metadata変更・不正MD5などの恒久的なsourceエラーが一部itemで発生しても、他のitemは処理を継続してpartial successとして記録します。source／HTTPの一時エラーだけを再試行し、401／403／404などの認証・権限・未検出エラーは再試行しません。attempt番号はjob itemごとに停止・stale復旧後も累積し、開始記録と監査更新はworker generationまで含むclaimで保護されます。
+
+stale復旧ではdownloadingをpendingへ戻し、downloaded／validating／validatedの整合する`.part`をvalidation pendingとして検証から再開します。importingは既存のsource linkと検証済みファイルを確認して冪等に完了へ復旧します。Range応答はContent-Range全体、Content-Length、期待サイズ、同種のETag／Last-Modified validatorを個別に検証します。
 ## Phase 6A: SDXL LoRA学習ジョブ基盤
 
 Phase 6Aでは、完成済みデータセットスナップショットと検証済みローカルモデルを入力に、学習設定・ジョブをSQLiteへ保存し、安全な引数配列で `sdxl_train_network.py` を起動します。ジョブはPID、worker heartbeat、stdout/stderrログ、終了コードを記録し、キャンセル、stale復旧、boundedなログ末尾取得に対応します。

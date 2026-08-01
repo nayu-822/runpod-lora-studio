@@ -279,13 +279,19 @@ def _header_size(headers: Mapping[str, str]) -> int:
 
 
 def _status_code(status: int) -> DownloadFailureCode:
-    return {
+    mapped = {
+        400: DownloadFailureCode.HTTP_CLIENT_ERROR,
         401: DownloadFailureCode.AUTHENTICATION_FAILED,
         403: DownloadFailureCode.PERMISSION_DENIED,
         404: DownloadFailureCode.SOURCE_POST_NOT_FOUND,
         408: DownloadFailureCode.REQUEST_TIMEOUT,
         429: DownloadFailureCode.RATE_LIMITED,
-    }.get(status, DownloadFailureCode.CONNECTION_FAILED)
+    }.get(status)
+    if mapped is not None:
+        return mapped
+    if 400 <= status < 500:
+        return DownloadFailureCode.HTTP_CLIENT_ERROR
+    return DownloadFailureCode.CONNECTION_FAILED
 
 
 def parse_retry_after(value: str | None) -> float | None:

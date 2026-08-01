@@ -76,12 +76,14 @@ class DanbooruSourceError(RuntimeError):
 
     @property
     def retryable(self) -> bool:
+        if self.status is not None:
+            return self.status in {408, 429, 500, 501, 502, 503, 504}
         return self.code in {
             AcquisitionErrorCode.RATE_LIMITED,
             AcquisitionErrorCode.REQUEST_TIMEOUT,
             AcquisitionErrorCode.CONNECTION_FAILED,
             AcquisitionErrorCode.SOURCE_UNAVAILABLE,
-        } or self.status in {408, 500, 502, 503, 504}
+        }
 
 
 @dataclass(frozen=True, slots=True)
