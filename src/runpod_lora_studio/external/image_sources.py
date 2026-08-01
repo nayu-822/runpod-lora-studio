@@ -41,6 +41,15 @@ MAX_CURSOR_LENGTH = 128
 MAX_METADATA_BYTES = 32 * 1024
 
 
+@dataclass(frozen=True, slots=True)
+class ImageSourceRequestContext:
+    """Callbacks used to keep a long metadata request under worker control."""
+
+    cancel_requested: Callable[[], bool] | None = None
+    before_request: Callable[[], None] | None = None
+    after_request: Callable[[], None] | None = None
+
+
 class ImageSourceAdapter(Protocol):
     source_type: ImageSourceType
     adapter_version: str
@@ -57,7 +66,12 @@ class ImageSourceAdapter(Protocol):
         cancel_requested: Callable[[], bool] | None = None,
     ) -> ImageSearchPage: ...
 
-    def get_post(self, external_post_id: str) -> ImageSourcePost | None: ...
+    def get_post(
+        self,
+        external_post_id: str,
+        *,
+        context: ImageSourceRequestContext | None = None,
+    ) -> ImageSourcePost | None: ...
 
 
 class DanbooruSourceError(RuntimeError):
@@ -300,28 +314,34 @@ class DanbooruApiClient:
         params: Mapping[str, str],
         *,
         cancel_requested: Callable[[], bool] | None = None,
+        retry_policy: DanbooruRetryPolicy | None = None,
+        before_request: Callable[[], None] | None = None,
+        after_request: Callable[[], None] | None = None,
     ) -> tuple[object, int, int, int]:
+        policy = retry_policy or self.retry_policy
         retries = 0
         rate_limits = 0
-        for attempt in range(self.retry_policy.max_attempts):
+        for attempt in range(policy.max_attempts):
             if cancel_requested and cancel_requested():
                 raise DanbooruSourceError(
                     AcquisitionErrorCode.CANCELED, "search canceled"
                 )
             self.limiter.acquire(cancel_requested=cancel_requested)
             try:
+                if before_request is not None:
+                    before_request()
                 response = self.transport.get(params)
             except DanbooruSourceError as exc:
                 if exc.code is AcquisitionErrorCode.RATE_LIMITED:
                     self.limiter.record_rate_limit()
                     rate_limits += 1
-                if not exc.retryable or attempt + 1 >= self.retry_policy.max_attempts:
+                if not exc.retryable or attempt + 1 >= policy.max_attempts:
                     raise
                 retries += 1
                 retry_after = (
                     exc.retry_after
                     if exc.retry_after is not None
-                    else self.retry_policy.delay(attempt)
+                    else policy.delay(attempt)
                 )
                 if cancel_requested and cancel_requested():
                     raise DanbooruSourceError(
@@ -334,6 +354,8 @@ class DanbooruApiClient:
                 )
                 continue
             finally:
+                if after_request is not None:
+                    after_request()
                 self.limiter.release()
             try:
                 payload = json.loads(response.body.decode("utf-8"))
@@ -397,10 +419,21 @@ class DanbooruImageSourceAdapter:
             tuple(posts), next_cursor, requests, retries, rate_limits
         )
 
-    def get_post(self, external_post_id: str) -> ImageSourcePost | None:
+    def get_post(
+        self,
+        external_post_id: str,
+        *,
+        context: ImageSourceRequestContext | None = None,
+    ) -> ImageSourcePost | None:
         if not re.fullmatch(r"[0-9]{1,32}", external_post_id):
             return None
-        payload, _, _, _ = self.client.get_json({"search[id]": external_post_id})
+        payload, _, _, _ = self.client.get_json(
+            {"search[id]": external_post_id},
+            cancel_requested=context.cancel_requested if context else None,
+            retry_policy=DanbooruRetryPolicy(max_attempts=1),
+            before_request=context.before_request if context else None,
+            after_request=context.after_request if context else None,
+        )
         if not isinstance(payload, list) or not payload:
             return None
         if not isinstance(payload[0], dict):
@@ -447,7 +480,13 @@ class FakeImageSourceAdapter:
             raise self.failures[key]
         return self.pages.get(key, ImageSearchPage((), None))
 
-    def get_post(self, external_post_id: str) -> ImageSourcePost | None:
+    def get_post(
+        self,
+        external_post_id: str,
+        *,
+        context: ImageSourceRequestContext | None = None,
+    ) -> ImageSourcePost | None:
+        del context
         for page in self.pages.values():
             for post in page.posts:
                 if post.external_post_id == external_post_id:

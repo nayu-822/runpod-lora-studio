@@ -329,8 +329,11 @@ Phase 5のレビュー対応を完了し、完了扱いへ更新する。Alembic
 - RangeのETagとLast-Modifiedを別々に比較し、Content-Range全体・Content-Length・期待サイズを検証する。HTTP 401／403／404は再試行せず、408／429／500-504等だけを再試行する
 - start_jobでは外部postの一括取得を行わず、実行時に使用しない最新URLをjob itemへ保存しない。各item直前のsource再確認で恒久エラーをitem単位に記録する
 - stale復旧で旧workerのrunning attemptを成功復旧または`WORKER_CLAIM_LOST`として終端化し、worker generation違いのitem／attempt／job更新を拒否する
+- stale claimはjob ID、running status、stale heartbeat、worker ID、claim token、worker generationを含む条件付きUPDATEで原子的に取得し、条件不一致時はitem、attempt、ファイルを変更しない
+- stale復旧後はjobを`queued`へ戻し、新しいworker claimの下でcounter再計算、terminal status判定、manifest生成、`completed_at`設定、active key解除を行う。import成功済みitemだけが残る場合もjobとmanifestを終端化する
+- `get_post()`はmetadataの単発requestとし、item attemptをretryの正本にする。request前後とRetry-After待機中にcancel、claim、generation、heartbeatを確認し、二重retryを行わない
 
-Phase 8Bの実装とレビュー指摘対応は、追加テストと品質チェックの成功を確認済み。Google Driveへの成果物同期、完了manifestのDrive保存、PodのStop／TerminateはPhase 9で実装する。
+Phase 8Bの実装とレビュー指摘対応は、追加テストと品質チェックの成功を確認済み。`ruff format --check .`、`ruff check .`、`mypy src`が成功し、`pytest`は`324 passed, 2 skipped`である。Google Driveへの成果物同期、完了manifestのDrive保存、PodのStop／TerminateはPhase 9で実装する。
 
 ## Phase 9: 完了処理・Google Drive同期・Pod終了
 

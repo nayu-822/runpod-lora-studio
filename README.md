@@ -300,6 +300,10 @@ Phase 8Aは画像本体をダウンロードせず、外部画像を初期表示
 start_jobはDB上のconfirmed plan、search result、reservation、fingerprintなど不変構造だけを検証し、job作成前に外部postを一括取得しません。最新のsource存在・metadata・URL・MD5は各itemのworker処理直前に確認し、実行時に使わない最新URLをjob itemへ保存しません。
 
 stale復旧ではdownloadingをpendingへ戻し、downloaded／validating／validatedの整合する`.part`をvalidation pendingとして検証から再開します。validation pendingは再ダウンロードせず、Pillow、サイズ、MD5、SHA-256、寸法、形式の検証から処理します。importingは既存のsource linkと検証済みファイルを確認して冪等に完了へ復旧し、対応するrunning attemptを終端化して不要な`.part`を清掃します。Range応答はContent-Range全体、Content-Length、期待サイズ、同種のETag／Last-Modified validatorを個別に検証します。
+
+stale claimの回収は、job ID、running status、stale heartbeat、worker ID、claim token、worker generationを含む条件付き更新で原子的に行います。回収後のjobは`queued`へ戻し、新しいworker claimの下でcounter再計算、terminal status判定、manifest生成、`completed_at`設定、active key解除を行います。そのため、import済みitemだけが残るstale jobも、専用workerのclaim後にjobとmanifestを終端化できます。
+
+source metadata取得の`get_post()`は単発requestとし、item attemptをretryの正本にします。request前後とRetry-After待機中はcancel、claim token、worker generation、heartbeatを確認し、metadata request数とattempt監査が二重retryなしで対応します。レビュー対応後の品質チェックは、`ruff format --check .`、`ruff check .`、`mypy src`が成功し、`pytest`は`324 passed, 2 skipped`です。
 ## Phase 6A: SDXL LoRA学習ジョブ基盤
 
 Phase 6Aでは、完成済みデータセットスナップショットと検証済みローカルモデルを入力に、学習設定・ジョブをSQLiteへ保存し、安全な引数配列で `sdxl_train_network.py` を起動します。ジョブはPID、worker heartbeat、stdout/stderrログ、終了コードを記録し、キャンセル、stale復旧、boundedなログ末尾取得に対応します。

@@ -27,10 +27,12 @@ from runpod_lora_studio.domain.acquisition_models import (
 )
 from runpod_lora_studio.external.image_sources import (
     DanbooruApiClient,
+    DanbooruImageSourceAdapter,
     DanbooruRetryPolicy,
     DanbooruSourceError,
     FakeImageSourceAdapter,
     HttpResponse,
+    ImageSourceRequestContext,
     SourceRateLimiter,
     _retry_after_seconds,
     interruptible_sleep,
@@ -356,6 +358,43 @@ def test_api_retry_cancellation_prevents_follow_up_request() -> None:
         client.get_json({"tags": "solo"}, cancel_requested=lambda: canceled)
     assert error.value.code is AcquisitionErrorCode.CANCELED
     assert transport.calls == 1
+
+
+def test_get_post_uses_one_request_and_leaves_retry_to_download_worker() -> None:
+    class MetadataTransport:
+        calls = 0
+
+        def get(self, params: dict[str, str]) -> HttpResponse:
+            del params
+            self.calls += 1
+            raise DanbooruSourceError(
+                AcquisitionErrorCode.SOURCE_UNAVAILABLE,
+                status=503,
+                retry_after=1.0,
+            )
+
+    transport = MetadataTransport()
+    events: list[str] = []
+    adapter = DanbooruImageSourceAdapter(
+        client=DanbooruApiClient(
+            transport,
+            limiter=SourceRateLimiter(minimum_interval_seconds=0),
+            retry_policy=DanbooruRetryPolicy(max_attempts=4),
+        )
+    )
+
+    with pytest.raises(DanbooruSourceError):
+        adapter.get_post(
+            "42",
+            context=ImageSourceRequestContext(
+                cancel_requested=lambda: False,
+                before_request=lambda: events.append("before"),
+                after_request=lambda: events.append("after"),
+            ),
+        )
+
+    assert transport.calls == 1
+    assert events == ["before", "after"]
 
 
 def test_authentication_failure_is_not_retried() -> None:
