@@ -67,7 +67,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0028_phase8a_claim_reservations"
+            "0029_phase8a_page_checkpoints"
         )
 
 
@@ -201,6 +201,7 @@ def test_phase8a_acquisition_tables_have_source_and_plan_constraints(
         "image_acquisition_plan_items",
         "external_image_asset_links",
         "image_acquisition_reservations",
+        "image_source_search_cursor_checkpoints",
     }.issubset(tables)
     post_columns = {
         item["name"] for item in inspector.get_columns("external_image_posts")
@@ -235,13 +236,60 @@ def test_phase8a_acquisition_tables_have_source_and_plan_constraints(
     search_columns = {
         column["name"] for column in inspector.get_columns("image_source_searches")
     }
-    assert {"worker_generation", "claim_token"}.issubset(search_columns)
+    assert {
+        "worker_generation",
+        "claim_token",
+        "request_cursor",
+        "completion_reason",
+    }.issubset(search_columns)
+    checkpoint_columns = {
+        column["name"]
+        for column in inspector.get_columns("image_source_search_cursor_checkpoints")
+    }
+    assert {
+        "request_cursor_fingerprint",
+        "next_cursor_fingerprint",
+        "worker_generation",
+        "committed_at",
+    }.issubset(checkpoint_columns)
     reservation_unique = {
         item["name"]
         for item in inspector.get_unique_constraints("image_acquisition_reservations")
     }
     assert "uq_image_acquisition_reservation_source_post" in reservation_unique
     assert plan_unique
+
+
+def test_phase8a_page_checkpoint_migration_downgrade_and_reupgrade(
+    test_workspace: Path,
+) -> None:
+    settings = migrate(test_workspace)
+    config = Config(str(Path("alembic.ini").resolve()))
+    old_path = os.environ.get("RUNPOD_LORA_STUDIO_DATABASE_PATH")
+    os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = str(settings.database_path)
+    get_settings.cache_clear()
+    try:
+        command.downgrade(config, "0028_phase8a_claim_reservations")
+        inspector = inspect(create_engine_for_settings(settings))
+        assert (
+            "image_source_search_cursor_checkpoints" not in inspector.get_table_names()
+        )
+        search_columns = {
+            column["name"] for column in inspector.get_columns("image_source_searches")
+        }
+        assert "request_cursor" not in search_columns
+        assert "completion_reason" not in search_columns
+        command.upgrade(config, "head")
+    finally:
+        get_settings.cache_clear()
+        if old_path is None:
+            os.environ.pop("RUNPOD_LORA_STUDIO_DATABASE_PATH", None)
+        else:
+            os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
+    with create_engine_for_settings(settings).connect() as connection:
+        assert MigrationContext.configure(connection).get_current_revision() == (
+            "0029_phase8a_page_checkpoints"
+        )
 
 
 def test_existing_0001_database_upgrades_to_head(test_workspace: Path) -> None:
@@ -297,7 +345,7 @@ def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0028_phase8a_claim_reservations"
+            "0029_phase8a_page_checkpoints"
         )
 
 
@@ -325,7 +373,7 @@ def test_phase4_downgrade_and_reupgrade_preserves_phase3_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0028_phase8a_claim_reservations"
+            "0029_phase8a_page_checkpoints"
         )
 
 
@@ -339,7 +387,7 @@ def test_phase5_upgrades_existing_0006_database_to_head(
         assert "managed_models" in tables
         assert "storage_transfer_jobs" in tables
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0028_phase8a_claim_reservations"
+            "0029_phase8a_page_checkpoints"
         )
 
 
@@ -360,7 +408,7 @@ def test_phase5_heartbeat_migration_upgrades_existing_0007_database(
             "current_file_transferred_bytes",
         }.issubset(columns)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0028_phase8a_claim_reservations"
+            "0029_phase8a_page_checkpoints"
         )
 
 
@@ -408,7 +456,7 @@ def test_phase5_progress_migration_upgrades_existing_0008_database(
         ).one()
         assert row == ("running", 0, 0)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0028_phase8a_claim_reservations"
+            "0029_phase8a_page_checkpoints"
         )
 
 
@@ -435,7 +483,7 @@ def test_phase5_progress_downgrade_and_reupgrade(test_workspace: Path) -> None:
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0028_phase8a_claim_reservations"
+            "0029_phase8a_page_checkpoints"
         )
 
 

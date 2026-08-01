@@ -1709,7 +1709,12 @@ class ImageSourceSearchRecord(Base):
     api_request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     rate_limit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # The last cursor passed to the source API. It remains unchanged while a
+    # page is being retried, whereas current_cursor is the last committed next
+    # cursor.
+    request_cursor: Mapped[str | None] = mapped_column(String(128), nullable=True)
     current_cursor: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    completion_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     cancellation_requested: Mapped[bool] = mapped_column(
         Integer, nullable=False, default=False
     )
@@ -1730,6 +1735,38 @@ class ImageSourceSearchRecord(Base):
         DateTime(timezone=True), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ImageSourceSearchCursorCheckpointRecord(Base):
+    __tablename__ = "image_source_search_cursor_checkpoints"
+    __table_args__ = (
+        UniqueConstraint(
+            "search_id",
+            "request_cursor_fingerprint",
+            name="uq_image_search_cursor_checkpoint_request",
+        ),
+        Index(
+            "ix_image_search_cursor_checkpoints_search",
+            "search_id",
+            "committed_at",
+        ),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    search_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("image_source_searches.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    request_cursor_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    next_cursor_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    worker_generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    committed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
 

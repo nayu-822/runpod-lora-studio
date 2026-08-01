@@ -285,6 +285,8 @@ Phase 5では、rcloneを介してGoogle Driveのモデルを一覧表示し、R
 
 Phase 8Aは画像本体をダウンロードせず、外部画像を初期表示せず、確定時も不変の取得計画だけを保存します。API通信は固定HTTPSエンドポイント、応答サイズ上限、JSON schema確認、1ワーカーのレート制限、429等の限定的な指数バックオフ、秒数またはHTTP-date形式のRetry-After、待機中キャンセルを使用します。認証が必要な場合は`DANBOORU_LOGIN`と`DANBOORU_API_KEY`を環境変数へ設定します。これらはDB、ログ、UI、fingerprintへ保存しません。検索workerのclaimはDBの条件付き更新とclaim tokenで保護され、stale searchはcursorから安全に再claimされます。取得計画のexternal post reservationにより、同じpostを複数のplanへ同時確定しません。
 
+検索ページは、APIへ渡した`request_cursor`を先に保存し、ページ内候補のupsertと保存完了を示す`current_cursor`／`page_count`のcheckpointを同一transactionで確定します。途中停止・claim喪失・DB commit失敗では未完了ページのnext cursorを進めず、stale再開時は保存済みrequest cursorから同じページを冪等に再実行します。cursor履歴はfingerprintでDBへ保存し、worker世代をまたぐcursor loopを検出します。候補数上限に到達した場合は未処理の残りページを再開対象にせず、`candidate_limit`として検索をcompletedにします。
+
 検索結果の確認と計画確定の間にメタデータや重複状態が変わった場合は確定を拒否します。確定済み計画はfingerprintで冪等に再取得できます。画像ファイルの取得、`.part`、magic bytes／SHA検証、ImageRecord登録、サムネイル生成、ZIP化はPhase 8B以降の対象です。
 ## Phase 6A: SDXL LoRA学習ジョブ基盤
 

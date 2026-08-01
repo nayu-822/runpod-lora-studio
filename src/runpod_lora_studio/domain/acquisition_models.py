@@ -35,6 +35,11 @@ class ImageSearchStatus(StrEnum):
     STALE = "stale"
 
 
+class ImageSearchCompletionReason(StrEnum):
+    SOURCE_EXHAUSTED = "source_exhausted"
+    CANDIDATE_LIMIT = "candidate_limit"
+
+
 class CandidateStatus(StrEnum):
     ACCEPTED = "accepted"
     EXCLUDED = "excluded"

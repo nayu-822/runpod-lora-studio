@@ -5,7 +5,8 @@ import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
+from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select
@@ -19,8 +20,10 @@ from runpod_lora_studio.domain.acquisition_models import (
     ImageSearchCursor,
     ImageSearchPage,
     ImageSearchSort,
+    ImageSearchStatus,
     ImageSourcePost,
     ImageSourceType,
+    ValidatedImageSearchQuery,
 )
 from runpod_lora_studio.external.image_sources import (
     DanbooruApiClient,
@@ -39,7 +42,9 @@ from runpod_lora_studio.persistence.database import (
 )
 from runpod_lora_studio.persistence.models import (
     Base,
+    ImageSourceSearchCursorCheckpointRecord,
     ImageSourceSearchRecord,
+    ImageSourceSearchResultRecord,
     ProjectRecord,
 )
 from runpod_lora_studio.services.acquisition_service import (
@@ -94,6 +99,91 @@ def post(
         is_flagged=False,
         source_metadata={"tag_names": ["1girl", "solo"]},
     )
+
+
+def _service_with_search(
+    test_workspace: Path,
+    pages: dict[str | None, ImageSearchPage],
+    *,
+    maximum_candidate_count: int = 20,
+) -> tuple[
+    ImageAcquisitionService,
+    Any,
+    ValidatedImageSearchQuery,
+    UUID,
+    FakeImageSourceAdapter,
+]:
+    settings = AppSettings(
+        workspace_root=test_workspace / "runtime",
+        projects_dir=test_workspace / "runtime" / "projects",
+        models_dir=test_workspace / "runtime" / "models",
+        outputs_dir=test_workspace / "runtime" / "outputs",
+        logs_dir=test_workspace / "runtime" / "logs",
+        temp_dir=test_workspace / "runtime" / "tmp",
+        database_path=test_workspace / "runtime" / "database" / "studio.sqlite3",
+    )
+    ensure_runtime_directories(settings)
+    engine = create_engine_for_settings(settings)
+    Base.metadata.create_all(engine)
+    project_id = uuid4()
+    now = datetime.now(UTC)
+    session_factory = create_session_factory(settings)
+    with session_factory() as session:
+        session.add(
+            ProjectRecord(
+                id=str(project_id),
+                name="page-checkpoint-test",
+                description="",
+                concept_type="character",
+                trigger_words="[]",
+                status="draft",
+                schema_version=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.commit()
+    validated = validate_search_query(
+        query(
+            project_id=project_id,
+            maximum_candidate_count=maximum_candidate_count,
+        )
+    )
+    search_id = uuid4()
+    with session_factory() as session:
+        session.add(
+            ImageSourceSearchRecord(
+                id=str(search_id),
+                project_id=str(project_id),
+                source_type="danbooru",
+                normalized_query=validated.normalized_query,
+                query_fingerprint=validated.query_fingerprint,
+                query_version=validated.criteria.query_version,
+                adapter_version="phase8a-fake-v1",
+                status=ImageSearchStatus.QUEUED.value,
+                requested_candidate_count=maximum_candidate_count,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.commit()
+    adapter = FakeImageSourceAdapter(pages)
+    service = ImageAcquisitionService(settings, adapter=adapter)
+    return service, session_factory, validated, search_id, adapter
+
+
+def _mark_search_stale(session_factory: Any, search_id: UUID) -> None:
+    with session_factory() as session:
+        record = session.scalar(
+            select(ImageSourceSearchRecord).where(
+                ImageSourceSearchRecord.id == str(search_id)
+            )
+        )
+        assert record is not None
+        record.status = ImageSearchStatus.STALE.value
+        record.worker_id = None
+        record.claim_token = None
+        session.commit()
 
 
 def test_query_validation_is_normalized_and_fingerprint_is_deterministic() -> None:
@@ -435,3 +525,281 @@ def test_search_claim_is_atomic_and_old_token_cannot_update(
         assert record.worker_id == "worker-c"
         assert record.claim_token == "token-c"
         assert record.page_count == 0
+
+
+def test_page_checkpoint_rolls_back_and_replays_an_uncommitted_page(
+    test_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pages = {
+        None: ImageSearchPage(tuple(post(str(index)) for index in range(10)), None)
+    }
+    service, session_factory, validated, search_id, adapter = _service_with_search(
+        test_workspace, pages
+    )
+    assert service._claim_search(search_id, "worker-a", "token-a")
+    assert service._prepare_page(
+        search_id,
+        worker_id="worker-a",
+        claim_token="token-a",
+        request_cursor=None,
+    )
+    page = adapter.search_page(validated, None)
+    assert service._record_api_request(
+        search_id,
+        worker_id="worker-a",
+        claim_token="token-a",
+        requests=page.request_count,
+        retries=page.retry_count,
+        rate_limits=page.rate_limit_count,
+    )
+
+    original_upsert = service._upsert_candidate
+    save_calls = 0
+
+    def fail_after_five(
+        session: Any,
+        search: Any,
+        candidate: ImageSourcePost,
+        query_value: ValidatedImageSearchQuery,
+        now: datetime,
+    ) -> bool:
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 6:
+            raise RuntimeError("simulated worker stop")
+        return original_upsert(session, search, candidate, query_value, now)
+
+    monkeypatch.setattr(service, "_upsert_candidate", fail_after_five)
+    with pytest.raises(RuntimeError, match="simulated worker stop"):
+        service._commit_page(
+            search_id,
+            request_cursor=None,
+            page=page,
+            query=validated,
+            worker_id="worker-a",
+            claim_token="token-a",
+        )
+    monkeypatch.undo()
+
+    with session_factory() as session:
+        record = session.scalar(
+            select(ImageSourceSearchRecord).where(
+                ImageSourceSearchRecord.id == str(search_id)
+            )
+        )
+        assert record is not None
+        assert record.status == ImageSearchStatus.RUNNING.value
+        assert record.current_cursor is None
+        assert record.page_count == 0
+        assert record.returned_post_count == 0
+        assert (
+            session.scalar(
+                select(ImageSourceSearchResultRecord.id).where(
+                    ImageSourceSearchResultRecord.search_id == str(search_id)
+                )
+            )
+            is None
+        )
+
+    _mark_search_stale(session_factory, search_id)
+    service.run_search(search_id, validated, worker_id="worker-b")
+
+    with session_factory() as session:
+        record = session.scalar(
+            select(ImageSourceSearchRecord).where(
+                ImageSourceSearchRecord.id == str(search_id)
+            )
+        )
+        assert record is not None
+        assert record.status == ImageSearchStatus.COMPLETED.value
+        assert record.returned_post_count == 10
+        assert record.accepted_candidate_count == 10
+        assert record.page_count == 1
+        assert record.api_request_count == 2
+        assert record.current_cursor is None
+    assert len(service.list_candidates(search_id)) == 10
+    assert adapter.calls == 2
+
+
+def test_page_checkpoint_rolls_back_when_claim_is_lost(
+    test_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pages = {
+        None: ImageSearchPage((post("1"), post("2")), ImageSearchCursor("before:1")),
+        "before:1": ImageSearchPage((), None),
+    }
+    service, session_factory, validated, search_id, _ = _service_with_search(
+        test_workspace, pages
+    )
+    assert service._claim_search(search_id, "worker-a", "token-a")
+    assert service._prepare_page(
+        search_id,
+        worker_id="worker-a",
+        claim_token="token-a",
+        request_cursor=None,
+    )
+    page = pages[None]
+    assert service._record_api_request(
+        search_id,
+        worker_id="worker-a",
+        claim_token="token-a",
+        requests=page.request_count,
+        retries=page.retry_count,
+        rate_limits=page.rate_limit_count,
+    )
+    original_touch = service._touch_claim
+    touch_calls = 0
+
+    def lose_claim(
+        session: Any,
+        current_search_id: UUID,
+        worker_id: str,
+        claim_token: str,
+        now: datetime,
+    ) -> bool:
+        nonlocal touch_calls
+        touch_calls += 1
+        if touch_calls == 3:
+            return False
+        return original_touch(session, current_search_id, worker_id, claim_token, now)
+
+    monkeypatch.setattr(service, "_touch_claim", lose_claim)
+    result = service._commit_page(
+        search_id,
+        request_cursor=None,
+        page=page,
+        query=validated,
+        worker_id="worker-a",
+        claim_token="token-a",
+    )
+    assert result.error is AcquisitionErrorCode.WORKER_CLAIM_LOST
+    monkeypatch.undo()
+
+    with session_factory() as session:
+        record = session.scalar(
+            select(ImageSourceSearchRecord).where(
+                ImageSourceSearchRecord.id == str(search_id)
+            )
+        )
+        assert record is not None
+        assert record.current_cursor is None
+        assert record.page_count == 0
+        assert record.returned_post_count == 0
+
+    _mark_search_stale(session_factory, search_id)
+    service.run_search(search_id, validated, worker_id="worker-b")
+    with session_factory() as session:
+        record = session.scalar(
+            select(ImageSourceSearchRecord).where(
+                ImageSourceSearchRecord.id == str(search_id)
+            )
+        )
+        assert record is not None
+        assert record.status == ImageSearchStatus.COMPLETED.value
+        assert record.returned_post_count == 2
+        assert record.page_count == 2
+
+
+def test_cursor_checkpoint_history_survives_stale_reclaim(
+    test_workspace: Path,
+) -> None:
+    pages = {
+        None: ImageSearchPage((post("1"),), ImageSearchCursor("before:1")),
+        "before:1": ImageSearchPage((post("2"),), ImageSearchCursor("before:2")),
+        "before:2": ImageSearchPage((post("3"),), ImageSearchCursor("before:1")),
+    }
+    service, session_factory, validated, search_id, adapter = _service_with_search(
+        test_workspace, pages
+    )
+    assert service._claim_search(search_id, "worker-a", "token-a")
+    cursor: ImageSearchCursor | None = None
+    for _ in range(2):
+        assert service._prepare_page(
+            search_id,
+            worker_id="worker-a",
+            claim_token="token-a",
+            request_cursor=cursor,
+        )
+        page = adapter.search_page(validated, cursor)
+        assert service._record_api_request(
+            search_id,
+            worker_id="worker-a",
+            claim_token="token-a",
+            requests=page.request_count,
+            retries=page.retry_count,
+            rate_limits=page.rate_limit_count,
+        )
+        result = service._commit_page(
+            search_id,
+            request_cursor=cursor,
+            page=page,
+            query=validated,
+            worker_id="worker-a",
+            claim_token="token-a",
+        )
+        assert result.error is None
+        cursor = page.next_cursor
+
+    _mark_search_stale(session_factory, search_id)
+    service.run_search(search_id, validated, worker_id="worker-b")
+
+    with session_factory() as session:
+        record = session.scalar(
+            select(ImageSourceSearchRecord).where(
+                ImageSourceSearchRecord.id == str(search_id)
+            )
+        )
+        assert record is not None
+        assert record.worker_generation == 2
+        assert record.status == ImageSearchStatus.PARTIALLY_FAILED.value
+        assert record.error_code == AcquisitionErrorCode.CURSOR_LOOP_DETECTED.value
+        assert record.returned_post_count == 3
+        checkpoints = session.scalars(
+            select(ImageSourceSearchCursorCheckpointRecord).where(
+                ImageSourceSearchCursorCheckpointRecord.search_id == str(search_id)
+            )
+        ).all()
+        assert len(checkpoints) == 3
+    assert adapter.calls == 3
+    assert len(service.list_candidates(search_id)) == 3
+
+
+def test_candidate_limit_completes_without_committing_a_resume_cursor(
+    test_workspace: Path,
+) -> None:
+    pages = {
+        None: ImageSearchPage(
+            tuple(post(str(index)) for index in range(10)),
+            ImageSearchCursor("before:1"),
+        ),
+        "before:1": ImageSearchPage((post("11"),), None),
+    }
+    service, session_factory, validated, search_id, adapter = _service_with_search(
+        test_workspace, pages, maximum_candidate_count=5
+    )
+    service.run_search(search_id, validated)
+
+    with session_factory() as session:
+        record = session.scalar(
+            select(ImageSourceSearchRecord).where(
+                ImageSourceSearchRecord.id == str(search_id)
+            )
+        )
+        assert record is not None
+        assert record.status == ImageSearchStatus.COMPLETED.value
+        assert record.completion_reason == "candidate_limit"
+        assert record.returned_post_count == 5
+        assert record.accepted_candidate_count == 5
+        assert record.excluded_candidate_count == 0
+        assert record.page_count == 0
+        assert record.current_cursor is None
+        assert (
+            session.scalar(
+                select(ImageSourceSearchCursorCheckpointRecord.id).where(
+                    ImageSourceSearchCursorCheckpointRecord.search_id == str(search_id)
+                )
+            )
+            is None
+        )
+    assert adapter.calls == 1
+    assert len(service.list_candidates(search_id)) == 5

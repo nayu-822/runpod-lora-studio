@@ -23,7 +23,9 @@ from runpod_lora_studio.domain.acquisition_models import (
     CandidateStatus,
     DanbooruSearchCriteria,
     ImageRating,
+    ImageSearchCompletionReason,
     ImageSearchCursor,
+    ImageSearchPage,
     ImageSearchSort,
     ImageSearchStatus,
     ImageSourcePost,
@@ -50,6 +52,7 @@ from runpod_lora_studio.persistence.models import (
     ImageAcquisitionPlanItemRecord,
     ImageAcquisitionPlanRecord,
     ImageAcquisitionReservationRecord,
+    ImageSourceSearchCursorCheckpointRecord,
     ImageSourceSearchRecord,
     ImageSourceSearchResultRecord,
     ProjectRecord,
@@ -84,6 +87,13 @@ class SearchCandidateView:
     already_imported: bool
     already_planned: bool
     selected: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PageCommitResult:
+    saved_count: int = 0
+    limit_reached: bool = False
+    error: AcquisitionErrorCode | None = None
 
 
 def validate_search_query(query: DanbooruSearchCriteria) -> ValidatedImageSearchQuery:
@@ -311,55 +321,46 @@ class ImageAcquisitionService:
             return
         adapter = self._adapter(validated.criteria.source_type)
         cursor = self._resume_cursor(search_id, worker_id, claim_token)
-        seen_cursors: set[str] = set()
-        seen_posts: set[str] = set()
+        completion_reason = ImageSearchCompletionReason.SOURCE_EXHAUSTED
         try:
             while True:
                 if self._is_cancel_requested(search_id):
                     raise DanbooruSourceError(AcquisitionErrorCode.CANCELED)
-                if cursor is not None:
-                    if cursor.opaque_value in seen_cursors:
-                        raise DanbooruSourceError(
-                            AcquisitionErrorCode.CURSOR_LOOP_DETECTED
-                        )
-                    seen_cursors.add(cursor.opaque_value)
+                if self._cursor_checkpoint_exists(search_id, cursor):
+                    raise DanbooruSourceError(AcquisitionErrorCode.CURSOR_LOOP_DETECTED)
+                if not self._prepare_page(
+                    search_id,
+                    worker_id=worker_id,
+                    claim_token=claim_token,
+                    request_cursor=cursor,
+                ):
+                    raise DanbooruSourceError(AcquisitionErrorCode.WORKER_CLAIM_LOST)
                 page = adapter.search_page(
                     validated,
                     cursor,
                     cancel_requested=lambda: self._is_cancel_requested(search_id),
                 )
-                if not self._increment_search(
+                if not self._record_api_request(
                     search_id,
                     worker_id=worker_id,
                     claim_token=claim_token,
-                    returned=len(page.posts),
-                    pages=1,
                     requests=page.request_count,
                     retries=page.retry_count,
                     rate_limits=page.rate_limit_count,
-                    cursor=page.next_cursor.opaque_value if page.next_cursor else None,
                 ):
                     raise DanbooruSourceError(AcquisitionErrorCode.WORKER_CLAIM_LOST)
-                if not page.posts:
-                    break
-                for post in page.posts:
-                    if post.external_post_id in seen_posts:
-                        continue
-                    seen_posts.add(post.external_post_id)
-                    if not self._save_candidate(
-                        search_id,
-                        post,
-                        validated,
-                        worker_id=worker_id,
-                        claim_token=claim_token,
-                    ):
-                        raise DanbooruSourceError(
-                            AcquisitionErrorCode.WORKER_CLAIM_LOST
-                        )
-                    if len(seen_posts) >= validated.criteria.maximum_candidate_count:
-                        cursor = None
-                        break
-                if len(seen_posts) >= validated.criteria.maximum_candidate_count:
+                page_result = self._commit_page(
+                    search_id,
+                    request_cursor=cursor,
+                    page=page,
+                    query=validated,
+                    worker_id=worker_id,
+                    claim_token=claim_token,
+                )
+                if page_result.error is not None:
+                    raise DanbooruSourceError(page_result.error)
+                if page_result.limit_reached:
+                    completion_reason = ImageSearchCompletionReason.CANDIDATE_LIMIT
                     break
                 if page.next_cursor is None:
                     break
@@ -381,6 +382,7 @@ class ImageAcquisitionService:
                 ImageSearchStatus.COMPLETED,
                 worker_id=worker_id,
                 claim_token=claim_token,
+                completion_reason=completion_reason.value,
             )
         except DanbooruSourceError as exc:
             status = (
@@ -912,119 +914,49 @@ class ImageAcquisitionService:
             session.commit()
             return claimed_id is not None
 
-    def _save_candidate(
+    def _prepare_page(
         self,
         search_id: UUID,
-        post: ImageSourcePost,
-        query: ValidatedImageSearchQuery,
         *,
         worker_id: str,
         claim_token: str,
+        request_cursor: ImageSearchCursor | None,
     ) -> bool:
         with self.session_factory() as session:
             now = datetime.now(UTC)
-            metadata = _metadata_fingerprint(post)
-            claim = self._touch_claim(session, search_id, worker_id, claim_token, now)
-            if not claim:
-                session.rollback()
-                return False
-            values = {
-                "id": str(uuid4()),
-                "source_type": post.source_type.value,
-                "external_post_id": post.external_post_id,
-                "post_url": post.post_url,
-                "file_url": post.file_url,
-                "preview_url": post.preview_url,
-                "sample_url": post.sample_url,
-                "width": post.width,
-                "height": post.height,
-                "file_size": post.file_size,
-                "file_extension": post.file_extension,
-                "rating": post.rating.value if post.rating else None,
-                "score": post.score,
-                "source_md5": post.source_md5,
-                "normalized_tags_json": json.dumps(post.tag_names, sort_keys=True),
-                "metadata_fingerprint": metadata,
-                "source_metadata_json": json.dumps(
-                    post.source_metadata, sort_keys=True
-                ),
-                "is_deleted": post.is_deleted,
-                "is_pending": post.is_pending,
-                "is_flagged": post.is_flagged,
-                "first_seen_at": now,
-                "last_seen_at": now,
-                "created_at": now,
-                "updated_at": now,
-            }
-            post_update_values = dict(values)
-            post_update_values.pop("id")
-            post_update_values.pop("first_seen_at")
-            post_update_values.pop("created_at")
-            post_update_values["last_seen_at"] = now
-            session.execute(
-                sqlite_insert(ExternalImagePostRecord)
-                .values(**values)
-                .on_conflict_do_update(
-                    index_elements=["source_type", "external_post_id"],
-                    set_=post_update_values,
+            statement = (
+                update(ImageSourceSearchRecord)
+                .where(
+                    ImageSourceSearchRecord.id == str(search_id),
+                    ImageSourceSearchRecord.status == ImageSearchStatus.RUNNING.value,
+                    ImageSourceSearchRecord.worker_id == worker_id,
+                    ImageSourceSearchRecord.claim_token == claim_token,
+                    ImageSourceSearchRecord.cancellation_requested == False,  # noqa: E712
                 )
-            )
-            search = self._get_search_record(session, search_id)
-            if search is None:
-                session.rollback()
-                return False
-            imported = self._already_imported(
-                session, post.source_type.value, post.external_post_id
-            )
-            planned = self._already_planned(
-                session, post.source_type.value, post.external_post_id
-            )
-            reasons = filter_source_post(
-                post, query, already_imported=imported, already_planned=planned
-            )
-            result_values = {
-                "id": str(uuid4()),
-                "search_id": str(search_id),
-                "external_post_id": post.external_post_id,
-                "result_order": search.returned_post_count,
-                "candidate_status": (
-                    CandidateStatus.ACCEPTED
-                    if not reasons
-                    else CandidateStatus.EXCLUDED
-                ).value,
-                "exclusion_reasons_json": json.dumps(
-                    [reason.value for reason in reasons], sort_keys=True
-                ),
-                "already_imported": imported,
-                "already_planned": planned,
-                "selected": False,
-                "metadata_fingerprint_at_search": metadata,
-                "created_at": now,
-                "updated_at": now,
-            }
-            inserted_id = session.execute(
-                sqlite_insert(ImageSourceSearchResultRecord)
-                .values(**result_values)
-                .on_conflict_do_nothing(
-                    index_elements=["search_id", "external_post_id"]
+                .values(
+                    request_cursor=(
+                        request_cursor.opaque_value if request_cursor else None
+                    ),
+                    heartbeat_at=now,
+                    updated_at=now,
                 )
-                .returning(ImageSourceSearchResultRecord.id)
-            ).scalar_one_or_none()
-            if inserted_id is not None:
-                search.returned_post_count += 1
-                search.accepted_candidate_count += int(not reasons)
-                search.excluded_candidate_count += int(bool(reasons))
-            search.heartbeat_at = now
-            search.updated_at = now
+                .returning(ImageSourceSearchRecord.id)
+            )
+            prepared_id = session.execute(statement).scalar_one_or_none()
             session.commit()
-            return True
+            return prepared_id is not None
 
-    def _increment_search(self, search_id: UUID, **values: object) -> bool:
+    def _record_api_request(
+        self,
+        search_id: UUID,
+        *,
+        worker_id: str,
+        claim_token: str,
+        requests: int,
+        retries: int,
+        rate_limits: int,
+    ) -> bool:
         with self.session_factory() as session:
-            worker_id = values.pop("worker_id", None)
-            claim_token = values.pop("claim_token", None)
-            if not isinstance(worker_id, str) or not isinstance(claim_token, str):
-                return False
             now = datetime.now(UTC)
             statement = (
                 update(ImageSourceSearchRecord)
@@ -1035,19 +967,12 @@ class ImageAcquisitionService:
                     ImageSourceSearchRecord.claim_token == claim_token,
                 )
                 .values(
-                    page_count=ImageSourceSearchRecord.page_count
-                    + _integer_value(values.get("pages", 0)),
                     api_request_count=ImageSourceSearchRecord.api_request_count
-                    + _integer_value(values.get("requests", 0)),
+                    + _integer_value(requests),
                     retry_count=ImageSourceSearchRecord.retry_count
-                    + _integer_value(values.get("retries", 0)),
+                    + _integer_value(retries),
                     rate_limit_count=ImageSourceSearchRecord.rate_limit_count
-                    + _integer_value(values.get("rate_limits", 0)),
-                    current_cursor=(
-                        values.get("cursor")
-                        if isinstance(values.get("cursor"), str)
-                        else None
-                    ),
+                    + _integer_value(rate_limits),
                     heartbeat_at=now,
                     updated_at=now,
                 )
@@ -1057,6 +982,218 @@ class ImageAcquisitionService:
             session.commit()
             return updated_id is not None
 
+    def _increment_search(self, search_id: UUID, **values: object) -> bool:
+        """Keep the old private hook request-only for compatibility with tests."""
+        worker_id = values.pop("worker_id", None)
+        claim_token = values.pop("claim_token", None)
+        if not isinstance(worker_id, str) or not isinstance(claim_token, str):
+            return False
+        return self._record_api_request(
+            search_id,
+            worker_id=worker_id,
+            claim_token=claim_token,
+            requests=_integer_value(values.get("requests", 0)),
+            retries=_integer_value(values.get("retries", 0)),
+            rate_limits=_integer_value(values.get("rate_limits", 0)),
+        )
+
+    def _commit_page(
+        self,
+        search_id: UUID,
+        *,
+        request_cursor: ImageSearchCursor | None,
+        page: ImageSearchPage,
+        query: ValidatedImageSearchQuery,
+        worker_id: str,
+        claim_token: str,
+    ) -> _PageCommitResult:
+        with self.session_factory() as session:
+            now = datetime.now(UTC)
+            claim_error = self._touch_claim_or_error(
+                session, search_id, worker_id, claim_token, now
+            )
+            if claim_error is not None:
+                session.rollback()
+                return _PageCommitResult(error=claim_error)
+            search = self._get_search_record(session, search_id)
+            if search is None:
+                session.rollback()
+                return _PageCommitResult(error=AcquisitionErrorCode.WORKER_CLAIM_LOST)
+
+            saved_count = 0
+            limit_reached = (
+                search.returned_post_count >= query.criteria.maximum_candidate_count
+            )
+            for post in page.posts:
+                if limit_reached:
+                    break
+                claim_error = self._touch_claim_or_error(
+                    session, search_id, worker_id, claim_token, now
+                )
+                if claim_error is not None:
+                    session.rollback()
+                    return _PageCommitResult(error=claim_error)
+                if self._upsert_candidate(session, search, post, query, now):
+                    saved_count += 1
+                limit_reached = (
+                    search.returned_post_count >= query.criteria.maximum_candidate_count
+                )
+
+            claim_error = self._touch_claim_or_error(
+                session, search_id, worker_id, claim_token, now
+            )
+            if claim_error is not None:
+                session.rollback()
+                return _PageCommitResult(error=claim_error)
+
+            is_terminal = limit_reached or page.next_cursor is None
+            if not limit_reached:
+                search.current_cursor = (
+                    page.next_cursor.opaque_value if page.next_cursor else None
+                )
+                search.page_count += 1
+                checkpoint = session.execute(
+                    sqlite_insert(ImageSourceSearchCursorCheckpointRecord)
+                    .values(
+                        id=str(uuid4()),
+                        search_id=str(search_id),
+                        request_cursor_fingerprint=_cursor_fingerprint(request_cursor),
+                        next_cursor_fingerprint=_cursor_fingerprint(page.next_cursor)
+                        if page.next_cursor
+                        else None,
+                        worker_generation=search.worker_generation,
+                        committed_at=now,
+                    )
+                    .on_conflict_do_nothing(
+                        index_elements=[
+                            "search_id",
+                            "request_cursor_fingerprint",
+                        ]
+                    )
+                    .returning(ImageSourceSearchCursorCheckpointRecord.id)
+                ).scalar_one_or_none()
+                if checkpoint is None:
+                    session.rollback()
+                    return _PageCommitResult(
+                        error=AcquisitionErrorCode.CURSOR_LOOP_DETECTED
+                    )
+
+            # Keep the request cursor when the source is exhausted or the
+            # candidate limit stops in the middle of a page. This is only a
+            # recovery aid; completed searches cannot be claimed again.
+            search.request_cursor = (
+                page.next_cursor.opaque_value
+                if page.next_cursor is not None
+                else request_cursor.opaque_value
+                if request_cursor
+                else None
+            )
+            search.heartbeat_at = now
+            search.updated_at = now
+            if is_terminal:
+                search.status = ImageSearchStatus.COMPLETED.value
+                search.completion_reason = (
+                    ImageSearchCompletionReason.CANDIDATE_LIMIT.value
+                    if limit_reached
+                    else ImageSearchCompletionReason.SOURCE_EXHAUSTED.value
+                )
+                search.completed_at = now
+                search.worker_id = None
+                search.claim_token = None
+            session.commit()
+            return _PageCommitResult(
+                saved_count=saved_count,
+                limit_reached=limit_reached,
+            )
+
+    def _upsert_candidate(
+        self,
+        session: Any,
+        search: ImageSourceSearchRecord,
+        post: ImageSourcePost,
+        query: ValidatedImageSearchQuery,
+        now: datetime,
+    ) -> bool:
+        metadata = _metadata_fingerprint(post)
+        values = {
+            "id": str(uuid4()),
+            "source_type": post.source_type.value,
+            "external_post_id": post.external_post_id,
+            "post_url": post.post_url,
+            "file_url": post.file_url,
+            "preview_url": post.preview_url,
+            "sample_url": post.sample_url,
+            "width": post.width,
+            "height": post.height,
+            "file_size": post.file_size,
+            "file_extension": post.file_extension,
+            "rating": post.rating.value if post.rating else None,
+            "score": post.score,
+            "source_md5": post.source_md5,
+            "normalized_tags_json": json.dumps(post.tag_names, sort_keys=True),
+            "metadata_fingerprint": metadata,
+            "source_metadata_json": json.dumps(post.source_metadata, sort_keys=True),
+            "is_deleted": post.is_deleted,
+            "is_pending": post.is_pending,
+            "is_flagged": post.is_flagged,
+            "first_seen_at": now,
+            "last_seen_at": now,
+            "created_at": now,
+            "updated_at": now,
+        }
+        post_update_values = dict(values)
+        post_update_values.pop("id")
+        post_update_values.pop("first_seen_at")
+        post_update_values.pop("created_at")
+        post_update_values["last_seen_at"] = now
+        session.execute(
+            sqlite_insert(ExternalImagePostRecord)
+            .values(**values)
+            .on_conflict_do_update(
+                index_elements=["source_type", "external_post_id"],
+                set_=post_update_values,
+            )
+        )
+        imported = self._already_imported(
+            session, post.source_type.value, post.external_post_id
+        )
+        planned = self._already_planned(
+            session, post.source_type.value, post.external_post_id
+        )
+        reasons = filter_source_post(
+            post, query, already_imported=imported, already_planned=planned
+        )
+        result_values = {
+            "id": str(uuid4()),
+            "search_id": search.id,
+            "external_post_id": post.external_post_id,
+            "result_order": search.returned_post_count,
+            "candidate_status": (
+                CandidateStatus.ACCEPTED if not reasons else CandidateStatus.EXCLUDED
+            ).value,
+            "exclusion_reasons_json": json.dumps(
+                [reason.value for reason in reasons], sort_keys=True
+            ),
+            "already_imported": imported,
+            "already_planned": planned,
+            "selected": False,
+            "metadata_fingerprint_at_search": metadata,
+            "created_at": now,
+            "updated_at": now,
+        }
+        inserted_id = session.execute(
+            sqlite_insert(ImageSourceSearchResultRecord)
+            .values(**result_values)
+            .on_conflict_do_nothing(index_elements=["search_id", "external_post_id"])
+            .returning(ImageSourceSearchResultRecord.id)
+        ).scalar_one_or_none()
+        if inserted_id is None:
+            return False
+        search.returned_post_count += 1
+        search.accepted_candidate_count += int(not reasons)
+        search.excluded_candidate_count += int(bool(reasons))
+        return True
+
     def _finish_search(
         self,
         search_id: UUID,
@@ -1065,6 +1202,7 @@ class ImageAcquisitionService:
         *,
         worker_id: str,
         claim_token: str,
+        completion_reason: str | None = None,
     ) -> None:
         with self.session_factory() as session:
             now = datetime.now(UTC)
@@ -1079,6 +1217,7 @@ class ImageAcquisitionService:
                 .values(
                     status=status.value,
                     error_code=error_code,
+                    completion_reason=completion_reason,
                     completed_at=now,
                     heartbeat_at=now,
                     updated_at=now,
@@ -1103,11 +1242,27 @@ class ImageAcquisitionService:
                 ImageSourceSearchRecord.status == ImageSearchStatus.RUNNING.value,
                 ImageSourceSearchRecord.worker_id == worker_id,
                 ImageSourceSearchRecord.claim_token == claim_token,
+                ImageSourceSearchRecord.cancellation_requested == False,  # noqa: E712
             )
             .values(heartbeat_at=now, updated_at=now)
             .returning(ImageSourceSearchRecord.id)
         )
         return session.execute(statement).scalar_one_or_none() is not None
+
+    def _touch_claim_or_error(
+        self,
+        session: Any,
+        search_id: UUID,
+        worker_id: str,
+        claim_token: str,
+        now: datetime,
+    ) -> AcquisitionErrorCode | None:
+        if self._touch_claim(session, search_id, worker_id, claim_token, now):
+            return None
+        record = self._get_search_record(session, search_id)
+        if record is not None and record.cancellation_requested:
+            return AcquisitionErrorCode.CANCELED
+        return AcquisitionErrorCode.WORKER_CLAIM_LOST
 
     def _resume_cursor(
         self, search_id: UUID, worker_id: str, claim_token: str
@@ -1120,9 +1275,30 @@ class ImageAcquisitionService:
                 or record.claim_token != claim_token
             ):
                 return None
+            if (
+                record.request_cursor is not None
+                and record.request_cursor != record.current_cursor
+            ):
+                return ImageSearchCursor(record.request_cursor)
             if record.current_cursor is None:
                 return None
             return ImageSearchCursor(record.current_cursor)
+
+    def _cursor_checkpoint_exists(
+        self, search_id: UUID, cursor: ImageSearchCursor | None
+    ) -> bool:
+        with self.session_factory() as session:
+            return (
+                session.scalar(
+                    select(ImageSourceSearchCursorCheckpointRecord.id).where(
+                        ImageSourceSearchCursorCheckpointRecord.search_id
+                        == str(search_id),
+                        ImageSourceSearchCursorCheckpointRecord.request_cursor_fingerprint
+                        == _cursor_fingerprint(cursor),
+                    )
+                )
+                is not None
+            )
 
     def _is_cancel_requested(self, search_id: UUID) -> bool:
         with self.session_factory() as session:
@@ -1274,6 +1450,12 @@ def _validate_int_range(
 
 def _integer_value(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _cursor_fingerprint(cursor: ImageSearchCursor | None) -> str:
+    return fingerprint(
+        {"algorithm": "sha256-v1", "cursor": cursor.opaque_value if cursor else None}
+    )
 
 
 def _metadata_fingerprint(post: ImageSourcePost) -> str:
