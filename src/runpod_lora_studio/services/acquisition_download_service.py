@@ -57,7 +57,11 @@ from runpod_lora_studio.persistence.models import (
     ImageAcquisitionJobRecord,
     ImageAcquisitionPlanItemRecord,
     ImageAcquisitionPlanRecord,
+    ImageAcquisitionReservationRecord,
+    ImageSourceSearchRecord,
+    ImageSourceSearchResultRecord,
 )
+from runpod_lora_studio.services.acquisition_service import PLAN_VERSION
 from runpod_lora_studio.services.image_ingestion_service import (
     IMPORTER_VERSION,
     VALIDATOR_VERSION,
@@ -68,6 +72,7 @@ from runpod_lora_studio.services.project_service import ProjectService
 
 logger = logging.getLogger("runpod_lora_studio.acquisition_download")
 CONTENT_RANGE_RE = re.compile(r"^bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)$")
+_MD5_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 RETRYABLE_CODES = frozenset(
     {
         DownloadFailureCode.AUTHENTICATION_FAILED,
@@ -196,6 +201,7 @@ class ImageAcquisitionDownloadService:
         job_id = uuid4()
         now = datetime.now(UTC)
         expected_bytes = sum(item.expected_file_size or 0 for item in items) or None
+        self._check_job_storage(plan.project_id, items)
         job = ImageAcquisitionJobRecord(
             id=str(job_id),
             project_id=plan.project_id,
@@ -211,7 +217,17 @@ class ImageAcquisitionDownloadService:
             validator_version=VALIDATOR_VERSION,
             importer_version=IMPORTER_VERSION,
             job_fingerprint=fingerprint(
-                {"plan": plan.plan_fingerprint, "version": "phase8b"}
+                {
+                    "project_id": plan.project_id,
+                    "plan_id": plan.id,
+                    "plan_fingerprint": plan.plan_fingerprint,
+                    "source_type": plan.source_type,
+                    "plan_version": plan.plan_version,
+                    "downloader_version": DOWNLOAD_TRANSPORT_VERSION,
+                    "validator_version": VALIDATOR_VERSION,
+                    "importer_version": IMPORTER_VERSION,
+                    "storage_policy_version": "phase8b-storage-v1",
+                }
             ),
             created_at=now,
             updated_at=now,
@@ -529,6 +545,7 @@ class ImageAcquisitionDownloadService:
                 raise _ClaimLost()
             source_type = ImageSourceType(item.source_type)
             external_post_id = item.external_post_id
+        self._check_cancel_or_claim(job_id, worker, token)
         adapter = self._adapter(source_type)
         try:
             post = adapter.get_post(external_post_id)
@@ -621,6 +638,7 @@ class ImageAcquisitionDownloadService:
                     raise AcquisitionDownloadError(
                         DownloadFailureCode.IMPORT_FAILED
                     ) from exc
+                self._finish_attempt(item_id, "succeeded", None)
                 return
             except _Canceled:
                 raise
@@ -638,7 +656,14 @@ class ImageAcquisitionDownloadService:
                     )
                     return
                 self._record_attempt_failure(
-                    job_id, item_id, worker, token, attempt, exc.code, True
+                    job_id,
+                    item_id,
+                    worker,
+                    token,
+                    attempt,
+                    exc.code,
+                    True,
+                    retry_after=exc.retry_after,
                 )
                 self._retry_backoff(exc.retry_after, attempt, job_id)
             except ImageVerificationError as exc:
@@ -659,7 +684,14 @@ class ImageAcquisitionDownloadService:
                         )
                         return
                     self._record_attempt_failure(
-                        job_id, item_id, worker, token, attempt, exc.code, True
+                        job_id,
+                        item_id,
+                        worker,
+                        token,
+                        attempt,
+                        exc.code,
+                        True,
+                        retry_after=exc.retry_after,
                     )
                     self._retry_backoff(exc.retry_after, attempt, job_id)
                     continue
@@ -717,7 +749,9 @@ class ImageAcquisitionDownloadService:
             etag=item.etag,
             last_modified=item.last_modified,
         )
+        self._check_cancel_or_claim(job_id, worker, token)
         response = self.transport.open(request)
+        self._check_cancel_or_claim(job_id, worker, token)
         actual_start = resume_start
         if resume_start is not None and response.status == 200:
             actual_start = None
@@ -734,6 +768,7 @@ class ImageAcquisitionDownloadService:
                 _status_failure(response.status), status=response.status
             )
         headers = _normalized_headers(response.headers)
+        self._record_attempt_response(item_id, response.status, resume_start, headers)
         length = _parse_content_length(headers.get("content-length"))
         if headers.get("content-length") is not None and length is None:
             response.close()
@@ -806,6 +841,7 @@ class ImageAcquisitionDownloadService:
         self._set_item_status(
             job_id, item_id, worker, token, ImageAcquisitionItemStatus.VALIDATING
         )
+        self._check_cancel_or_claim(job_id, worker, token)
         verified = self.ingestion.inspect_image(
             path,
             expected_md5=post.source_md5,
@@ -827,6 +863,7 @@ class ImageAcquisitionDownloadService:
         worker: str,
         token: str,
     ) -> None:
+        self._check_cancel_or_claim(job_id, worker, token)
         self._set_item_status(
             job_id, item_id, worker, token, ImageAcquisitionItemStatus.IMPORTING
         )
@@ -859,8 +896,93 @@ class ImageAcquisitionDownloadService:
         if plan.status != "confirmed":
             raise AcquisitionDownloadError(DownloadFailureCode.PLAN_NOT_CONFIRMED)
         adapter = self._adapter(ImageSourceType(plan.source_type))
+        materialized_items = list(items)
+        with self.session_factory() as session:
+            search = session.scalar(
+                select(ImageSourceSearchRecord).where(
+                    ImageSourceSearchRecord.id == plan.source_search_id
+                )
+            )
+            reservations = session.scalars(
+                select(ImageAcquisitionReservationRecord).where(
+                    ImageAcquisitionReservationRecord.plan_id == plan.id
+                )
+            ).all()
+            result_ids = {item.search_result_id for item in materialized_items}
+            results = {
+                result.id: result
+                for result in session.scalars(
+                    select(ImageSourceSearchResultRecord).where(
+                        ImageSourceSearchResultRecord.id.in_(result_ids)
+                    )
+                ).all()
+            }
+        if search is None:
+            raise AcquisitionDownloadError(DownloadFailureCode.PLAN_METADATA_CHANGED)
+        if (
+            plan.project_id != search.project_id
+            or plan.source_type != search.source_type
+            or plan.query_fingerprint != search.query_fingerprint
+            or plan.adapter_version != search.adapter_version
+            or plan.plan_version != PLAN_VERSION
+            or adapter.adapter_version != plan.adapter_version
+            or len(materialized_items) != plan.selected_count
+        ):
+            raise AcquisitionDownloadError(DownloadFailureCode.PLAN_METADATA_CHANGED)
+        expected_reservations = {
+            (plan.source_type, item.external_post_id) for item in materialized_items
+        }
+        actual_reservations = {
+            (reservation.source_type, reservation.external_post_id)
+            for reservation in reservations
+        }
+        if actual_reservations != expected_reservations:
+            raise AcquisitionDownloadError(DownloadFailureCode.PLAN_METADATA_CHANGED)
+        plan_items_for_fingerprint: list[dict[str, object]] = []
+        for item in materialized_items:
+            result = results.get(item.search_result_id)
+            if (
+                result is None
+                or result.external_post_id != item.external_post_id
+                or result.metadata_fingerprint_at_search
+                != item.expected_metadata_fingerprint
+                or result.already_imported
+                or result.already_planned
+            ):
+                raise AcquisitionDownloadError(
+                    DownloadFailureCode.PLAN_METADATA_CHANGED
+                )
+            plan_items_for_fingerprint.append(
+                {
+                    "search_result_id": result.id,
+                    "external_post_id": item.external_post_id,
+                    "metadata_fingerprint": item.expected_metadata_fingerprint,
+                    "file_url_fingerprint": item.expected_file_url_fingerprint,
+                    "source_md5": item.expected_md5,
+                    "extension": item.expected_extension,
+                    "width": item.expected_width,
+                    "height": item.expected_height,
+                    "already_imported": bool(result.already_imported),
+                    "already_planned": bool(result.already_planned),
+                }
+            )
+        expected_plan_fingerprint = fingerprint(
+            {
+                "project_id": search.project_id,
+                "search_id": search.id,
+                "source_type": search.source_type,
+                "items": plan_items_for_fingerprint,
+                "query_fingerprint": search.query_fingerprint,
+                "adapter_version": search.adapter_version,
+                "plan_version": PLAN_VERSION,
+                "plan_status": "confirmed",
+                "selected_count": len(materialized_items),
+            }
+        )
+        if expected_plan_fingerprint != plan.plan_fingerprint:
+            raise AcquisitionDownloadError(DownloadFailureCode.PLAN_METADATA_CHANGED)
         fresh_posts: dict[str, ImageSourcePost] = {}
-        for item in items:
+        for item in materialized_items:
             try:
                 post = adapter.get_post(item.external_post_id)
             except DanbooruSourceError as exc:
@@ -877,6 +999,8 @@ class ImageAcquisitionDownloadService:
                 raise AcquisitionDownloadError(DownloadFailureCode.FILE_URL_MISSING)
             if not validate_download_url(post.file_url):
                 raise AcquisitionDownloadError(DownloadFailureCode.FILE_URL_NOT_ALLOWED)
+            if post.source_md5 is not None and not _MD5_RE.fullmatch(post.source_md5):
+                raise AcquisitionDownloadError(DownloadFailureCode.SOURCE_MD5_INVALID)
             fresh_posts[item.external_post_id] = post
         return fresh_posts
 
@@ -1197,24 +1321,71 @@ class ImageAcquisitionDownloadService:
             updated_at=datetime.now(UTC),
         )
 
+    def _record_attempt_response(
+        self,
+        item_id: str,
+        status: int,
+        requested_range_start: int | None,
+        headers: Mapping[str, str],
+    ) -> None:
+        with self.session_factory() as session:
+            item = session.scalar(
+                select(ImageAcquisitionJobItemRecord).where(
+                    ImageAcquisitionJobItemRecord.id == item_id
+                )
+            )
+            if item is None or item.attempt_count <= 0:
+                return
+            attempt = session.scalar(
+                select(ImageAcquisitionAttemptRecord).where(
+                    ImageAcquisitionAttemptRecord.job_item_id == item_id,
+                    ImageAcquisitionAttemptRecord.attempt_number == item.attempt_count,
+                )
+            )
+            if attempt is None:
+                return
+            attempt.http_status = status
+            attempt.requested_range_start = requested_range_start
+            attempt.response_etag_fingerprint = (
+                fingerprint(headers["etag"]) if headers.get("etag") else None
+            )
+            attempt.response_last_modified_fingerprint = (
+                fingerprint(headers["last-modified"])
+                if headers.get("last-modified")
+                else None
+            )
+            session.commit()
+
     def _set_attempt_started(
         self, job_id: UUID, item_id: str, worker: str, token: str, attempt: int
     ) -> None:
+        now = datetime.now(UTC)
         self._conditional_item_update(
             job_id,
             item_id,
             worker,
             token,
             attempt_count=attempt,
-            updated_at=datetime.now(UTC),
+            last_attempted_at=now,
+            updated_at=now,
         )
         with self.session_factory() as session:
+            generation = session.scalar(
+                select(ImageAcquisitionJobRecord.worker_generation)
+                .join(
+                    ImageAcquisitionJobItemRecord,
+                    ImageAcquisitionJobItemRecord.job_id
+                    == ImageAcquisitionJobRecord.id,
+                )
+                .where(ImageAcquisitionJobItemRecord.id == item_id)
+            )
             session.add(
                 ImageAcquisitionAttemptRecord(
                     id=str(uuid4()),
                     job_item_id=item_id,
                     attempt_number=attempt,
                     status="running",
+                    worker_generation=int(generation or 0),
                     started_at=datetime.now(UTC),
                     created_at=datetime.now(UTC),
                 )
@@ -1230,6 +1401,7 @@ class ImageAcquisitionDownloadService:
         attempt: int,
         code: DownloadFailureCode,
         retryable: bool,
+        retry_after: float | None = None,
     ) -> None:
         self._conditional_item_update(
             job_id,
@@ -1242,6 +1414,11 @@ class ImageAcquisitionDownloadService:
             updated_at=datetime.now(UTC),
         )
         with self.session_factory() as session:
+            item_row = session.scalar(
+                select(ImageAcquisitionJobItemRecord).where(
+                    ImageAcquisitionJobItemRecord.id == item_id
+                )
+            )
             row = session.scalar(
                 select(ImageAcquisitionAttemptRecord).where(
                     ImageAcquisitionAttemptRecord.job_item_id == item_id,
@@ -1252,8 +1429,35 @@ class ImageAcquisitionDownloadService:
                 row.status = "failed"
                 row.failure_code = code.value
                 row.retryable = retryable
+                row.retry_after_seconds = retry_after
+                row.received_bytes = item_row.received_bytes if item_row else 0
                 row.completed_at = datetime.now(UTC)
                 session.commit()
+
+    def _finish_attempt(
+        self, item_id: str, status: str, code: DownloadFailureCode | None
+    ) -> None:
+        with self.session_factory() as session:
+            item = session.scalar(
+                select(ImageAcquisitionJobItemRecord).where(
+                    ImageAcquisitionJobItemRecord.id == item_id
+                )
+            )
+            if item is None or item.attempt_count <= 0:
+                return
+            attempt = session.scalar(
+                select(ImageAcquisitionAttemptRecord).where(
+                    ImageAcquisitionAttemptRecord.job_item_id == item_id,
+                    ImageAcquisitionAttemptRecord.attempt_number == item.attempt_count,
+                )
+            )
+            if attempt is None or attempt.status != "running":
+                return
+            attempt.status = status
+            attempt.failure_code = code.value if code else None
+            attempt.received_bytes = item.received_bytes
+            attempt.completed_at = datetime.now(UTC)
+            session.commit()
 
     def _retry_item(
         self,
@@ -1302,6 +1506,7 @@ class ImageAcquisitionDownloadService:
             completed_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
         )
+        self._finish_attempt(item_id, "failed", code)
 
     def _mark_linked_existing(
         self, job_id: UUID, item_id: str, worker: str, token: str
@@ -1480,6 +1685,29 @@ class ImageAcquisitionDownloadService:
         if expected_size is None:
             expected_size = self.settings.image_download_unknown_size_limit_bytes
         if free < expected_size + self.settings.image_download_disk_safety_margin_bytes:
+            raise AcquisitionDownloadError(DownloadFailureCode.INSUFFICIENT_STORAGE)
+
+    def _check_job_storage(
+        self, project_id: str, items: Iterable[ImageAcquisitionPlanItemRecord]
+    ) -> None:
+        project_path = self.projects.project_root(UUID(project_id))
+        if project_path.is_symlink():
+            raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
+        project_root = project_path.resolve()
+        projects_root = self.settings.projects_dir.resolve()
+        if not project_root.is_relative_to(projects_root) or not project_root.is_dir():
+            raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
+        staging_root = project_root / "acquisition" / "jobs"
+        staging_root.mkdir(parents=True, exist_ok=True)
+        materialized_items = list(items)
+        expected = sum(
+            item.expected_file_size
+            if item.expected_file_size is not None
+            else self.settings.image_download_unknown_size_limit_bytes
+            for item in materialized_items
+        )
+        free = int(self.disk_usage(str(staging_root)).free)
+        if free < expected + self.settings.image_download_disk_safety_margin_bytes:
             raise AcquisitionDownloadError(DownloadFailureCode.INSUFFICIENT_STORAGE)
 
     def _retry_backoff(
@@ -1717,29 +1945,50 @@ class ImageAcquisitionDownloadService:
             project_root = self.projects.project_root(UUID(job.project_id)).resolve()
             manifest_dir = project_root / "acquisition" / "jobs" / job.id / "manifests"
             manifest_dir.mkdir(parents=True, exist_ok=True)
+            items = session.scalars(
+                select(ImageAcquisitionJobItemRecord)
+                .where(ImageAcquisitionJobItemRecord.job_id == job.id)
+                .order_by(ImageAcquisitionJobItemRecord.display_order)
+            ).all()
+            completed_at = datetime.now(UTC)
             manifest = {
                 "schema_version": "phase8b-manifest-v1",
                 "job_id": job.id,
                 "plan_id": job.plan_id,
                 "project_id": job.project_id,
+                "source_type": job.source_type,
+                "plan_fingerprint": job.plan_fingerprint,
+                "downloader_version": job.downloader_version,
+                "validator_version": job.validator_version,
+                "importer_version": job.importer_version,
+                "started_at": job.started_at.isoformat() if job.started_at else None,
+                "completed_at": completed_at.isoformat(),
                 "status": final_status.value,
+                "item_count": job.requested_count,
+                "imported_count": job.imported_count,
+                "linked_existing_count": job.linked_existing_count,
+                "skipped_count": job.skipped_count,
+                "failed_count": job.failed_count,
                 "items": [
                     {
+                        "item_id": item.id,
                         "external_post_id": item.external_post_id,
                         "status": item.status,
                         "attempt_count": item.attempt_count,
                         "file_size": item.detected_file_size,
                         "sha256": item.calculated_sha256,
+                        "image_asset_id": item.image_asset_id,
+                        "source_md5_match": (
+                            item.calculated_md5.lower() == item.expected_md5.lower()
+                            if item.calculated_md5 and item.expected_md5
+                            else None
+                        ),
                         "format": item.detected_format,
                         "width": item.detected_width,
                         "height": item.detected_height,
                         "failure_code": item.failure_code,
                     }
-                    for item in session.scalars(
-                        select(ImageAcquisitionJobItemRecord)
-                        .where(ImageAcquisitionJobItemRecord.job_id == job.id)
-                        .order_by(ImageAcquisitionJobItemRecord.display_order)
-                    ).all()
+                    for item in items
                 ],
             }
             temporary = manifest_dir / ".manifest.tmp"

@@ -67,7 +67,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0030_phase8b_acquisition_downloads"
+            "0031_phase8b_integrity_fields"
         )
 
 
@@ -290,6 +290,7 @@ def test_phase8b_acquisition_download_schema_is_migrated(
         "part_relative_path",
         "expected_file_url",
         "range_start",
+        "last_attempted_at",
         "calculated_sha256",
         "detected_format",
         "failure_code",
@@ -313,6 +314,17 @@ def test_phase8b_acquisition_download_schema_is_migrated(
         constraint["name"]
         for constraint in inspector.get_unique_constraints("external_image_asset_links")
     }
+    attempt_columns = {
+        column["name"] for column in inspector.get_columns("image_acquisition_attempts")
+    }
+    assert {
+        "http_status",
+        "requested_range_start",
+        "retry_after_seconds",
+        "response_etag_fingerprint",
+        "response_last_modified_fingerprint",
+        "worker_generation",
+    }.issubset(attempt_columns)
 
 
 def test_phase8a_page_checkpoint_migration_downgrade_and_reupgrade(
@@ -343,7 +355,7 @@ def test_phase8a_page_checkpoint_migration_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0030_phase8b_acquisition_downloads"
+            "0031_phase8b_integrity_fields"
         )
 
 
@@ -400,7 +412,7 @@ def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0030_phase8b_acquisition_downloads"
+            "0031_phase8b_integrity_fields"
         )
 
 
@@ -428,7 +440,7 @@ def test_phase4_downgrade_and_reupgrade_preserves_phase3_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0030_phase8b_acquisition_downloads"
+            "0031_phase8b_integrity_fields"
         )
 
 
@@ -442,7 +454,7 @@ def test_phase5_upgrades_existing_0006_database_to_head(
         assert "managed_models" in tables
         assert "storage_transfer_jobs" in tables
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0030_phase8b_acquisition_downloads"
+            "0031_phase8b_integrity_fields"
         )
 
 
@@ -463,7 +475,7 @@ def test_phase5_heartbeat_migration_upgrades_existing_0007_database(
             "current_file_transferred_bytes",
         }.issubset(columns)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0030_phase8b_acquisition_downloads"
+            "0031_phase8b_integrity_fields"
         )
 
 
@@ -511,7 +523,7 @@ def test_phase5_progress_migration_upgrades_existing_0008_database(
         ).one()
         assert row == ("running", 0, 0)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0030_phase8b_acquisition_downloads"
+            "0031_phase8b_integrity_fields"
         )
 
 
@@ -538,7 +550,7 @@ def test_phase5_progress_downgrade_and_reupgrade(test_workspace: Path) -> None:
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0030_phase8b_acquisition_downloads"
+            "0031_phase8b_integrity_fields"
         )
 
 

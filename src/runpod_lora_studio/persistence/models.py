@@ -2087,6 +2087,9 @@ class ImageAcquisitionJobItemRecord(Base):
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    last_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -2116,6 +2119,16 @@ class ImageAcquisitionAttemptRecord(Base):
     failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     retryable: Mapped[bool] = mapped_column(Integer, nullable=False, default=False)
     received_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    requested_range_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    retry_after_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    response_etag_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    response_last_modified_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    worker_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
