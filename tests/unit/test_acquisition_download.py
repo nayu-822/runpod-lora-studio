@@ -115,8 +115,10 @@ class _MutablePostAdapter(FakeImageSourceAdapter):
         self.missing_ids: set[str] = set()
         self.post_failures: dict[str, DanbooruSourceError] = {}
         self.post_overrides: dict[str, ImageSourcePost] = {}
+        self.get_post_calls = 0
 
     def get_post(self, external_post_id: str) -> ImageSourcePost | None:
+        self.get_post_calls += 1
         if external_post_id in self.post_failures:
             raise self.post_failures[external_post_id]
         if external_post_id in self.missing_ids:
@@ -292,8 +294,6 @@ def test_source_revalidation_is_item_scoped_and_allows_partial_success(
     service = ImageAcquisitionDownloadService(
         settings, adapter=adapter, transport=transport, auto_start=False
     )
-    job_id = service.start_job(plan_id, auto_start=False)
-
     adapter.missing_ids.add(posts[1].external_post_id)
     adapter.post_overrides[posts[2].external_post_id] = replace(posts[2], width=31)
     adapter.post_overrides[posts[3].external_post_id] = replace(
@@ -303,6 +303,8 @@ def test_source_revalidation_is_item_scoped_and_allows_partial_success(
         AcquisitionErrorCode.REQUEST_TIMEOUT,
         status=503,
     )
+    job_id = service.start_job(plan_id, auto_start=False)
+    assert adapter.get_post_calls == 0
 
     service.run_job_sync(job_id)
 
@@ -707,9 +709,84 @@ def test_stale_importing_state_is_completed_from_existing_idempotent_import(
             )
         )
         assert job is not None and item is not None
+        attempt = session.scalar(
+            select(ImageAcquisitionAttemptRecord).where(
+                ImageAcquisitionAttemptRecord.job_item_id == item.id
+            )
+        )
+        assert attempt is not None
         item.status = ImageAcquisitionItemStatus.IMPORTING.value
         item.image_asset_id = None
+        item.received_bytes = len(body)
         item.completed_at = None
+        part = settings.projects_dir / str(job.project_id) / item.part_relative_path
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(body)
+        job.status = ImageAcquisitionJobStatus.RUNNING.value
+        job.worker_id = "stale-worker"
+        job.claim_token = "stale-token"
+        job.worker_generation = 5
+        job.heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+        attempt.status = "running"
+        attempt.worker_generation = 5
+        attempt.received_bytes = len(body)
+        attempt.completed_at = None
+        session.commit()
+
+    assert service.recover_stale_jobs() == 1
+    item = service.list_items(job_id)[0]
+    assert item.status is ImageAcquisitionItemStatus.IMPORTED
+    assert not part.exists()
+    with create_session_factory(settings)() as session:
+        attempt = session.scalar(select(ImageAcquisitionAttemptRecord))
+        assert attempt is not None
+        assert attempt.status == "succeeded"
+        assert attempt.completed_at is not None
+        assert attempt.received_bytes == len(body)
+        assert attempt.failure_code is None
+        assert attempt.worker_generation == 5
+
+
+@pytest.mark.parametrize(
+    "interrupted_status",
+    [
+        ImageAcquisitionItemStatus.DOWNLOADED,
+        ImageAcquisitionItemStatus.VALIDATING,
+        ImageAcquisitionItemStatus.VALIDATED,
+    ],
+)
+def test_validation_pending_recovery_validates_part_without_download(
+    test_workspace: Path,
+    interrupted_status: ImageAcquisitionItemStatus,
+) -> None:
+    settings = _settings(test_workspace)
+    body = _png_bytes((90, 110, 220))
+    post = _post("1305", body)
+    plan_id, adapter = _make_plan(settings, (post,))
+    transport = FakeDownloadTransport({post.file_url or "": FakeDownloadSpec(body)})
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, transport=transport, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    with create_session_factory(settings)() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        item.status = interrupted_status.value
+        item.received_bytes = len(body)
+        item.etag = "stale-etag"
+        item.accept_ranges = True
+        part = settings.projects_dir / str(job.project_id) / item.part_relative_path
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(body)
         job.status = ImageAcquisitionJobStatus.RUNNING.value
         job.worker_id = "stale-worker"
         job.claim_token = "stale-token"
@@ -717,8 +794,96 @@ def test_stale_importing_state_is_completed_from_existing_idempotent_import(
         session.commit()
 
     assert service.recover_stale_jobs() == 1
+    assert (
+        service.list_items(job_id)[0].status
+        is ImageAcquisitionItemStatus.VALIDATION_PENDING
+    )
+    service.resume_job(job_id, auto_start=False)
+    assert (
+        service.list_items(job_id)[0].status
+        is ImageAcquisitionItemStatus.VALIDATION_PENDING
+    )
+    service.run_job_sync(job_id)
+
+    job = service.get_job(job_id)
+    assert job is not None
+    assert job.status is ImageAcquisitionJobStatus.COMPLETED
+    assert service.list_items(job_id)[0].status is ImageAcquisitionItemStatus.IMPORTED
+    assert transport.requests == []
+
+
+def test_stale_importing_without_import_is_audited_then_reprocessed(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace)
+    body = _png_bytes((190, 110, 40))
+    post = _post("1306", body)
+    plan_id, adapter = _make_plan(settings, (post,))
+    transport = FakeDownloadTransport({post.file_url or "": FakeDownloadSpec(body)})
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, transport=transport, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    with create_session_factory(settings)() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        part = settings.projects_dir / str(job.project_id) / item.part_relative_path
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(body[:16])
+        item.status = ImageAcquisitionItemStatus.IMPORTING.value
+        item.received_bytes = 16
+        item.attempt_count = 1
+        job.status = ImageAcquisitionJobStatus.RUNNING.value
+        job.worker_id = "stale-worker"
+        job.claim_token = "stale-token"
+        job.worker_generation = 6
+        job.heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+        session.add(
+            ImageAcquisitionAttemptRecord(
+                id="stale-attempt-1306",
+                job_item_id=item.id,
+                attempt_number=1,
+                status="running",
+                worker_generation=6,
+                started_at=datetime.now(UTC) - timedelta(hours=1),
+                created_at=datetime.now(UTC) - timedelta(hours=1),
+            )
+        )
+        session.commit()
+
+    assert service.recover_stale_jobs() == 1
+    with create_session_factory(settings)() as session:
+        old_attempt = session.scalar(
+            select(ImageAcquisitionAttemptRecord).where(
+                ImageAcquisitionAttemptRecord.id == "stale-attempt-1306"
+            )
+        )
+        assert old_attempt is not None
+        assert old_attempt.status == "failed"
+        assert old_attempt.failure_code == DownloadFailureCode.WORKER_CLAIM_LOST.value
+        assert old_attempt.completed_at is not None
+
+    service.resume_job(job_id, auto_start=False)
+    service.run_job_sync(job_id)
     item = service.list_items(job_id)[0]
     assert item.status is ImageAcquisitionItemStatus.IMPORTED
+    with create_session_factory(settings)() as session:
+        attempts = session.scalars(
+            select(ImageAcquisitionAttemptRecord).order_by(
+                ImageAcquisitionAttemptRecord.attempt_number
+            )
+        ).all()
+        assert [attempt.attempt_number for attempt in attempts] == [1, 2]
+        assert all(attempt.status != "running" for attempt in attempts)
 
 
 def test_terminal_status_rejects_nonterminal_items(
@@ -771,11 +936,47 @@ def test_attempt_audit_rejects_old_worker_generation(
             None,
             {"etag": "old-worker"},
         )
+    with pytest.raises(_ClaimLost):
+        service._set_item_status(
+            job_id,
+            item_id,
+            worker,
+            token,
+            ImageAcquisitionItemStatus.VALIDATING,
+            generation=generation - 1,
+        )
+    with pytest.raises(_ClaimLost):
+        service._finish_attempt(
+            job_id,
+            item_id,
+            worker,
+            token,
+            generation - 1,
+            attempt,
+            "succeeded",
+            None,
+        )
+    service._finish_job(
+        job_id,
+        worker,
+        token,
+        generation - 1,
+        ImageAcquisitionJobStatus.FAILED,
+        DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR,
+    )
 
     with create_session_factory(settings)() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
         row = session.scalar(select(ImageAcquisitionAttemptRecord))
+        assert job is not None
+        assert job.status == ImageAcquisitionJobStatus.RUNNING.value
         assert row is not None
         assert row.http_status is None
+        assert row.status == "running"
 
 
 @pytest.mark.parametrize(

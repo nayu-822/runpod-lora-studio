@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import case, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from runpod_lora_studio.config.settings import AppSettings
@@ -198,10 +198,7 @@ class ImageAcquisitionDownloadService:
                 self._start_thread(UUID(existing.id))
             return UUID(existing.id)
         plan, items = self._load_confirmed_plan(plan_id)
-        try:
-            fresh_posts = self._revalidate_plan(plan, items)
-        except DanbooruSourceError as exc:
-            raise AcquisitionDownloadError(_source_failure(exc)) from exc
+        items = self._validate_plan_structure(plan, items)
         job_id = uuid4()
         now = datetime.now(UTC)
         expected_bytes = sum(item.expected_file_size or 0 for item in items) or None
@@ -257,7 +254,7 @@ class ImageAcquisitionDownloadService:
                         expected_height=item.expected_height,
                         expected_extension=item.expected_extension,
                         expected_file_size=item.expected_file_size,
-                        expected_file_url=fresh_posts[item.external_post_id].file_url,
+                        expected_file_url=None,
                         part_relative_path=f"acquisition/jobs/{job_id}/parts/{item_id}.part",
                         created_at=now,
                         updated_at=now,
@@ -404,8 +401,31 @@ class ImageAcquisitionDownloadService:
                         part = self._stale_part_path(job.project_id, item)
                         part_matches = self._part_matches_item(part, item)
                         if item.status == ImageAcquisitionItemStatus.IMPORTING.value:
-                            if self._recover_importing_item(session, job, item, now):
+                            if self._recover_importing_item(
+                                session, job, item, now, part
+                            ):
                                 continue
+                            self._finalize_stale_attempts(
+                                session,
+                                item,
+                                now,
+                                DownloadFailureCode.WORKER_CLAIM_LOST,
+                                retryable=True,
+                            )
+                        elif item.status not in {
+                            ImageAcquisitionItemStatus.IMPORTED.value,
+                            ImageAcquisitionItemStatus.LINKED_EXISTING.value,
+                            ImageAcquisitionItemStatus.SKIPPED.value,
+                            ImageAcquisitionItemStatus.FAILED.value,
+                            ImageAcquisitionItemStatus.CANCELED.value,
+                        }:
+                            self._finalize_stale_attempts(
+                                session,
+                                item,
+                                now,
+                                DownloadFailureCode.WORKER_CLAIM_LOST,
+                                retryable=True,
+                            )
                         if item.status == ImageAcquisitionItemStatus.DOWNLOADING.value:
                             target = ImageAcquisitionItemStatus.PENDING
                         elif item.status in {
@@ -428,13 +448,14 @@ class ImageAcquisitionDownloadService:
                             target = ImageAcquisitionItemStatus.PENDING
                         else:
                             continue
-                        if (
-                            not part_matches
-                            and part is not None
-                            and part.exists()
-                            and not part.is_symlink()
-                        ):
-                            part.unlink(missing_ok=True)
+                        if not part_matches:
+                            if (
+                                part is not None
+                                and part.exists()
+                                and not part.is_symlink()
+                                and part.is_file()
+                            ):
+                                part.unlink(missing_ok=True)
                             item.received_bytes = 0
                             item.etag = None
                             item.last_modified = None
@@ -471,6 +492,7 @@ class ImageAcquisitionDownloadService:
                 job_id,
                 worker,
                 token,
+                generation,
                 ImageAcquisitionJobStatus.FAILED,
                 DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR,
             )
@@ -512,9 +534,14 @@ class ImageAcquisitionDownloadService:
         try:
             self._validate_plan_structure(plan, plan_items)
         except AcquisitionDownloadError as exc:
-            self._fail_all_unfinished(job_id, worker, token, exc.code)
+            self._fail_all_unfinished(job_id, worker, token, generation, exc.code)
             self._finish_job(
-                job_id, worker, token, ImageAcquisitionJobStatus.FAILED, exc.code
+                job_id,
+                worker,
+                token,
+                generation,
+                ImageAcquisitionJobStatus.FAILED,
+                exc.code,
             )
             return
         while True:
@@ -526,6 +553,7 @@ class ImageAcquisitionDownloadService:
                     job_id,
                     worker,
                     token,
+                    generation,
                     ImageAcquisitionJobStatus.CANCELED,
                     DownloadFailureCode.CANCELED,
                 )
@@ -549,6 +577,7 @@ class ImageAcquisitionDownloadService:
                     job_id,
                     worker,
                     token,
+                    generation,
                     ImageAcquisitionJobStatus.CANCELED,
                     DownloadFailureCode.CANCELED,
                 )
@@ -567,8 +596,8 @@ class ImageAcquisitionDownloadService:
                     generation=generation,
                 )
         status, error = self._job_terminal_status(job_id)
-        self._write_manifest(job_id, worker, token, status)
-        self._finish_job(job_id, worker, token, status, error)
+        self._write_manifest(job_id, worker, token, generation, status)
+        self._finish_job(job_id, worker, token, generation, status, error)
 
     def _process_item(
         self,
@@ -599,7 +628,7 @@ class ImageAcquisitionDownloadService:
             source_type = ImageSourceType(item.source_type)
             external_post_id = item.external_post_id
             initial_status = item.status
-        self._check_cancel_or_claim(job_id, worker, token)
+        self._check_cancel_or_claim(job_id, worker, token, generation)
         adapter = self._adapter(source_type)
         max_attempts = self.settings.image_download_retry_max_attempts
         attempted = self._item_attempt_count(item_id)
@@ -632,7 +661,9 @@ class ImageAcquisitionDownloadService:
                 if self._source_link_exists(
                     post.source_type.value, post.external_post_id
                 ):
-                    self._mark_linked_existing(job_id, item_id, worker, token)
+                    self._mark_linked_existing(
+                        job_id, item_id, worker, token, generation
+                    )
                     self._finish_attempt(
                         job_id,
                         item_id,
@@ -650,7 +681,7 @@ class ImageAcquisitionDownloadService:
                     == ImageAcquisitionItemStatus.VALIDATION_PENDING.value
                 ):
                     verified = self._validate_staged_part(
-                        job_id, item_id, post, worker, token
+                        job_id, item_id, post, worker, token, generation
                     )
                 else:
                     verified = self._download_and_validate(
@@ -658,7 +689,14 @@ class ImageAcquisitionDownloadService:
                     )
                 try:
                     self._import_item(
-                        job_id, item_id, plan, post, verified, worker, token
+                        job_id,
+                        item_id,
+                        plan,
+                        post,
+                        verified,
+                        worker,
+                        token,
+                        generation,
                     )
                 except OSError as exc:
                     raise AcquisitionDownloadError(
@@ -865,12 +903,18 @@ class ImageAcquisitionDownloadService:
         post: ImageSourcePost,
         worker: str,
         token: str,
+        generation: int,
     ) -> VerifiedImageFile:
         path, _ = self._item_path(job_id, item_id)
         self._set_item_status(
-            job_id, item_id, worker, token, ImageAcquisitionItemStatus.VALIDATING
+            job_id,
+            item_id,
+            worker,
+            token,
+            ImageAcquisitionItemStatus.VALIDATING,
+            generation=generation,
         )
-        self._check_cancel_or_claim(job_id, worker, token)
+        self._check_cancel_or_claim(job_id, worker, token, generation)
         verified = self.ingestion.inspect_image(
             path,
             expected_md5=post.source_md5,
@@ -879,7 +923,7 @@ class ImageAcquisitionDownloadService:
             expected_height=post.height,
             expected_extension=post.file_extension,
         )
-        self._set_verified(job_id, item_id, worker, token, verified)
+        self._set_verified(job_id, item_id, worker, token, verified, generation)
         return verified
 
     def _download_and_validate(
@@ -894,7 +938,12 @@ class ImageAcquisitionDownloadService:
     ) -> VerifiedImageFile:
         path, item = self._item_path(job_id, item_id)
         self._set_item_status(
-            job_id, item_id, worker, token, ImageAcquisitionItemStatus.DOWNLOADING
+            job_id,
+            item_id,
+            worker,
+            token,
+            ImageAcquisitionItemStatus.DOWNLOADING,
+            generation=generation,
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         resume_start = self._resume_start(path, item, post)
@@ -904,9 +953,9 @@ class ImageAcquisitionDownloadService:
             etag=item.etag,
             last_modified=item.last_modified,
         )
-        self._check_cancel_or_claim(job_id, worker, token)
+        self._check_cancel_or_claim(job_id, worker, token, generation)
         response = self.transport.open(request)
-        self._check_cancel_or_claim(job_id, worker, token)
+        self._check_cancel_or_claim(job_id, worker, token, generation)
         headers = _normalized_headers(response.headers)
         self._record_attempt_response(
             job_id,
@@ -987,7 +1036,7 @@ class ImageAcquisitionDownloadService:
                 for chunk in response.iter_chunks(
                     self.settings.image_download_chunk_size
                 ):
-                    self._check_cancel_or_claim(job_id, worker, token)
+                    self._check_cancel_or_claim(job_id, worker, token, generation)
                     if not isinstance(chunk, bytes) or not chunk:
                         continue
                     received += len(chunk)
@@ -1021,12 +1070,22 @@ class ImageAcquisitionDownloadService:
         if range_total is not None and received != range_total:
             raise AcquisitionDownloadError(DownloadFailureCode.RECEIVED_SIZE_MISMATCH)
         self._set_item_status(
-            job_id, item_id, worker, token, ImageAcquisitionItemStatus.DOWNLOADED
+            job_id,
+            item_id,
+            worker,
+            token,
+            ImageAcquisitionItemStatus.DOWNLOADED,
+            generation=generation,
         )
         self._set_item_status(
-            job_id, item_id, worker, token, ImageAcquisitionItemStatus.VALIDATING
+            job_id,
+            item_id,
+            worker,
+            token,
+            ImageAcquisitionItemStatus.VALIDATING,
+            generation=generation,
         )
-        self._check_cancel_or_claim(job_id, worker, token)
+        self._check_cancel_or_claim(job_id, worker, token, generation)
         verified = self.ingestion.inspect_image(
             path,
             expected_md5=post.source_md5,
@@ -1035,7 +1094,7 @@ class ImageAcquisitionDownloadService:
             expected_height=post.height,
             expected_extension=post.file_extension,
         )
-        self._set_verified(job_id, item_id, worker, token, verified)
+        self._set_verified(job_id, item_id, worker, token, verified, generation)
         return verified
 
     def _import_item(
@@ -1047,10 +1106,16 @@ class ImageAcquisitionDownloadService:
         verified: VerifiedImageFile,
         worker: str,
         token: str,
+        generation: int,
     ) -> None:
-        self._check_cancel_or_claim(job_id, worker, token)
+        self._check_cancel_or_claim(job_id, worker, token, generation)
         self._set_item_status(
-            job_id, item_id, worker, token, ImageAcquisitionItemStatus.IMPORTING
+            job_id,
+            item_id,
+            worker,
+            token,
+            ImageAcquisitionItemStatus.IMPORTING,
+            generation=generation,
         )
         provenance = ImageSourceProvenance(
             source_type=post.source_type,
@@ -1070,7 +1135,15 @@ class ImageAcquisitionDownloadService:
             if result.linked_existing
             else ImageAcquisitionItemStatus.IMPORTED
         )
-        self._set_item_complete(job_id, item_id, worker, token, status, result.image.id)
+        self._set_item_complete(
+            job_id,
+            item_id,
+            worker,
+            token,
+            status,
+            result.image.id,
+            generation,
+        )
         self._remove_part(job_id, item_id)
 
     def _validate_plan_structure(
@@ -1200,24 +1273,6 @@ class ImageAcquisitionDownloadService:
             raise AcquisitionDownloadError(DownloadFailureCode.SOURCE_MD5_INVALID)
         return post
 
-    def _revalidate_plan(
-        self,
-        plan: ImageAcquisitionPlanRecord,
-        items: Iterable[ImageAcquisitionPlanItemRecord],
-    ) -> dict[str, ImageSourcePost]:
-        """Perform start-time preflight; worker-time checks are item-scoped."""
-        materialized_items = self._validate_plan_structure(plan, items)
-        adapter = self._adapter(ImageSourceType(plan.source_type))
-        fresh_posts: dict[str, ImageSourcePost] = {}
-        for item in materialized_items:
-            post = self._load_current_source_post(adapter, item.external_post_id)
-            if not self._item_matches_values(item, post):
-                raise AcquisitionDownloadError(
-                    DownloadFailureCode.PLAN_METADATA_CHANGED
-                )
-            fresh_posts[item.external_post_id] = post
-        return fresh_posts
-
     def _load_confirmed_plan(
         self, plan_id: UUID, *, by_job: bool = False
     ) -> tuple[ImageAcquisitionPlanRecord, list[ImageAcquisitionPlanItemRecord]]:
@@ -1340,7 +1395,14 @@ class ImageAcquisitionDownloadService:
                     .exists(),
                 )
                 .values(
-                    status=ImageAcquisitionItemStatus.DOWNLOADING.value,
+                    status=case(
+                        (
+                            ImageAcquisitionJobItemRecord.status
+                            == ImageAcquisitionItemStatus.VALIDATION_PENDING.value,
+                            ImageAcquisitionItemStatus.VALIDATION_PENDING.value,
+                        ),
+                        else_=ImageAcquisitionItemStatus.DOWNLOADING.value,
+                    ),
                     started_at=datetime.now(UTC),
                     updated_at=datetime.now(UTC),
                 )
@@ -1389,7 +1451,9 @@ class ImageAcquisitionDownloadService:
             )
             return item.id if item else None
 
-    def _check_cancel_or_claim(self, job_id: UUID, worker: str, token: str) -> None:
+    def _check_cancel_or_claim(
+        self, job_id: UUID, worker: str, token: str, generation: int
+    ) -> None:
         with self.session_factory() as session:
             job = session.scalar(
                 select(ImageAcquisitionJobRecord).where(
@@ -1398,6 +1462,7 @@ class ImageAcquisitionDownloadService:
                     == ImageAcquisitionJobStatus.RUNNING.value,
                     ImageAcquisitionJobRecord.worker_id == worker,
                     ImageAcquisitionJobRecord.claim_token == token,
+                    ImageAcquisitionJobRecord.worker_generation == generation,
                 )
             )
             if job is None:
@@ -1412,12 +1477,15 @@ class ImageAcquisitionDownloadService:
         worker: str,
         token: str,
         status: ImageAcquisitionItemStatus,
+        *,
+        generation: int,
     ) -> None:
         self._conditional_item_update(
             job_id,
             item_id,
             worker,
             token,
+            generation=generation,
             status=status.value,
             updated_at=datetime.now(UTC),
         )
@@ -1430,12 +1498,14 @@ class ImageAcquisitionDownloadService:
         token: str,
         status: ImageAcquisitionItemStatus,
         image_id: UUID,
+        generation: int,
     ) -> None:
         self._conditional_item_update(
             job_id,
             item_id,
             worker,
             token,
+            generation=generation,
             status=status.value,
             image_asset_id=str(image_id),
             completed_at=datetime.now(UTC),
@@ -1451,12 +1521,14 @@ class ImageAcquisitionDownloadService:
         worker: str,
         token: str,
         verified: VerifiedImageFile,
+        generation: int,
     ) -> None:
         self._conditional_item_update(
             job_id,
             item_id,
             worker,
             token,
+            generation=generation,
             status=ImageAcquisitionItemStatus.VALIDATED.value,
             calculated_md5=verified.md5,
             calculated_sha256=verified.sha256,
@@ -1475,7 +1547,7 @@ class ImageAcquisitionDownloadService:
         worker: str,
         token: str,
         *,
-        generation: int | None = None,
+        generation: int,
         **values: Any,
     ) -> None:
         with self.session_factory() as session:
@@ -1776,8 +1848,17 @@ class ImageAcquisitionDownloadService:
         worker: str,
         token: str,
         code: DownloadFailureCode,
+        generation: int,
     ) -> None:
-        self._set_item_failure(job_id, item_id, worker, token, code, True)
+        self._set_item_failure(
+            job_id,
+            item_id,
+            worker,
+            token,
+            code,
+            True,
+            generation=generation,
+        )
 
     def _item_attempt_count(self, item_id: str) -> int:
         with self.session_factory() as session:
@@ -1798,7 +1879,7 @@ class ImageAcquisitionDownloadService:
         retryable: bool,
         *,
         canceled: bool = False,
-        generation: int | None = None,
+        generation: int,
         http_status: int | None = None,
         retry_after: float | None = None,
     ) -> None:
@@ -1812,6 +1893,7 @@ class ImageAcquisitionDownloadService:
             item_id,
             worker,
             token,
+            generation=generation,
             status=status.value,
             failure_code=code.value,
             failure_message=code.value,
@@ -1819,22 +1901,21 @@ class ImageAcquisitionDownloadService:
             completed_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
         )
-        if generation is not None:
-            self._finish_attempt(
-                job_id,
-                item_id,
-                worker,
-                token,
-                generation,
-                self._item_attempt_count(item_id),
-                "failed",
-                code,
-                http_status=http_status,
-                retry_after=retry_after,
-            )
+        self._finish_attempt(
+            job_id,
+            item_id,
+            worker,
+            token,
+            generation,
+            self._item_attempt_count(item_id),
+            "failed",
+            code,
+            http_status=http_status,
+            retry_after=retry_after,
+        )
 
     def _mark_linked_existing(
-        self, job_id: UUID, item_id: str, worker: str, token: str
+        self, job_id: UUID, item_id: str, worker: str, token: str, generation: int
     ) -> None:
         with self.session_factory() as session:
             item = session.scalar(
@@ -1857,6 +1938,7 @@ class ImageAcquisitionDownloadService:
             item_id,
             worker,
             token,
+            generation=generation,
             status=(
                 ImageAcquisitionItemStatus.LINKED_EXISTING.value
                 if image_asset_id
@@ -1957,12 +2039,36 @@ class ImageAcquisitionDownloadService:
         except OSError:
             return False
 
+    @staticmethod
+    def _finalize_stale_attempts(
+        session: Any,
+        item: ImageAcquisitionJobItemRecord,
+        now: datetime,
+        code: DownloadFailureCode,
+        *,
+        retryable: bool,
+        status: str = "failed",
+    ) -> None:
+        attempts = session.scalars(
+            select(ImageAcquisitionAttemptRecord).where(
+                ImageAcquisitionAttemptRecord.job_item_id == item.id,
+                ImageAcquisitionAttemptRecord.status == "running",
+            )
+        ).all()
+        for attempt in attempts:
+            attempt.status = status
+            attempt.failure_code = code.value if status == "failed" else None
+            attempt.retryable = retryable
+            attempt.received_bytes = item.received_bytes
+            attempt.completed_at = now
+
     def _recover_importing_item(
         self,
         session: Any,
         job: ImageAcquisitionJobRecord,
         item: ImageAcquisitionJobItemRecord,
         now: datetime,
+        part: Path | None,
     ) -> bool:
         link = session.scalar(
             select(ExternalImageAssetLinkRecord).where(
@@ -2003,6 +2109,21 @@ class ImageAcquisitionDownloadService:
             or not thumbnail.is_file()
         ):
             return False
+        if part is not None and part.exists():
+            if part.is_symlink() or not part.is_file():
+                return False
+            try:
+                part.unlink()
+            except OSError:
+                return False
+        self._finalize_stale_attempts(
+            session,
+            item,
+            now,
+            DownloadFailureCode.WORKER_CLAIM_LOST,
+            retryable=False,
+            status="succeeded",
+        )
         item.image_asset_id = asset.id
         item.status = (
             ImageAcquisitionItemStatus.IMPORTED.value
@@ -2012,6 +2133,11 @@ class ImageAcquisitionDownloadService:
         item.failure_code = None
         item.failure_message = None
         item.retryable = False
+        item.received_bytes = 0
+        item.etag = None
+        item.last_modified = None
+        item.accept_ranges = False
+        item.range_start = None
         item.completed_at = now
         item.updated_at = now
         return True
@@ -2341,6 +2467,7 @@ class ImageAcquisitionDownloadService:
         job_id: UUID,
         worker: str,
         token: str,
+        generation: int,
         status: ImageAcquisitionJobStatus,
         error: DownloadFailureCode | None,
     ) -> None:
@@ -2350,6 +2477,7 @@ class ImageAcquisitionDownloadService:
                     ImageAcquisitionJobRecord.id == str(job_id),
                     ImageAcquisitionJobRecord.worker_id == worker,
                     ImageAcquisitionJobRecord.claim_token == token,
+                    ImageAcquisitionJobRecord.worker_generation == generation,
                 )
             )
             if job is None:
@@ -2368,7 +2496,12 @@ class ImageAcquisitionDownloadService:
         self._recompute_counts(job_id)
 
     def _fail_all_unfinished(
-        self, job_id: UUID, worker: str, token: str, code: DownloadFailureCode
+        self,
+        job_id: UUID,
+        worker: str,
+        token: str,
+        generation: int,
+        code: DownloadFailureCode,
     ) -> None:
         with self.session_factory() as session:
             items = session.scalars(
@@ -2380,6 +2513,16 @@ class ImageAcquisitionDownloadService:
                             ImageAcquisitionItemStatus.DOWNLOADING.value,
                         ]
                     ),
+                    select(ImageAcquisitionJobRecord.id)
+                    .where(
+                        ImageAcquisitionJobRecord.id == str(job_id),
+                        ImageAcquisitionJobRecord.status
+                        == ImageAcquisitionJobStatus.RUNNING.value,
+                        ImageAcquisitionJobRecord.worker_id == worker,
+                        ImageAcquisitionJobRecord.claim_token == token,
+                        ImageAcquisitionJobRecord.worker_generation == generation,
+                    )
+                    .exists(),
                 )
             ).all()
             for item in items:
@@ -2395,6 +2538,7 @@ class ImageAcquisitionDownloadService:
         job_id: UUID,
         worker: str,
         token: str,
+        generation: int,
         final_status: ImageAcquisitionJobStatus,
     ) -> None:
         with self.session_factory() as session:
@@ -2403,6 +2547,7 @@ class ImageAcquisitionDownloadService:
                     ImageAcquisitionJobRecord.id == str(job_id),
                     ImageAcquisitionJobRecord.worker_id == worker,
                     ImageAcquisitionJobRecord.claim_token == token,
+                    ImageAcquisitionJobRecord.worker_generation == generation,
                 )
             )
             if job is None:

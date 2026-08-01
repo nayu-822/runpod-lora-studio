@@ -7,7 +7,7 @@ import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +107,13 @@ class SubprocessTrainingAdapter:
         if process is None or process.poll() is not None:
             return
         if os.name != "nt":
-            os.killpg(os.getpgid(pid), signal.SIGTERM)  # type: ignore[attr-defined]
+            getpgid = getattr(os, "getpgid", None)
+            killpg = getattr(os, "killpg", None)
+            if not callable(getpgid) or not callable(killpg):
+                return
+            group_id = getpgid(pid)
+            if isinstance(group_id, int):
+                killpg(group_id, signal.SIGTERM)
         else:
             process.terminate()
 
@@ -116,7 +122,13 @@ class SubprocessTrainingAdapter:
         if process is None or process.poll() is not None:
             return
         if os.name != "nt":
-            os.killpg(os.getpgid(pid), _sigkill())  # type: ignore[attr-defined]
+            getpgid = getattr(os, "getpgid", None)
+            killpg = getattr(os, "killpg", None)
+            if not callable(getpgid) or not callable(killpg):
+                return
+            group_id = getpgid(pid)
+            if isinstance(group_id, int):
+                killpg(group_id, _sigkill())
         else:
             process.kill()
 
@@ -200,7 +212,11 @@ def _process_group_id(pid: int) -> int | None:
     if os.name == "nt":
         return pid
     try:
-        return cast(int, os.getpgid(pid))  # type: ignore[attr-defined]
+        getpgid = getattr(os, "getpgid", None)
+        if not callable(getpgid):
+            return None
+        group_id = getpgid(pid)
+        return group_id if isinstance(group_id, int) else None
     except OSError:
         return None
 

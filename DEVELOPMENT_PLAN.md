@@ -327,8 +327,10 @@ Phase 5のレビュー対応を完了し、完了扱いへ更新する。Alembic
 - attempt番号はjob item単位で累積し、開始記録をitem更新と同一トランザクションで作成する。監査更新はjob／worker／claim token／generation／attemptの全条件で保護する
 - stale復旧はdownloading、downloaded、validating、validated、importingを対象とし、整合する`.part`はvalidation pendingへ、不完全なimportは再処理へ戻し、既存linkと検証済みファイルは冪等に再利用する
 - RangeのETagとLast-Modifiedを別々に比較し、Content-Range全体・Content-Length・期待サイズを検証する。HTTP 401／403／404は再試行せず、408／429／500-504等だけを再試行する
+- start_jobでは外部postの一括取得を行わず、実行時に使用しない最新URLをjob itemへ保存しない。各item直前のsource再確認で恒久エラーをitem単位に記録する
+- stale復旧で旧workerのrunning attemptを成功復旧または`WORKER_CLAIM_LOST`として終端化し、worker generation違いのitem／attempt／job更新を拒否する
 
-Phase 8Bの実装とレビュー指摘対応は完了。Google Driveへの成果物同期、完了manifestのDrive保存、PodのStop／TerminateはPhase 9で実装する。
+Phase 8Bの実装とレビュー指摘対応は、追加テストと品質チェックの成功を確認済み。Google Driveへの成果物同期、完了manifestのDrive保存、PodのStop／TerminateはPhase 9で実装する。
 
 ## Phase 9: 完了処理・Google Drive同期・Pod終了
 
