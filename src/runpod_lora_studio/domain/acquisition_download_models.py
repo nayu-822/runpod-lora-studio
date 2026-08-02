@@ -77,6 +77,13 @@ class DownloadFailureCode(StrEnum):
     UNKNOWN_DOWNLOAD_ERROR = "UNKNOWN_DOWNLOAD_ERROR"
 
 
+class PartCleanupWarningCode(StrEnum):
+    CLEANUP_FAILED = "PART_CLEANUP_FAILED"
+    PATH_INVALID = "PART_PATH_INVALID"
+    SYMLINK_REJECTED = "PART_SYMLINK_REJECTED"
+    NOT_REGULAR_FILE = "PART_NOT_REGULAR_FILE"
+
+
 @dataclass(frozen=True, slots=True)
 class ImageSourceProvenance:
     source_type: ImageSourceType
@@ -139,3 +146,4 @@ class AcquisitionItemView:
     sha256_prefix: str | None
     failure_code: str | None
     retryable: bool
+    part_cleanup_warning: str | None = None

@@ -333,7 +333,7 @@ Phase 5のレビュー対応を完了し、完了扱いへ更新する。Alembic
 - stale復旧後はjobを`queued`へ戻し、新しいworker claimの下でcounter再計算、terminal status判定、manifest生成、`completed_at`設定、active key解除を行う。import成功済みitemだけが残る場合もjobとmanifestを終端化する
 - `get_post()`はmetadataの単発requestとし、item attemptをretryの正本にする。request前後とRetry-After待機中にcancel、claim、generation、heartbeatを確認し、二重retryを行わない
 
-Phase 8Bの実装とレビュー指摘対応は、追加テストと品質チェックの成功を確認済み。`ruff format --check .`、`ruff check .`、`mypy src`が成功し、`pytest`は`342 passed, 2 skipped, 77 warnings`である。Google Driveへの成果物同期、完了manifestのDrive保存、PodのStop／TerminateはPhase 9で実装する。
+Phase 8Bの実装とレビュー指摘対応は、追加テストと品質チェックの成功を確認済み。`ruff format --check .`、`ruff check .`、`mypy src`が成功し、`pytest`は`348 passed, 10 skipped, 77 warnings`である。Google Driveへの成果物同期、完了manifestのDrive保存、PodのStop／TerminateはPhase 9で実装する。
 
 ## Phase 9: 完了処理・Google Drive同期・Pod終了
 
@@ -587,6 +587,6 @@ Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は�
 - 取得計画のpreview fingerprintには検索fingerprint、adapter version、plan状態、選択件数、候補メタデータを含める。confirm時にDBを再検証し、確定済みplanは不変・冪等で、画像ダウンロードは行わない。UIは外部画像を表示せず、ratingと除外理由を日本語で表示する。
 - Phase 8Bの画像取得、ファイル検証、ImageRecord登録、サムネイル、外部post provenance、停止再開は実装済みである。ZIP、他source、tagger／dataset／Drive連携は未実装であり、成果物のDrive同期とPod終了はPhase 9の対象である。
 - source metadataの`get_post()`はitem attempt単位の単発requestとし、cancelで呼出元が先に戻る場合もクライアント単位の上限1 executorが実transportを保持する。limiterのleaseと`after_request`は実transport終了後にだけ解放・実行し、cancel直後のrequest再利用、thread無制限増加、429／Retry-After、callback／transport／claim喪失時のrelease監査を回帰テストで確認する。URL、Authorization、API key、raw responseはログへ出さない。
-- manifestはworker generationとランダムUUID断片による固有temporary／final fileへ書き込み、JSONのfsync中にSQLite write transactionを保持しない。final fileの相対pathはclaim条件付きUPDATEで保存し、old workerのclaim喪失時は自worker作成fileだけをcleanupする。projects root外、symlink、path traversalを拒否し、DBが参照するmanifestはregular fileとして確定する。
-- plan検証の恒久エラー時は、`PENDING`、`DOWNLOADING`、`DOWNLOADED`、`VALIDATION_PENDING`、`VALIDATING`、`VALIDATED`、`IMPORTING`の全非終端itemとrunning attemptを同一failure codeでFAILED・非retryableに終端化し、安全な`.part`をcleanupしてからcounterを再計算し、`pending_count=0`、`downloading_count=0`を含むmanifestを生成する。`IMPORTED`、`LINKED_EXISTING`、`SKIPPED`は変更しない。
-- 最新HEADで`ruff format --check .`、`ruff check .`、`mypy src`が成功し、`pytest`は`342 passed, 2 skipped, 77 warnings`である。Phase 8Bでは過去migrationを変更せず、新規migrationも追加しない。
+- manifestはworker generationとランダムUUID断片による固有temporary／final fileへ書き込み、JSONのfsync中にSQLite write transactionを保持しない。`project_root`から`manifests`までの各親componentを`lstat`してsymlink、path traversal、projects root外を拒否し、不足ディレクトリは検証しながら作成する。temporaryは`O_CREAT|O_EXCL`（対応環境では`O_NOFOLLOW`／directory fd）で作成し、file fsync、claim再確認、atomic replace、manifest directory fsync、親とfinalの再検証、claim条件付きUPDATE、commit後の参照確認を順序どおり実行する。old workerのclaim喪失やDB更新失敗時は自worker作成fileだけをcleanupし、ambiguous commitでDBが参照済みのfileは削除しない。DBが参照するmanifestはprojects root内のregular fileとして確定する。
+- plan検証の恒久エラー時は、`PENDING`、`DOWNLOADING`、`DOWNLOADED`、`VALIDATION_PENDING`、`VALIDATING`、`VALIDATED`、`IMPORTING`の全非終端itemとrunning attemptを同一failure codeでFAILED・非retryableに終端化し、安全な`.part`をcleanupしてからcounterを再計算し、`pending_count=0`、`downloading_count=0`を含むmanifestを生成する。cleanup不能・不審pathは新規migration `0032_phase8b_part_cleanup_warnings`で追加したitemの`part_cleanup_warning`、manifest、`AcquisitionItemView`へ`PART_CLEANUP_FAILED`、`PART_PATH_INVALID`、`PART_SYMLINK_REJECTED`、`PART_NOT_REGULAR_FILE`の固定コードで保存する。`IMPORTED`、`LINKED_EXISTING`、`SKIPPED`は変更せず、絶対パスやraw exceptionも保存しない。
+- 最新HEADで`ruff format --check .`、`ruff check .`、`mypy src`が成功し、`pytest`は`348 passed, 10 skipped, 77 warnings`である。Phase 8Bでは過去migrationを変更せず、`0032_phase8b_part_cleanup_warnings`を現在のHEADの子として追加する。

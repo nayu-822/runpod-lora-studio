@@ -2080,6 +2080,7 @@ class ImageAcquisitionJobItemRecord(Base):
     )
     failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     failure_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    part_cleanup_warning: Mapped[str | None] = mapped_column(String(64), nullable=True)
     retryable: Mapped[bool] = mapped_column(Integer, nullable=False, default=False)
     started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

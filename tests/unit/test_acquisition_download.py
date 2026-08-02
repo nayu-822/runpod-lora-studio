@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import shutil
 import threading
 import time
 from dataclasses import replace
@@ -20,6 +22,7 @@ from runpod_lora_studio.domain.acquisition_download_models import (
     DownloadFailureCode,
     ImageAcquisitionItemStatus,
     ImageAcquisitionJobStatus,
+    PartCleanupWarningCode,
 )
 from runpod_lora_studio.domain.acquisition_models import (
     AcquisitionErrorCode,
@@ -1615,6 +1618,7 @@ def test_plan_validation_failure_finishes_every_unfinished_item(
     item_view = service.list_items(job_id)[0]
     assert item_view.status is ImageAcquisitionItemStatus.FAILED
     assert item_view.failure_code == DownloadFailureCode.PLAN_METADATA_CHANGED.value
+    assert item_view.part_cleanup_warning is None
     assert not part.exists()
     with session_factory() as session:
         stored_job = session.scalar(
@@ -1637,9 +1641,454 @@ def test_plan_validation_failure_finishes_every_unfinished_item(
         )
         manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
         assert manifest_data["status"] == ImageAcquisitionJobStatus.FAILED.value
+        assert manifest_data["part_cleanup_warning_codes"] == []
+        assert manifest_data["items"][0]["part_cleanup_warning"] is None
         assert manifest_data["pending_count"] == 0
         assert manifest_data["downloading_count"] == 0
         assert manifest_data["failed_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("cleanup_kind", "expected_warning"),
+    [
+        ("absent", None),
+        ("invalid", PartCleanupWarningCode.PATH_INVALID.value),
+        ("directory", PartCleanupWarningCode.NOT_REGULAR_FILE.value),
+        ("unlink_failed", PartCleanupWarningCode.CLEANUP_FAILED.value),
+        ("symlink", PartCleanupWarningCode.SYMLINK_REJECTED.value),
+    ],
+)
+def test_plan_validation_cleanup_result_is_audited(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_kind: str,
+    expected_warning: str | None,
+) -> None:
+    if cleanup_kind == "directory" and os.name == "nt":
+        pytest.skip("Windows test workspace path is too long for directory fixture")
+    settings = _settings(test_workspace)
+    post = _post("1342", _png_bytes((30, 90, 160)))
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    generation = service._claim_job(job_id, "cleanup-worker", "cleanup-token")
+    assert generation is not None
+    session_factory = create_session_factory(settings)
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        item.status = ImageAcquisitionItemStatus.DOWNLOADING.value
+        item.received_bytes = 1
+        item.attempt_count = 1
+        if cleanup_kind == "invalid":
+            item.part_relative_path = "../outside-part.part"
+        elif cleanup_kind == "directory":
+            item.part_relative_path = f"acquisition/jobs/{job_id}/{item.id}.part"
+        part = settings.projects_dir / job.project_id / item.part_relative_path
+        now = datetime.now(UTC)
+        session.add(
+            ImageAcquisitionAttemptRecord(
+                id=f"cleanup-attempt-{cleanup_kind}",
+                job_item_id=item.id,
+                attempt_number=1,
+                status="running",
+                worker_generation=generation,
+                started_at=now,
+                created_at=now,
+            )
+        )
+        session.commit()
+
+    if cleanup_kind == "directory":
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.mkdir()
+    elif cleanup_kind == "unlink_failed":
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(b"x")
+
+        def fail_unlink(_: Path, *, missing_ok: bool = False) -> None:
+            del missing_ok
+            raise OSError("intentional test failure")
+
+        monkeypatch.setattr(Path, "unlink", fail_unlink)
+    elif cleanup_kind == "symlink":
+        part.parent.mkdir(parents=True, exist_ok=True)
+        target = test_workspace / "outside-part-target"
+        target.write_bytes(b"must remain")
+        try:
+            part.symlink_to(target)
+        except OSError:
+            pytest.skip("symlink creation is unavailable")
+
+    service._fail_all_unfinished(
+        job_id,
+        "cleanup-worker",
+        "cleanup-token",
+        generation,
+        DownloadFailureCode.PLAN_METADATA_CHANGED,
+    )
+    counts = service._recompute_counts(
+        job_id, "cleanup-worker", "cleanup-token", generation
+    )
+    service._write_manifest(
+        job_id,
+        "cleanup-worker",
+        "cleanup-token",
+        generation,
+        ImageAcquisitionJobStatus.FAILED,
+        counts=counts,
+    )
+    service._finish_job(
+        job_id,
+        "cleanup-worker",
+        "cleanup-token",
+        generation,
+        ImageAcquisitionJobStatus.FAILED,
+        DownloadFailureCode.PLAN_METADATA_CHANGED,
+    )
+
+    item_view = service.list_items(job_id)[0]
+    assert item_view.status is ImageAcquisitionItemStatus.FAILED
+    assert item_view.part_cleanup_warning == expected_warning
+    with session_factory() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        stored_item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        attempt = session.scalar(select(ImageAcquisitionAttemptRecord))
+        assert stored_job is not None and stored_item is not None
+        assert stored_item.part_cleanup_warning == expected_warning
+        assert attempt is not None and attempt.status == "failed"
+        assert stored_job.manifest_relative_path is not None
+        manifest_path = (
+            settings.projects_dir
+            / stored_job.project_id
+            / stored_job.manifest_relative_path
+        )
+    manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest_data["part_cleanup_warning_codes"] == (
+        [expected_warning] if expected_warning else []
+    )
+    assert manifest_data["items"][0]["part_cleanup_warning"] == expected_warning
+    assert str(test_workspace) not in json.dumps(manifest_data)
+    assert "intentional test failure" not in json.dumps(manifest_data)
+
+
+@pytest.mark.parametrize("component", ["acquisition", "jobs", "job", "manifests"])
+def test_manifest_rejects_symlink_parent_components(
+    test_workspace: Path,
+    component: str,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1343", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    generation = service._claim_job(job_id, "symlink-worker", "symlink-token")
+    assert generation is not None
+    counts = service._recompute_counts(
+        job_id, "symlink-worker", "symlink-token", generation
+    )
+    with create_session_factory(settings)() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert job is not None
+        project_id = job.project_id
+    project_root = settings.projects_dir / project_id
+    target = project_root / "manifest-symlink-target"
+    target.mkdir(parents=True)
+    link = project_root / "acquisition"
+    if component == "jobs":
+        link = project_root / "acquisition" / "jobs"
+        link.parent.mkdir(parents=True, exist_ok=True)
+    elif component == "job":
+        link = project_root / "acquisition" / "jobs" / str(job_id)
+        link.parent.mkdir(parents=True, exist_ok=True)
+    elif component == "manifests":
+        link = project_root / "acquisition" / "jobs" / str(job_id) / "manifests"
+        link.parent.mkdir(parents=True, exist_ok=True)
+    if link.exists() and not link.is_symlink():
+        shutil.rmtree(link)
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    service._write_manifest(
+        job_id,
+        "symlink-worker",
+        "symlink-token",
+        generation,
+        ImageAcquisitionJobStatus.COMPLETED,
+        counts=counts,
+    )
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.manifest_relative_path is None
+        assert stored_job.manifest_warning == "MANIFEST_WRITE_FAILED"
+    assert not list(target.glob("manifest-*.json"))
+    assert str(target) not in stored_job.manifest_warning
+
+
+@pytest.mark.parametrize("artifact_kind", ["temporary", "final"])
+def test_manifest_rejects_existing_artifact_symlink(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_kind: str,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1344", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    generation = service._claim_job(job_id, "artifact-worker", "artifact-token")
+    assert generation is not None
+    counts = service._recompute_counts(
+        job_id, "artifact-worker", "artifact-token", generation
+    )
+    fixed_uuid = UUID("11111111-1111-4111-8111-111111111111")
+    monkeypatch.setattr(acquisition_download_module, "uuid4", lambda: fixed_uuid)
+    with create_session_factory(settings)() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert job is not None
+        project_id = job.project_id
+    project_root = settings.projects_dir / project_id
+    manifest_dir = project_root / "acquisition" / "jobs" / str(job_id) / "manifests"
+    manifest_dir.mkdir(parents=True)
+    final = manifest_dir / "manifest-g1-111111111111.json"
+    artifact = (
+        manifest_dir / ".manifest-g1-111111111111.json.tmp"
+        if artifact_kind == "temporary"
+        else final
+    )
+    target = test_workspace / f"{artifact_kind}-target"
+    target.write_bytes(b"must remain")
+    try:
+        artifact.symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    service._write_manifest(
+        job_id,
+        "artifact-worker",
+        "artifact-token",
+        generation,
+        ImageAcquisitionJobStatus.COMPLETED,
+        counts=counts,
+    )
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.manifest_relative_path is None
+        assert stored_job.manifest_warning == "MANIFEST_WRITE_FAILED"
+    assert target.read_bytes() == b"must remain"
+
+
+def test_manifest_operations_sync_directory_before_db_update(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1345", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    generation = service._claim_job(job_id, "order-worker", "order-token")
+    assert generation is not None
+    counts = service._recompute_counts(
+        job_id, "order-worker", "order-token", generation
+    )
+    events: list[str] = []
+    original_open = service._open_manifest_temporary
+    original_fsync = acquisition_download_module.os.fsync
+    original_replace = service._atomic_replace_manifest
+    original_directory_fsync = service._fsync_manifest_directory
+
+    def open_temporary(path: Path) -> object:
+        events.append("temporary_write")
+        return original_open(path)
+
+    def fsync(descriptor: int) -> None:
+        events.append("file_fsync")
+        original_fsync(descriptor)
+
+    def replace(temporary: Path, final: Path) -> None:
+        events.append("atomic_replace")
+        original_replace(temporary, final)
+
+    def fsync_directory(path: Path) -> None:
+        events.append("directory_fsync")
+        original_directory_fsync(path)
+
+    monkeypatch.setattr(service, "_open_manifest_temporary", open_temporary)
+    monkeypatch.setattr(acquisition_download_module.os, "fsync", fsync)
+    monkeypatch.setattr(service, "_atomic_replace_manifest", replace)
+    monkeypatch.setattr(service, "_fsync_manifest_directory", fsync_directory)
+
+    service._write_manifest(
+        job_id,
+        "order-worker",
+        "order-token",
+        generation,
+        ImageAcquisitionJobStatus.COMPLETED,
+        counts=counts,
+    )
+    assert events.index("temporary_write") < events.index("file_fsync")
+    assert events.index("file_fsync") < events.index("atomic_replace")
+    assert events.index("atomic_replace") < events.index("directory_fsync")
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.manifest_relative_path is not None
+
+
+def test_manifest_directory_fsync_failure_does_not_update_db(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1346", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    generation = service._claim_job(job_id, "fsync-worker", "fsync-token")
+    assert generation is not None
+    counts = service._recompute_counts(
+        job_id, "fsync-worker", "fsync-token", generation
+    )
+
+    def fail_directory_fsync(_: Path) -> None:
+        raise OSError("intentional fsync failure")
+
+    monkeypatch.setattr(service, "_fsync_manifest_directory", fail_directory_fsync)
+    service._write_manifest(
+        job_id,
+        "fsync-worker",
+        "fsync-token",
+        generation,
+        ImageAcquisitionJobStatus.COMPLETED,
+        counts=counts,
+    )
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.manifest_relative_path is None
+        assert stored_job.manifest_warning == "MANIFEST_WRITE_FAILED"
+        project_id = stored_job.project_id
+    assert not list(
+        (
+            settings.projects_dir
+            / project_id
+            / "acquisition"
+            / "jobs"
+            / str(job_id)
+            / "manifests"
+        ).glob("manifest-*.json")
+    )
+
+
+def test_manifest_ambiguous_commit_preserves_db_referenced_file(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1347", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    generation = service._claim_job(job_id, "commit-worker", "commit-token")
+    assert generation is not None
+    counts = service._recompute_counts(
+        job_id, "commit-worker", "commit-token", generation
+    )
+    original_factory = service.session_factory
+
+    def ambiguous_factory(*args: object, **kwargs: object) -> object:
+        session = original_factory(*args, **kwargs)
+        original_commit = session.commit
+
+        def ambiguous_commit() -> None:
+            original_commit()
+            raise RuntimeError("ambiguous commit")
+
+        session.commit = ambiguous_commit  # type: ignore[method-assign]
+        return session
+
+    monkeypatch.setattr(service, "session_factory", ambiguous_factory)
+    with pytest.raises(RuntimeError, match="ambiguous commit"):
+        service._write_manifest(
+            job_id,
+            "commit-worker",
+            "commit-token",
+            generation,
+            ImageAcquisitionJobStatus.COMPLETED,
+            counts=counts,
+        )
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.manifest_relative_path is not None
+        manifest = (
+            settings.projects_dir
+            / stored_job.project_id
+            / stored_job.manifest_relative_path
+        )
+    assert manifest.is_file()
 
 
 def test_stale_validation_pending_plan_change_finishes_job_as_failed(
