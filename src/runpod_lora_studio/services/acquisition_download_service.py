@@ -8,6 +8,7 @@ import shutil
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -136,6 +137,33 @@ class _RetryableDownload(Exception):
     ) -> None:
         self.code = code
         self.retry_after = retry_after
+
+
+@dataclass(frozen=True, slots=True)
+class _AcquisitionCountsSnapshot:
+    item_count: int
+    pending_count: int
+    downloading_count: int
+    downloaded_count: int
+    validated_count: int
+    imported_count: int
+    linked_existing_count: int
+    skipped_count: int
+    failed_count: int
+    received_bytes: int
+
+    def job_values(self) -> dict[str, int]:
+        return {
+            "pending_count": self.pending_count,
+            "downloading_count": self.downloading_count,
+            "downloaded_count": self.downloaded_count,
+            "validated_count": self.validated_count,
+            "imported_count": self.imported_count,
+            "linked_existing_count": self.linked_existing_count,
+            "skipped_count": self.skipped_count,
+            "failed_count": self.failed_count,
+            "received_bytes": self.received_bytes,
+        }
 
 
 class ImageAcquisitionDownloadService:
@@ -584,6 +612,11 @@ class ImageAcquisitionDownloadService:
             logger.warning("acquisition_worker_claim_lost job_id=%s", job_id)
         except Exception:
             logger.exception("acquisition_worker_failed job_id=%s", job_id)
+            try:
+                self._recompute_counts(job_id, worker, token, generation)
+            except _ClaimLost:
+                logger.warning("acquisition_worker_claim_lost job_id=%s", job_id)
+                return
             self._finish_job(
                 job_id,
                 worker,
@@ -631,6 +664,17 @@ class ImageAcquisitionDownloadService:
             self._validate_plan_structure(plan, plan_items)
         except AcquisitionDownloadError as exc:
             self._fail_all_unfinished(job_id, worker, token, generation, exc.code)
+            counts = self._recompute_counts(job_id, worker, token, generation)
+            if counts is None:
+                raise _ClaimLost() from exc
+            self._write_manifest(
+                job_id,
+                worker,
+                token,
+                generation,
+                ImageAcquisitionJobStatus.FAILED,
+                counts=counts,
+            )
             self._finish_job(
                 job_id,
                 worker,
@@ -691,8 +735,13 @@ class ImageAcquisitionDownloadService:
                     False,
                     generation=generation,
                 )
-        status, error = self._job_terminal_status(job_id)
-        self._write_manifest(job_id, worker, token, generation, status)
+        counts = self._recompute_counts(job_id, worker, token, generation)
+        if counts is None:
+            raise _ClaimLost()
+        status, error = self._job_terminal_status(
+            job_id, worker=worker, token=token, generation=generation
+        )
+        self._write_manifest(job_id, worker, token, generation, status, counts=counts)
         self._finish_job(job_id, worker, token, generation, status, error)
 
     def _process_item(
@@ -1385,6 +1434,7 @@ class ImageAcquisitionDownloadService:
             after_request=lambda: self._source_checkpoint(
                 job_id, worker, token, generation
             ),
+            poll_interval_seconds=self.settings.image_download_heartbeat_interval_seconds,
         )
         self._source_checkpoint(job_id, worker, token, generation)
         try:
@@ -2605,99 +2655,157 @@ class ImageAcquisitionDownloadService:
         worker: str | None = None,
         token: str | None = None,
         generation: int | None = None,
-    ) -> None:
+    ) -> _AcquisitionCountsSnapshot | None:
         if (worker is None) != (token is None) or (
             worker is not None and generation is None
         ):
             raise ValueError("worker, token, and generation must be provided together")
         with self.session_factory() as session:
-            job = session.scalar(
+            job_exists = session.scalar(
                 select(ImageAcquisitionJobRecord).where(
                     ImageAcquisitionJobRecord.id == str(job_id)
                 )
             )
+            if job_exists is None:
+                return None
             items = session.scalars(
                 select(ImageAcquisitionJobItemRecord).where(
                     ImageAcquisitionJobItemRecord.job_id == str(job_id)
                 )
             ).all()
-            if job is None:
-                return
-            values = {
-                "pending_count": sum(
-                    item.status
-                    in {
-                        ImageAcquisitionItemStatus.PENDING.value,
-                        ImageAcquisitionItemStatus.VALIDATION_PENDING.value,
-                    }
-                    for item in items
-                ),
-                "downloading_count": sum(
-                    item.status
-                    in {
-                        ImageAcquisitionItemStatus.DOWNLOADING.value,
-                        ImageAcquisitionItemStatus.VALIDATING.value,
-                        ImageAcquisitionItemStatus.IMPORTING.value,
-                    }
-                    for item in items
-                ),
-                "downloaded_count": sum(
-                    item.status
-                    in {
-                        ImageAcquisitionItemStatus.DOWNLOADED.value,
-                        ImageAcquisitionItemStatus.VALIDATION_PENDING.value,
-                        ImageAcquisitionItemStatus.VALIDATING.value,
-                        ImageAcquisitionItemStatus.VALIDATED.value,
-                        ImageAcquisitionItemStatus.IMPORTING.value,
-                        ImageAcquisitionItemStatus.IMPORTED.value,
-                        ImageAcquisitionItemStatus.LINKED_EXISTING.value,
-                    }
-                    for item in items
-                ),
-                "validated_count": sum(
-                    item.status
-                    in {
-                        ImageAcquisitionItemStatus.VALIDATED.value,
-                        ImageAcquisitionItemStatus.IMPORTING.value,
-                        ImageAcquisitionItemStatus.IMPORTED.value,
-                        ImageAcquisitionItemStatus.LINKED_EXISTING.value,
-                    }
-                    for item in items
-                ),
-                "imported_count": sum(
-                    item.status == ImageAcquisitionItemStatus.IMPORTED.value
-                    for item in items
-                ),
-                "linked_existing_count": sum(
-                    item.status == ImageAcquisitionItemStatus.LINKED_EXISTING.value
-                    for item in items
-                ),
-                "skipped_count": sum(
-                    item.status == ImageAcquisitionItemStatus.SKIPPED.value
-                    for item in items
-                ),
-                "failed_count": sum(
-                    item.status == ImageAcquisitionItemStatus.FAILED.value
-                    for item in items
-                ),
-                "received_bytes": sum(item.received_bytes for item in items),
-                "updated_at": datetime.now(UTC),
-            }
-            if worker is not None and (
-                job.status != ImageAcquisitionJobStatus.RUNNING.value
-                or job.worker_id != worker
-                or job.claim_token != token
-                or job.worker_generation != generation
-            ):
-                return
-            for key, value in values.items():
-                setattr(job, key, value)
+            snapshot = self._counts_snapshot(items)
+            now = datetime.now(UTC)
+            conditions = [ImageAcquisitionJobRecord.id == str(job_id)]
+            if worker is not None:
+                conditions.extend(
+                    [
+                        ImageAcquisitionJobRecord.status
+                        == ImageAcquisitionJobStatus.RUNNING.value,
+                        ImageAcquisitionJobRecord.worker_id == worker,
+                        ImageAcquisitionJobRecord.claim_token == token,
+                        ImageAcquisitionJobRecord.worker_generation == generation,
+                    ]
+                )
+            values: dict[str, object] = {**snapshot.job_values()}
+            values["updated_at"] = now
+            if worker is not None:
+                values["heartbeat_at"] = now
+            result = session.execute(
+                update(ImageAcquisitionJobRecord)
+                .where(*conditions)
+                .values(**values)
+                .returning(ImageAcquisitionJobRecord.id)
+            ).scalar_one_or_none()
+            if result is None:
+                session.rollback()
+                if worker is not None:
+                    raise _ClaimLost()
+                return None
             session.commit()
+            return snapshot
+
+    @staticmethod
+    def _counts_snapshot(
+        items: Iterable[ImageAcquisitionJobItemRecord],
+    ) -> _AcquisitionCountsSnapshot:
+        materialized = list(items)
+        return _AcquisitionCountsSnapshot(
+            item_count=len(materialized),
+            pending_count=sum(
+                item.status
+                in {
+                    ImageAcquisitionItemStatus.PENDING.value,
+                    ImageAcquisitionItemStatus.VALIDATION_PENDING.value,
+                }
+                for item in materialized
+            ),
+            downloading_count=sum(
+                item.status
+                in {
+                    ImageAcquisitionItemStatus.DOWNLOADING.value,
+                    ImageAcquisitionItemStatus.VALIDATING.value,
+                    ImageAcquisitionItemStatus.IMPORTING.value,
+                }
+                for item in materialized
+            ),
+            downloaded_count=sum(
+                item.status
+                in {
+                    ImageAcquisitionItemStatus.DOWNLOADED.value,
+                    ImageAcquisitionItemStatus.VALIDATION_PENDING.value,
+                    ImageAcquisitionItemStatus.VALIDATING.value,
+                    ImageAcquisitionItemStatus.VALIDATED.value,
+                    ImageAcquisitionItemStatus.IMPORTING.value,
+                    ImageAcquisitionItemStatus.IMPORTED.value,
+                    ImageAcquisitionItemStatus.LINKED_EXISTING.value,
+                }
+                for item in materialized
+            ),
+            validated_count=sum(
+                item.status
+                in {
+                    ImageAcquisitionItemStatus.VALIDATED.value,
+                    ImageAcquisitionItemStatus.IMPORTING.value,
+                    ImageAcquisitionItemStatus.IMPORTED.value,
+                    ImageAcquisitionItemStatus.LINKED_EXISTING.value,
+                }
+                for item in materialized
+            ),
+            imported_count=sum(
+                item.status == ImageAcquisitionItemStatus.IMPORTED.value
+                for item in materialized
+            ),
+            linked_existing_count=sum(
+                item.status == ImageAcquisitionItemStatus.LINKED_EXISTING.value
+                for item in materialized
+            ),
+            skipped_count=sum(
+                item.status == ImageAcquisitionItemStatus.SKIPPED.value
+                for item in materialized
+            ),
+            failed_count=sum(
+                item.status == ImageAcquisitionItemStatus.FAILED.value
+                for item in materialized
+            ),
+            received_bytes=sum(item.received_bytes for item in materialized),
+        )
 
     def _job_terminal_status(
-        self, job_id: UUID
+        self,
+        job_id: UUID,
+        *,
+        worker: str | None = None,
+        token: str | None = None,
+        generation: int | None = None,
     ) -> tuple[ImageAcquisitionJobStatus, DownloadFailureCode | None]:
+        if (worker is None) != (token is None) or (
+            worker is not None and generation is None
+        ):
+            raise ValueError("worker, token, and generation must be provided together")
         with self.session_factory() as session:
+            job_conditions = [ImageAcquisitionJobRecord.id == str(job_id)]
+            if worker is not None:
+                job_conditions.extend(
+                    [
+                        ImageAcquisitionJobRecord.status
+                        == ImageAcquisitionJobStatus.RUNNING.value,
+                        ImageAcquisitionJobRecord.worker_id == worker,
+                        ImageAcquisitionJobRecord.claim_token == token,
+                        ImageAcquisitionJobRecord.worker_generation == generation,
+                    ]
+                )
+            if (
+                session.scalar(
+                    select(ImageAcquisitionJobRecord.id).where(*job_conditions)
+                )
+                is None
+            ):
+                if worker is not None:
+                    raise _ClaimLost()
+                return (
+                    ImageAcquisitionJobStatus.FAILED,
+                    DownloadFailureCode.INCOMPLETE_ITEM_STATE,
+                )
             items = session.scalars(
                 select(ImageAcquisitionJobItemRecord).where(
                     ImageAcquisitionJobItemRecord.job_id == str(job_id)
@@ -2796,7 +2904,6 @@ class ImageAcquisitionDownloadService:
             session.commit()
             if result is None:
                 return
-        self._recompute_counts(job_id)
 
     def _fail_all_unfinished(
         self,
@@ -2845,6 +2952,8 @@ class ImageAcquisitionDownloadService:
         token: str,
         generation: int,
         final_status: ImageAcquisitionJobStatus,
+        *,
+        counts: _AcquisitionCountsSnapshot | None = None,
     ) -> None:
         with self.session_factory() as session:
             job = session.scalar(
@@ -2867,6 +2976,11 @@ class ImageAcquisitionDownloadService:
                 .where(ImageAcquisitionJobItemRecord.job_id == job.id)
                 .order_by(ImageAcquisitionJobItemRecord.display_order)
             ).all()
+            current_counts = self._counts_snapshot(items)
+            if counts is None:
+                counts = current_counts
+            elif counts != current_counts:
+                raise _ClaimLost()
             completed_at = datetime.now(UTC)
             manifest = {
                 "schema_version": "phase8b-manifest-v1",
@@ -2881,11 +2995,16 @@ class ImageAcquisitionDownloadService:
                 "started_at": job.started_at.isoformat() if job.started_at else None,
                 "completed_at": completed_at.isoformat(),
                 "status": final_status.value,
-                "item_count": job.requested_count,
-                "imported_count": job.imported_count,
-                "linked_existing_count": job.linked_existing_count,
-                "skipped_count": job.skipped_count,
-                "failed_count": job.failed_count,
+                "item_count": counts.item_count,
+                "pending_count": counts.pending_count,
+                "downloading_count": counts.downloading_count,
+                "downloaded_count": counts.downloaded_count,
+                "validated_count": counts.validated_count,
+                "imported_count": counts.imported_count,
+                "linked_existing_count": counts.linked_existing_count,
+                "skipped_count": counts.skipped_count,
+                "failed_count": counts.failed_count,
+                "received_bytes": counts.received_bytes,
                 "items": [
                     {
                         "item_id": item.id,

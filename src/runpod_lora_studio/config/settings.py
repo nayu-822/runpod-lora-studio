@@ -7,7 +7,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from runpod_lora_studio.domain.storage_models import (
@@ -234,6 +234,21 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     @classmethod
     def normalize_log_level(cls, value: str) -> str:
         return str(value).strip().upper()
+
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def validate_image_download_stale_threshold(self) -> AppSettings:
+        metadata_request_max_seconds = (
+            self.image_search_connect_timeout_seconds
+            + self.image_search_read_timeout_seconds
+            + self.image_search_min_interval_seconds
+            + self.image_download_heartbeat_interval_seconds
+        )
+        if self.image_download_stale_after_seconds <= metadata_request_max_seconds:
+            raise ValueError(
+                "image_download_stale_after_seconds must exceed the maximum "
+                "metadata request wait time"
+            )
+        return self
 
     @field_validator(  # type: ignore[untyped-decorator]
         "workspace_root",

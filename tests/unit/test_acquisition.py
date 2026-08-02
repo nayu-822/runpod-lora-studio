@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -358,6 +359,117 @@ def test_api_retry_cancellation_prevents_follow_up_request() -> None:
         client.get_json({"tags": "solo"}, cancel_requested=lambda: canceled)
     assert error.value.code is AcquisitionErrorCode.CANCELED
     assert transport.calls == 1
+
+
+@pytest.mark.parametrize("failure_point", ["before", "transport", "after"])
+def test_source_request_releases_limiter_once_on_callback_or_transport_failure(
+    failure_point: str,
+) -> None:
+    class CountingLimiter(SourceRateLimiter):
+        release_calls = 0
+
+        def release(self) -> None:
+            self.release_calls += 1
+            super().release()
+
+    class RequestTransport:
+        calls = 0
+
+        def get(self, params: dict[str, str]) -> HttpResponse:
+            del params
+            self.calls += 1
+            if failure_point == "transport" and self.calls == 1:
+                raise RuntimeError("transport failed")
+            return HttpResponse(200, {"Content-Type": "application/json"}, b"[]")
+
+    limiter = CountingLimiter(minimum_interval_seconds=0)
+    client = DanbooruApiClient(RequestTransport(), limiter=limiter)
+    failures = 0
+
+    def before() -> None:
+        nonlocal failures
+        if failure_point == "before" and failures == 0:
+            failures += 1
+            raise DanbooruSourceError(AcquisitionErrorCode.CANCELED)
+
+    def after() -> None:
+        nonlocal failures
+        if failure_point == "after" and failures == 0:
+            failures += 1
+            raise DanbooruSourceError(AcquisitionErrorCode.WORKER_CLAIM_LOST)
+
+    with pytest.raises((DanbooruSourceError, RuntimeError)):
+        client.get_json({"tags": "solo"}, before_request=before, after_request=after)
+
+    payload, _, _, _ = client.get_json(
+        {"tags": "solo"}, before_request=before, after_request=after
+    )
+    assert payload == []
+    assert limiter.release_calls == 2
+
+
+def test_metadata_request_polling_cancels_and_reuses_limiter() -> None:
+    started = threading.Event()
+    unblock = threading.Event()
+    canceled = False
+    heartbeat_calls = 0
+    after_calls = 0
+
+    class BlockingTransport:
+        calls = 0
+
+        def get(self, params: dict[str, str]) -> HttpResponse:
+            del params
+            self.calls += 1
+            if self.calls == 1:
+                started.set()
+                assert unblock.wait(5.0)
+            return HttpResponse(200, {"Content-Type": "application/json"}, b"[]")
+
+    transport = BlockingTransport()
+    client = DanbooruApiClient(
+        transport, limiter=SourceRateLimiter(minimum_interval_seconds=0)
+    )
+
+    def cancel_requested() -> bool:
+        return canceled
+
+    def before_request() -> None:
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+
+    def after_request() -> None:
+        nonlocal after_calls
+        after_calls += 1
+
+    result: list[BaseException] = []
+
+    def request() -> None:
+        try:
+            client.get_json(
+                {"tags": "solo"},
+                cancel_requested=cancel_requested,
+                before_request=before_request,
+                after_request=after_request,
+                poll_interval_seconds=0.01,
+            )
+        except BaseException as exc:
+            result.append(exc)
+
+    request_thread = threading.Thread(target=request)
+    request_thread.start()
+    assert started.wait(1.0)
+    canceled = True
+    request_thread.join(1.0)
+    assert not request_thread.is_alive()
+    assert result and isinstance(result[0], DanbooruSourceError)
+    assert result[0].code is AcquisitionErrorCode.CANCELED
+    assert heartbeat_calls >= 1
+    assert after_calls == 1
+
+    payload, _, _, _ = client.get_json({"tags": "solo"})
+    assert payload == []
+    unblock.set()
 
 
 def test_get_post_uses_one_request_and_leaves_retry_to_download_worker() -> None:

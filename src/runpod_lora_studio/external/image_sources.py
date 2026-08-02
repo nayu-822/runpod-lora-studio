@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import email.utils
 import json
+import logging
 import math
 import os
 import re
@@ -40,6 +41,8 @@ MAX_TAG_LENGTH = 100
 MAX_CURSOR_LENGTH = 128
 MAX_METADATA_BYTES = 32 * 1024
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class ImageSourceRequestContext:
@@ -48,6 +51,7 @@ class ImageSourceRequestContext:
     cancel_requested: Callable[[], bool] | None = None
     before_request: Callable[[], None] | None = None
     after_request: Callable[[], None] | None = None
+    poll_interval_seconds: float | None = None
 
 
 class ImageSourceAdapter(Protocol):
@@ -317,6 +321,7 @@ class DanbooruApiClient:
         retry_policy: DanbooruRetryPolicy | None = None,
         before_request: Callable[[], None] | None = None,
         after_request: Callable[[], None] | None = None,
+        poll_interval_seconds: float | None = None,
     ) -> tuple[object, int, int, int]:
         policy = retry_policy or self.retry_policy
         retries = 0
@@ -326,11 +331,14 @@ class DanbooruApiClient:
                 raise DanbooruSourceError(
                     AcquisitionErrorCode.CANCELED, "search canceled"
                 )
-            self.limiter.acquire(cancel_requested=cancel_requested)
             try:
-                if before_request is not None:
-                    before_request()
-                response = self.transport.get(params)
+                response = self._request_with_controls(
+                    params,
+                    cancel_requested=cancel_requested,
+                    before_request=before_request,
+                    after_request=after_request,
+                    poll_interval_seconds=poll_interval_seconds,
+                )
             except DanbooruSourceError as exc:
                 if exc.code is AcquisitionErrorCode.RATE_LIMITED:
                     self.limiter.record_rate_limit()
@@ -353,10 +361,6 @@ class DanbooruApiClient:
                     sleeper=self.sleeper,
                 )
                 continue
-            finally:
-                if after_request is not None:
-                    after_request()
-                self.limiter.release()
             try:
                 payload = json.loads(response.body.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -365,6 +369,105 @@ class DanbooruApiClient:
                 ) from exc
             return payload, retries + 1, retries, rate_limits
         raise DanbooruSourceError(AcquisitionErrorCode.UNKNOWN_SOURCE_ERROR)
+
+    def _request_with_controls(
+        self,
+        params: Mapping[str, str],
+        *,
+        cancel_requested: Callable[[], bool] | None,
+        before_request: Callable[[], None] | None,
+        after_request: Callable[[], None] | None,
+        poll_interval_seconds: float | None,
+    ) -> HttpResponse:
+        acquired = False
+        primary_error: BaseException | None = None
+        try:
+            self.limiter.acquire(cancel_requested=cancel_requested)
+            acquired = True
+            try:
+                if before_request is not None:
+                    before_request()
+                response = self._get_transport_response(
+                    params,
+                    cancel_requested=cancel_requested,
+                    before_request=before_request,
+                    poll_interval_seconds=poll_interval_seconds,
+                )
+            except BaseException as exc:
+                primary_error = exc
+                if after_request is not None:
+                    try:
+                        after_request()
+                    except BaseException as after_error:
+                        raise after_error from exc
+                raise
+            else:
+                try:
+                    if after_request is not None:
+                        after_request()
+                except BaseException as exc:
+                    primary_error = exc
+                    raise
+            return response
+        finally:
+            if acquired:
+                try:
+                    self.limiter.release()
+                except Exception as release_error:
+                    if primary_error is None:
+                        raise
+                    logger.warning(
+                        "source_rate_limiter_release_failed error_type=%s",
+                        type(release_error).__name__,
+                    )
+
+    def _get_transport_response(
+        self,
+        params: Mapping[str, str],
+        *,
+        cancel_requested: Callable[[], bool] | None,
+        before_request: Callable[[], None] | None,
+        poll_interval_seconds: float | None,
+    ) -> HttpResponse:
+        if (
+            poll_interval_seconds is None
+            or poll_interval_seconds <= 0
+            or (cancel_requested is None and before_request is None)
+        ):
+            return self.transport.get(params)
+
+        completed = threading.Event()
+        response: list[HttpResponse] = []
+        errors: list[BaseException] = []
+
+        def run_transport() -> None:
+            try:
+                response.append(self.transport.get(params))
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        threading.Thread(
+            target=run_transport,
+            name="danbooru-metadata-request",
+            daemon=True,
+        ).start()
+        while not completed.wait(poll_interval_seconds):
+            if before_request is not None:
+                before_request()
+            if cancel_requested is not None and cancel_requested():
+                raise DanbooruSourceError(
+                    AcquisitionErrorCode.CANCELED, "source request canceled"
+                )
+        if errors:
+            raise errors[0]
+        if not response:
+            raise DanbooruSourceError(
+                AcquisitionErrorCode.UNKNOWN_SOURCE_ERROR,
+                "source request returned no response",
+            )
+        return response[0]
 
 
 class DanbooruImageSourceAdapter:
@@ -433,6 +536,7 @@ class DanbooruImageSourceAdapter:
             retry_policy=DanbooruRetryPolicy(max_attempts=1),
             before_request=context.before_request if context else None,
             after_request=context.after_request if context else None,
+            poll_interval_seconds=context.poll_interval_seconds if context else None,
         )
         if not isinstance(payload, list) or not payload:
             return None

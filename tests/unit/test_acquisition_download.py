@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import threading
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -35,9 +36,13 @@ from runpod_lora_studio.external.image_download import (
     validate_download_url,
 )
 from runpod_lora_studio.external.image_sources import (
+    DanbooruApiClient,
+    DanbooruImageSourceAdapter,
     DanbooruSourceError,
     FakeImageSourceAdapter,
+    HttpResponse,
     ImageSourceRequestContext,
+    SourceRateLimiter,
 )
 from runpod_lora_studio.persistence.database import (
     create_engine_for_settings,
@@ -780,6 +785,21 @@ def test_stale_importing_state_is_completed_from_existing_idempotent_import(
     manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
     assert manifest_data["status"] == ImageAcquisitionJobStatus.COMPLETED.value
     assert manifest_data["item_count"] == 1
+    assert manifest_data["imported_count"] == 1
+    assert manifest_data["linked_existing_count"] == 0
+    assert manifest_data["failed_count"] == 0
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.imported_count == manifest_data["imported_count"]
+        assert (
+            stored_job.linked_existing_count == manifest_data["linked_existing_count"]
+        )
+        assert stored_job.failed_count == manifest_data["failed_count"]
 
 
 @pytest.mark.parametrize(
@@ -1073,6 +1093,90 @@ def test_source_metadata_retry_heartbeats_during_backoff(
     assert recoveries and all(value == 0 for value in recoveries)
 
 
+def test_blocking_metadata_request_heartbeats_and_cancels_within_bound(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace)
+    settings.image_download_stale_after_seconds = 0.1
+    settings.image_download_heartbeat_interval_seconds = 0.02
+    body = _png_bytes((30, 140, 210))
+    post = _post("1324", body)
+
+    class BlockingMetadataTransport:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def get(self, params: dict[str, str]) -> HttpResponse:
+            del params
+            self.started.set()
+            assert self.release.wait(5.0)
+            payload = {
+                "id": int(post.external_post_id),
+                "file_url": post.file_url,
+                "preview_file_url": post.preview_url,
+                "large_file_url": post.sample_url,
+                "image_width": post.width,
+                "image_height": post.height,
+                "file_size": post.file_size,
+                "file_ext": "png",
+                "rating": "g",
+                "score": post.score,
+                "tag_string": " ".join(post.tag_names),
+                "md5": post.source_md5,
+            }
+            return HttpResponse(
+                200,
+                {"Content-Type": "application/json"},
+                json.dumps([payload]).encode("utf-8"),
+            )
+
+    metadata_transport = BlockingMetadataTransport()
+    metadata_adapter = DanbooruImageSourceAdapter(
+        client=DanbooruApiClient(
+            metadata_transport,
+            limiter=SourceRateLimiter(minimum_interval_seconds=0),
+        )
+    )
+
+    class BlockingMetadataAdapter(FakeImageSourceAdapter):
+        def __init__(self) -> None:
+            super().__init__({None: ImageSearchPage(posts=(post,), next_cursor=None)})
+            self.metadata = metadata_adapter
+
+        def get_post(
+            self,
+            external_post_id: str,
+            *,
+            context: ImageSourceRequestContext | None = None,
+        ) -> ImageSourcePost | None:
+            return self.metadata.get_post(external_post_id, context=context)
+
+    adapter = BlockingMetadataAdapter()
+    plan_id, _ = _make_plan(settings, (post,), adapter=adapter)
+    service = ImageAcquisitionDownloadService(
+        settings,
+        adapter=adapter,
+        transport=FakeDownloadTransport({post.file_url or "": FakeDownloadSpec(body)}),
+        auto_start=False,
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    worker_thread = threading.Thread(target=service.run_job_sync, args=(job_id,))
+    worker_thread.start()
+    assert metadata_transport.started.wait(1.0)
+
+    time.sleep(0.25)
+    assert service.recover_stale_jobs() == 0
+
+    service.cancel_job(job_id)
+    worker_thread.join(1.0)
+    assert not worker_thread.is_alive()
+    metadata_transport.release.set()
+    job = service.get_job(job_id)
+    assert job is not None
+    assert job.status is ImageAcquisitionJobStatus.CANCELED
+
+
 def test_stale_claim_does_not_revoke_worker_after_heartbeat_refresh(
     test_workspace: Path,
 ) -> None:
@@ -1138,6 +1242,101 @@ def test_stale_claim_does_not_revoke_worker_after_heartbeat_refresh(
         assert job.worker_id == "live-worker"
         assert job.claim_token == "live-token"
         assert job.worker_generation == 3
+
+
+def test_old_worker_counter_update_is_rejected_after_stale_reclaim(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1323", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    old_generation = service._claim_job(job_id, "old-worker", "old-token")
+    assert old_generation is not None
+    session_factory = create_session_factory(settings)
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert job is not None
+        job.heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+        session.commit()
+
+    snapshot_selected = threading.Event()
+    release_old_worker = threading.Event()
+    old_error: list[BaseException] = []
+    original_counts_snapshot = service._counts_snapshot
+    first_snapshot = True
+
+    def pause_old_snapshot(items: object) -> object:
+        nonlocal first_snapshot
+        if first_snapshot:
+            first_snapshot = False
+            snapshot_selected.set()
+            assert release_old_worker.wait(5.0)
+        return original_counts_snapshot(items)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "_counts_snapshot", pause_old_snapshot)
+
+    def old_worker() -> None:
+        try:
+            service._recompute_counts(job_id, "old-worker", "old-token", old_generation)
+        except BaseException as exc:
+            old_error.append(exc)
+
+    worker_thread = threading.Thread(target=old_worker)
+    worker_thread.start()
+    assert snapshot_selected.wait(1.0)
+
+    with session_factory() as session:
+        assert service._claim_stale_job(
+            session,
+            str(job_id),
+            "old-worker",
+            "old-token",
+            old_generation,
+            datetime.now(UTC) - timedelta(minutes=5),
+            datetime.now(UTC),
+        )
+        session.commit()
+
+    new_generation = service._claim_job(job_id, "new-worker", "new-token")
+    assert new_generation is not None
+    with session_factory() as session:
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert item is not None
+        item.status = ImageAcquisitionItemStatus.IMPORTED.value
+        session.commit()
+    new_counts = service._recompute_counts(
+        job_id, "new-worker", "new-token", new_generation
+    )
+    assert new_counts is not None
+    assert new_counts.imported_count == 1
+
+    release_old_worker.set()
+    worker_thread.join(1.0)
+    assert not worker_thread.is_alive()
+    assert old_error and isinstance(old_error[0], _ClaimLost)
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert job is not None
+        assert job.status == ImageAcquisitionJobStatus.RUNNING.value
+        assert job.worker_id == "new-worker"
+        assert job.imported_count == 1
 
 
 def test_terminal_status_rejects_nonterminal_items(

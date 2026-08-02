@@ -88,3 +88,23 @@ def test_ensure_runtime_directories_creates_configured_paths(
         settings.database_path.parent,
     ):
         assert directory.is_dir()
+
+
+def test_image_download_stale_threshold_exceeds_metadata_request_window() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(
+            image_search_connect_timeout_seconds=10.0,
+            image_search_read_timeout_seconds=30.0,
+            image_search_min_interval_seconds=1.0,
+            image_download_heartbeat_interval_seconds=2.0,
+            image_download_stale_after_seconds=43.0,
+        )
+
+    settings = AppSettings(
+        image_search_connect_timeout_seconds=10.0,
+        image_search_read_timeout_seconds=30.0,
+        image_search_min_interval_seconds=1.0,
+        image_download_heartbeat_interval_seconds=2.0,
+        image_download_stale_after_seconds=44.0,
+    )
+    assert settings.image_download_stale_after_seconds == 44.0
