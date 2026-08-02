@@ -2035,6 +2035,12 @@ class ImageAcquisitionJobItemRecord(Base):
             "part_cleanup_warning",
             "part_cleanup_claimed_at",
         ),
+        Index(
+            "ix_image_acquisition_job_items_part_cleanup_schedule",
+            "part_cleanup_warning",
+            "part_cleanup_next_retry_at",
+            "part_cleanup_claimed_at",
+        ),
     )
 
     internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -2090,6 +2096,9 @@ class ImageAcquisitionJobItemRecord(Base):
         String(64), nullable=True
     )
     part_cleanup_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    part_cleanup_next_retry_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     retryable: Mapped[bool] = mapped_column(Integer, nullable=False, default=False)

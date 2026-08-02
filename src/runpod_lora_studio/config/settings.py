@@ -211,6 +211,16 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
         default=2.0, gt=0.1, le=60.0
     )
     image_download_stale_after_seconds: float = Field(default=300.0, gt=0.0)
+    image_download_cleanup_retry_base_backoff_seconds: float = Field(
+        default=30.0, ge=0.0, le=3600.0
+    )
+    image_download_cleanup_retry_max_backoff_seconds: float = Field(
+        default=3600.0, ge=0.0, le=86400.0
+    )
+    image_download_cleanup_max_batches: int = Field(default=4, ge=1, le=32)
+    image_download_cleanup_time_budget_seconds: float = Field(
+        default=5.0, gt=0.0, le=60.0
+    )
     image_download_disk_safety_margin_bytes: int = Field(
         default=256 * 1024 * 1024, ge=0
     )
