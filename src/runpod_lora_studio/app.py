@@ -109,6 +109,7 @@ def create_app(
     training.reconcile_stale_jobs()
     training.reconcile_progress()
     acquisition_download.recover_stale_jobs()
+    acquisition_download.recover_part_cleanup_jobs()
     path_rows = build_paths_dataframe(runtime_settings)
 
     with gr.Blocks(title=runtime_settings.app_title) as demo:

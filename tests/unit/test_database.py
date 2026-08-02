@@ -67,7 +67,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0032_phase8b_part_cleanup_warnings"
+            "0033_phase8b_part_cleanup_claims"
         )
 
 
@@ -295,6 +295,8 @@ def test_phase8b_acquisition_download_schema_is_migrated(
         "detected_format",
         "failure_code",
         "part_cleanup_warning",
+        "part_cleanup_claim_token",
+        "part_cleanup_claimed_at",
     }.issubset(item_columns)
     link_columns = {
         column["name"] for column in inspector.get_columns("external_image_asset_links")
@@ -328,6 +330,40 @@ def test_phase8b_acquisition_download_schema_is_migrated(
     }.issubset(attempt_columns)
 
 
+def test_phase8b_part_cleanup_claims_downgrade_and_reupgrade(
+    test_workspace: Path,
+) -> None:
+    settings = migrate(test_workspace)
+    config = Config(str(Path("alembic.ini").resolve()))
+    old_path = os.environ.get("RUNPOD_LORA_STUDIO_DATABASE_PATH")
+    os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = str(settings.database_path)
+    get_settings.cache_clear()
+    try:
+        command.downgrade(config, "0032_phase8b_part_cleanup_warnings")
+        inspector = inspect(create_engine_for_settings(settings))
+        item_columns = {
+            column["name"]
+            for column in inspector.get_columns("image_acquisition_job_items")
+        }
+        assert "part_cleanup_claim_token" not in item_columns
+        assert "part_cleanup_claimed_at" not in item_columns
+        assert "ix_image_acquisition_job_items_part_cleanup" not in {
+            index["name"]
+            for index in inspector.get_indexes("image_acquisition_job_items")
+        }
+        command.upgrade(config, "head")
+    finally:
+        get_settings.cache_clear()
+        if old_path is None:
+            os.environ.pop("RUNPOD_LORA_STUDIO_DATABASE_PATH", None)
+        else:
+            os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
+    with create_engine_for_settings(settings).connect() as connection:
+        assert MigrationContext.configure(connection).get_current_revision() == (
+            "0033_phase8b_part_cleanup_claims"
+        )
+
+
 def test_phase8a_page_checkpoint_migration_downgrade_and_reupgrade(
     test_workspace: Path,
 ) -> None:
@@ -356,7 +392,7 @@ def test_phase8a_page_checkpoint_migration_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0032_phase8b_part_cleanup_warnings"
+            "0033_phase8b_part_cleanup_claims"
         )
 
 
@@ -413,7 +449,7 @@ def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0032_phase8b_part_cleanup_warnings"
+            "0033_phase8b_part_cleanup_claims"
         )
 
 
@@ -441,7 +477,7 @@ def test_phase4_downgrade_and_reupgrade_preserves_phase3_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0032_phase8b_part_cleanup_warnings"
+            "0033_phase8b_part_cleanup_claims"
         )
 
 
@@ -455,7 +491,7 @@ def test_phase5_upgrades_existing_0006_database_to_head(
         assert "managed_models" in tables
         assert "storage_transfer_jobs" in tables
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0032_phase8b_part_cleanup_warnings"
+            "0033_phase8b_part_cleanup_claims"
         )
 
 
@@ -476,7 +512,7 @@ def test_phase5_heartbeat_migration_upgrades_existing_0007_database(
             "current_file_transferred_bytes",
         }.issubset(columns)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0032_phase8b_part_cleanup_warnings"
+            "0033_phase8b_part_cleanup_claims"
         )
 
 
@@ -524,7 +560,7 @@ def test_phase5_progress_migration_upgrades_existing_0008_database(
         ).one()
         assert row == ("running", 0, 0)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0032_phase8b_part_cleanup_warnings"
+            "0033_phase8b_part_cleanup_claims"
         )
 
 
@@ -551,7 +587,7 @@ def test_phase5_progress_downgrade_and_reupgrade(test_workspace: Path) -> None:
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0032_phase8b_part_cleanup_warnings"
+            "0033_phase8b_part_cleanup_claims"
         )
 
 

@@ -226,6 +226,56 @@ def test_download_validates_imports_and_writes_safe_manifest(
     assert "path" not in json.dumps(manifest_data)
 
 
+def test_normal_import_cleanup_failure_is_audited(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace)
+    body = _png_bytes((10, 140, 220))
+    post = _post("1001-cleanup", body)
+    plan_id, adapter = _make_plan(settings, (post,))
+    transport = FakeDownloadTransport(
+        {post.file_url or "": FakeDownloadSpec(body, headers={"etag": "v1"})}
+    )
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, transport=transport, auto_start=False
+    )
+    monkeypatch.setattr(
+        service,
+        "_cleanup_part_artifact",
+        lambda _: PartCleanupWarningCode.CLEANUP_FAILED,
+    )
+
+    job_id = service.start_job(plan_id, auto_start=False)
+    service.run_job_sync(job_id)
+
+    item = service.list_items(job_id)[0]
+    assert item.status is ImageAcquisitionItemStatus.IMPORTED
+    assert item.part_cleanup_warning == PartCleanupWarningCode.CLEANUP_FAILED.value
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        attempt = session.scalar(select(ImageAcquisitionAttemptRecord))
+        assert stored_job is not None
+        assert attempt is not None and attempt.status == "succeeded"
+        assert stored_job.manifest_relative_path is not None
+        manifest_path = (
+            settings.projects_dir
+            / stored_job.project_id
+            / stored_job.manifest_relative_path
+        )
+    manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest_data["part_cleanup_warning_codes"] == [
+        PartCleanupWarningCode.CLEANUP_FAILED.value
+    ]
+    assert manifest_data["items"][0]["part_cleanup_warning"] == (
+        PartCleanupWarningCode.CLEANUP_FAILED.value
+    )
+
+
 def test_download_resumes_partial_stream_and_links_same_sha(
     test_workspace: Path,
 ) -> None:
@@ -516,6 +566,96 @@ def test_resume_continues_cumulative_attempt_numbers_after_cancel(
         assert [attempt.attempt_number for attempt in attempts] == [1, 2]
         assert attempts[0].status == "failed"
         assert attempts[1].status == "succeeded"
+
+
+@pytest.mark.parametrize(
+    ("item_status", "job_status", "retryable"),
+    [
+        (
+            ImageAcquisitionItemStatus.FAILED,
+            ImageAcquisitionJobStatus.FAILED,
+            True,
+        ),
+        (
+            ImageAcquisitionItemStatus.CANCELED,
+            ImageAcquisitionJobStatus.CANCELED,
+            False,
+        ),
+    ],
+)
+def test_get_job_and_resume_preserve_retryable_part_and_range_state(
+    test_workspace: Path,
+    item_status: ImageAcquisitionItemStatus,
+    job_status: ImageAcquisitionJobStatus,
+    retryable: bool,
+) -> None:
+    settings = _settings(test_workspace)
+    body = _png_bytes((220, 40, 100))
+    post = _post(f"1203-{item_status.value}", body)
+    plan_id, adapter = _make_plan(settings, (post,))
+    transport = FakeDownloadTransport(
+        {post.file_url or "": FakeDownloadSpec(body, headers={"etag": "resume-v1"})}
+    )
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, transport=transport, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    partial = body[:16]
+    session_factory = create_session_factory(settings)
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        item.status = item_status.value
+        item.failure_code = DownloadFailureCode.REQUEST_TIMEOUT.value
+        item.failure_message = DownloadFailureCode.REQUEST_TIMEOUT.value
+        item.retryable = retryable
+        item.attempt_count = 1
+        item.retry_count = 1
+        item.received_bytes = len(partial)
+        item.etag = "resume-v1"
+        item.accept_ranges = True
+        item.range_start = 0
+        job.status = job_status.value
+        job.cancellation_requested = job_status is ImageAcquisitionJobStatus.CANCELED
+        part = settings.projects_dir / job.project_id / item.part_relative_path
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(partial)
+        session.commit()
+
+    for _ in range(2):
+        job_view = service.get_job(job_id)
+        assert job_view is not None and job_view.status is job_status
+        assert part.exists()
+        assert part.read_bytes() == partial
+
+    service.resume_job(job_id, auto_start=False)
+    with session_factory() as session:
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert item is not None
+        assert item.status == ImageAcquisitionItemStatus.PENDING.value
+        assert bool(item.retryable) is retryable
+        assert item.received_bytes == len(partial)
+        assert item.etag == "resume-v1"
+        assert bool(item.accept_ranges) is True
+        assert item.range_start == 0
+        assert item.part_cleanup_warning is None
+
+    service.run_job_sync(job_id)
+    assert any(request.range_start == len(partial) for request in transport.requests)
+    assert not part.exists()
 
 
 def test_range_validation_keeps_etag_and_last_modified_independent(
@@ -1881,6 +2021,7 @@ def test_pending_part_cleanup_is_recovered_after_worker_stops(
         session.commit()
 
     assert service.recover_stale_jobs() == 1
+    assert service.recover_part_cleanup_jobs() == 1
     item_view = service.list_items(job_id)[0]
     assert item_view.status is ImageAcquisitionItemStatus.FAILED
     assert item_view.part_cleanup_warning is None
@@ -1930,7 +2071,7 @@ def test_part_cleanup_warning_survives_retry_and_clears_only_after_cleanup(
         "_cleanup_part_artifact",
         lambda _: PartCleanupWarningCode.CLEANUP_FAILED,
     )
-    service.recover_stale_jobs()
+    service.recover_part_cleanup_jobs()
     with session_factory() as session:
         item = session.scalar(
             select(ImageAcquisitionJobItemRecord).where(
@@ -1947,10 +2088,184 @@ def test_part_cleanup_warning_survives_retry_and_clears_only_after_cleanup(
         "_cleanup_part_artifact",
         ImageAcquisitionDownloadService._cleanup_part_artifact,
     )
-    service.recover_stale_jobs()
+    service.recover_part_cleanup_jobs()
     item_view = service.list_items(job_id)[0]
     assert item_view.status is ImageAcquisitionItemStatus.FAILED
     assert item_view.part_cleanup_warning is None
+    assert not part.exists()
+
+
+def test_get_job_does_not_recover_terminal_part_cleanup(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1350", _png_bytes((90, 150, 210)))
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    session_factory = create_session_factory(settings)
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        job.status = ImageAcquisitionJobStatus.FAILED.value
+        item.status = ImageAcquisitionItemStatus.FAILED.value
+        item.retryable = False
+        item.part_cleanup_warning = PartCleanupWarningCode.PENDING.value
+        part = settings.projects_dir / job.project_id / item.part_relative_path
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(b"keep-until-recovery")
+        session.commit()
+
+    cleanup_calls = 0
+
+    def fail_if_called(_: object) -> PartCleanupWarningCode:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        raise AssertionError("get_job must not perform terminal cleanup")
+
+    monkeypatch.setattr(service, "_cleanup_part_artifact", fail_if_called)
+    assert service.get_job(job_id) is not None
+    assert service.get_job(job_id) is not None
+    assert cleanup_calls == 0
+    assert part.exists()
+    assert service.list_items(job_id)[0].part_cleanup_warning == (
+        PartCleanupWarningCode.PENDING.value
+    )
+
+
+def test_part_cleanup_recovery_is_bounded(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace)
+    posts = (
+        _post("1351", _png_bytes((10, 50, 90))),
+        _post("1352", _png_bytes((20, 60, 100))),
+    )
+    plan_id, adapter = _make_plan(settings, posts)
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    session_factory = create_session_factory(settings)
+    parts: list[Path] = []
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        items = session.scalars(
+            select(ImageAcquisitionJobItemRecord)
+            .where(ImageAcquisitionJobItemRecord.job_id == str(job_id))
+            .order_by(ImageAcquisitionJobItemRecord.display_order)
+        ).all()
+        assert job is not None
+        job.status = ImageAcquisitionJobStatus.FAILED.value
+        for item in items:
+            item.status = ImageAcquisitionItemStatus.FAILED.value
+            item.retryable = False
+            item.part_cleanup_warning = PartCleanupWarningCode.PENDING.value
+            part = settings.projects_dir / job.project_id / item.part_relative_path
+            part.parent.mkdir(parents=True, exist_ok=True)
+            part.write_bytes(item.id.encode())
+            parts.append(part)
+        session.commit()
+
+    assert service.recover_part_cleanup_jobs(limit=1) == 1
+    assert sum(part.exists() for part in parts) == 1
+    assert service.recover_part_cleanup_jobs(limit=1) == 1
+    assert not any(part.exists() for part in parts)
+
+
+def test_part_cleanup_and_resume_race_rejects_terminal_resume(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1353", _png_bytes((30, 70, 110)))
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    session_factory = create_session_factory(settings)
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        job.status = ImageAcquisitionJobStatus.FAILED.value
+        item.status = ImageAcquisitionItemStatus.FAILED.value
+        item.retryable = False
+        item.part_cleanup_warning = PartCleanupWarningCode.PENDING.value
+        part = settings.projects_dir / job.project_id / item.part_relative_path
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(b"old-part")
+        session.commit()
+
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+    original_cleanup = service._cleanup_part_artifact
+
+    def pause_cleanup(inspection: object) -> PartCleanupWarningCode | None:
+        cleanup_started.set()
+        assert release_cleanup.wait(5.0)
+        return original_cleanup(inspection)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "_cleanup_part_artifact", pause_cleanup)
+    cleanup_result: list[int] = []
+    cleanup_thread = threading.Thread(
+        target=lambda: cleanup_result.append(service.recover_part_cleanup_jobs())
+    )
+    cleanup_thread.start()
+    assert cleanup_started.wait(5.0)
+
+    resume_thread = threading.Thread(
+        target=lambda: service.resume_job(job_id, auto_start=False)
+    )
+    resume_thread.start()
+    time.sleep(0.1)
+    release_cleanup.set()
+    cleanup_thread.join(5.0)
+    resume_thread.join(5.0)
+    assert not cleanup_thread.is_alive()
+    assert not resume_thread.is_alive()
+    assert cleanup_result == [1]
+
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        assert job.status == ImageAcquisitionJobStatus.FAILED.value
+        assert item.status == ImageAcquisitionItemStatus.FAILED.value
+        assert item.part_cleanup_warning is None
     assert not part.exists()
 
 
@@ -2089,14 +2404,26 @@ def test_manifest_rejects_existing_artifact_symlink(
     reason="manifest fd race coverage requires POSIX directory descriptors",
 )
 @pytest.mark.parametrize(
-    "race_point", ["validation", "open", "temporary", "rename", "fsync", "cleanup"]
+    "race_point",
+    [
+        "validation",
+        "open",
+        "temporary",
+        "rename",
+        "fsync",
+        "db-before",
+        "db-after",
+        "cleanup",
+    ],
 )
 @pytest.mark.parametrize("target_scope", ["same-project", "outside-project"])
+@pytest.mark.parametrize("replacement_kind", ["symlink", "directory"])
 def test_manifest_fd_operations_reject_directory_swap_races(
     test_workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
     race_point: str,
     target_scope: str,
+    replacement_kind: str,
 ) -> None:
     settings = _settings(test_workspace)
     post = _post("1348", _png_bytes())
@@ -2135,7 +2462,10 @@ def test_manifest_fd_operations_reject_directory_swap_races(
         if swapped:
             return
         manifest_dir.rename(backup)
-        manifest_dir.symlink_to(target, target_is_directory=True)
+        if replacement_kind == "symlink":
+            manifest_dir.symlink_to(target, target_is_directory=True)
+        else:
+            manifest_dir.mkdir()
         swapped = True
 
     try:
@@ -2208,6 +2538,28 @@ def test_manifest_fd_operations_reject_directory_swap_races(
                 swap_manifest_path()
 
             monkeypatch.setattr(service, "_fsync_manifest_directory", fsync_directory)
+        elif race_point == "db-before":
+            original_identity_match = service._manifest_directory_identity_matches
+
+            def identity_match(handle: object) -> bool:
+                swap_manifest_path()
+                return original_identity_match(handle)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(
+                service, "_manifest_directory_identity_matches", identity_match
+            )
+        elif race_point == "db-after":
+            original_artifact_match = service._manifest_artifact_matches_handle
+
+            def artifact_match(handle: object, name: str) -> bool:
+                swap_manifest_path()
+                return original_artifact_match(  # type: ignore[arg-type]
+                    handle, name
+                )
+
+            monkeypatch.setattr(
+                service, "_manifest_artifact_matches_handle", artifact_match
+            )
         else:
             original_cleanup = service._cleanup_manifest_artifact
 
@@ -2232,6 +2584,8 @@ def test_manifest_fd_operations_reject_directory_swap_races(
     finally:
         if manifest_dir.is_symlink():
             manifest_dir.unlink()
+        elif manifest_dir.is_dir():
+            shutil.rmtree(manifest_dir)
         if backup.is_dir():
             backup.rename(manifest_dir)
 
