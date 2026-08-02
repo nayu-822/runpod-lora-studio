@@ -19,6 +19,11 @@ class ImageAcquisitionJobStatus(StrEnum):
     STALE = "stale"
 
 
+class ManifestRepairState(StrEnum):
+    PENDING = "pending"
+    REPAIRING = "repairing"
+
+
 class ImageAcquisitionItemStatus(StrEnum):
     PENDING = "pending"
     DOWNLOADING = "downloading"

@@ -64,6 +64,7 @@ from runpod_lora_studio.services import (
 from runpod_lora_studio.services.acquisition_download_service import (
     AcquisitionDownloadError,
     ImageAcquisitionDownloadService,
+    PartCleanupRecoveryResult,
     _ClaimLost,
 )
 from runpod_lora_studio.services.acquisition_service import ImageAcquisitionService
@@ -1575,7 +1576,7 @@ def test_old_worker_cannot_remove_new_manifest_for_any_terminal_status(
         session.commit()
     paused_after_replace = threading.Event()
     release_old_worker = threading.Event()
-    old_error: list[BaseException] = []
+    old_result: list[object] = []
     replace_calls = 0
     original_atomic_replace = service._atomic_replace_manifest
 
@@ -1600,16 +1601,18 @@ def test_old_worker_cannot_remove_new_manifest_for_any_terminal_status(
 
     def old_worker() -> None:
         try:
-            service._write_manifest(
-                job_id,
-                "old-worker",
-                "old-token",
-                old_generation,
-                final_status,
-                counts=old_counts,
+            old_result.append(
+                service._write_manifest(
+                    job_id,
+                    "old-worker",
+                    "old-token",
+                    old_generation,
+                    final_status,
+                    counts=old_counts,
+                )
             )
         except BaseException as exc:
-            old_error.append(exc)
+            old_result.append(exc)
 
     old_thread = threading.Thread(target=old_worker)
     old_thread.start()
@@ -1678,7 +1681,7 @@ def test_old_worker_cannot_remove_new_manifest_for_any_terminal_status(
     release_old_worker.set()
     old_thread.join(1.0)
     assert not old_thread.is_alive()
-    assert old_error and isinstance(old_error[0], _ClaimLost)
+    assert old_result == [acquisition_download_module._ManifestWriteResult.CLAIM_LOST]
     assert old_manifest_files[0] != new_manifest
     assert not old_manifest_files[0].exists()
     assert list(manifest_dir.glob("manifest-*.json")) == [new_manifest]
@@ -2045,7 +2048,7 @@ def test_pending_part_cleanup_is_recovered_after_worker_stops(
                 )
             )
             assert recovered_job is not None and recovered_item is not None
-            assert recovered_job.status == ImageAcquisitionJobStatus.QUEUED.value
+            assert recovered_job.status == ImageAcquisitionJobStatus.STALE.value
             assert recovered_job.worker_id is None
             assert recovered_job.claim_token is None
             assert part.exists()
@@ -2056,7 +2059,7 @@ def test_pending_part_cleanup_is_recovered_after_worker_stops(
     )
     assert service.recover_stale_jobs() == 1
     monkeypatch.setattr(service, "recover_part_cleanup_jobs", original_recover_cleanup)
-    assert service.recover_part_cleanup_jobs() == 0
+    assert service.recover_part_cleanup_jobs().processed_count == 0
     item_view = service.list_items(job_id)[0]
     assert item_view.status is ImageAcquisitionItemStatus.FAILED
     assert item_view.part_cleanup_warning is None
@@ -2218,9 +2221,9 @@ def test_part_cleanup_recovery_is_bounded(
             parts.append(part)
         session.commit()
 
-    assert service.recover_part_cleanup_jobs(limit=1) == 1
+    assert service.recover_part_cleanup_jobs(limit=1).processed_count == 1
     assert sum(part.exists() for part in parts) == 1
-    assert service.recover_part_cleanup_jobs(limit=1) == 1
+    assert service.recover_part_cleanup_jobs(limit=1).processed_count == 1
     assert not any(part.exists() for part in parts)
 
 
@@ -2277,9 +2280,11 @@ def test_part_cleanup_drain_processes_backlog_and_does_not_repeat_warning(
         return original_cleanup(inspection)  # type: ignore[arg-type]
 
     monkeypatch.setattr(service, "_cleanup_part_artifact", fail_one_cleanup)
-    assert (
-        service.recover_part_cleanup_jobs(max_batches=4, time_budget_seconds=5.0) == 65
+    cleanup_result = service.recover_part_cleanup_jobs(
+        max_batches=4, time_budget_seconds=5.0
     )
+    assert cleanup_result.processed_count == 65
+    assert cleanup_result.warning_continued_count == 1
     assert len(cleanup_calls) == 65
     assert parts[failed_item_id].exists()
     assert (
@@ -2303,7 +2308,10 @@ def test_part_cleanup_drain_processes_backlog_and_does_not_repeat_warning(
         assert failed_item.part_cleanup_next_retry_at is not None
 
     assert (
-        service.recover_part_cleanup_jobs(max_batches=4, time_budget_seconds=5.0) == 0
+        service.recover_part_cleanup_jobs(
+            max_batches=4, time_budget_seconds=5.0
+        ).processed_count
+        == 0
     )
     assert len(cleanup_calls) == 65
 
@@ -2430,7 +2438,7 @@ def test_part_cleanup_restarts_after_unlink_before_result_commit(
         assert stored_item is not None
         stored_item.part_cleanup_claimed_at = datetime.now(UTC) - timedelta(hours=1)
         session.commit()
-    assert service.recover_part_cleanup_jobs() == 1
+    assert service.recover_part_cleanup_jobs().processed_count == 1
     assert service.list_items(job_id)[0].part_cleanup_warning is None
 
     with session_factory() as session:
@@ -2462,7 +2470,7 @@ def test_part_cleanup_restarts_after_unlink_before_result_commit(
         return session
 
     monkeypatch.setattr(service, "session_factory", fail_result_commit)
-    assert service.recover_part_cleanup_jobs() == 0
+    assert service.recover_part_cleanup_jobs().processed_count == 0
     assert not part.exists()
     with session_factory() as session:
         stored_item = session.scalar(
@@ -2475,7 +2483,7 @@ def test_part_cleanup_restarts_after_unlink_before_result_commit(
         stored_item.part_cleanup_claimed_at = datetime.now(UTC) - timedelta(hours=1)
         session.commit()
     monkeypatch.setattr(service, "session_factory", original_factory)
-    assert service.recover_part_cleanup_jobs() == 1
+    assert service.recover_part_cleanup_jobs().processed_count == 1
     assert service.list_items(job_id)[0].part_cleanup_warning is None
 
 
@@ -2539,7 +2547,7 @@ def test_part_cleanup_and_resume_race_rejects_terminal_resume(
         return original_cleanup(inspection)  # type: ignore[arg-type]
 
     monkeypatch.setattr(service, "_cleanup_part_artifact", pause_cleanup)
-    cleanup_result: list[int] = []
+    cleanup_result: list[PartCleanupRecoveryResult] = []
     cleanup_thread = threading.Thread(
         target=lambda: cleanup_result.append(service.recover_part_cleanup_jobs())
     )
@@ -2557,7 +2565,8 @@ def test_part_cleanup_and_resume_race_rejects_terminal_resume(
     resume_thread.join(5.0)
     assert not cleanup_thread.is_alive()
     assert not resume_thread.is_alive()
-    assert cleanup_result == [1]
+    assert len(cleanup_result) == 1
+    assert cleanup_result[0].processed_count == 1
 
     with session_factory() as session:
         job = session.scalar(
@@ -3061,15 +3070,15 @@ def test_manifest_ambiguous_commit_preserves_db_referenced_file(
         return session
 
     monkeypatch.setattr(service, "session_factory", ambiguous_factory)
-    with pytest.raises(RuntimeError, match="ambiguous commit"):
-        service._write_manifest(
-            job_id,
-            "commit-worker",
-            "commit-token",
-            generation,
-            ImageAcquisitionJobStatus.COMPLETED,
-            counts=counts,
-        )
+    result = service._write_manifest(
+        job_id,
+        "commit-worker",
+        "commit-token",
+        generation,
+        ImageAcquisitionJobStatus.COMPLETED,
+        counts=counts,
+    )
+    assert result is acquisition_download_module._ManifestWriteResult.DATABASE_ERROR
     with create_session_factory(settings)() as session:
         stored_job = session.scalar(
             select(ImageAcquisitionJobRecord).where(

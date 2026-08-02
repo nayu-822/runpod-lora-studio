@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import case, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from runpod_lora_studio.config.settings import AppSettings
@@ -27,6 +28,7 @@ from runpod_lora_studio.domain.acquisition_download_models import (
     ImageAcquisitionItemStatus,
     ImageAcquisitionJobStatus,
     ImageSourceProvenance,
+    ManifestRepairState,
     PartCleanupWarningCode,
     VerifiedImageFile,
 )
@@ -142,6 +144,39 @@ class _PartCleanupOutcome(Enum):
     DATABASE_ERROR = "database_error"
 
 
+@dataclass(frozen=True, slots=True)
+class PartCleanupRecoveryResult:
+    success_count: int
+    warning_continued_count: int
+    claim_conflict_count: int
+    database_error_count: int
+    remaining_eligible_count: int
+    remaining_delayed_count: int
+    processed_item_ids: tuple[str, ...]
+
+    @property
+    def processed_count(self) -> int:
+        return self.success_count + self.warning_continued_count
+
+    @property
+    def safe_for_job_resume(self) -> bool:
+        return (
+            self.warning_continued_count == 0
+            and self.claim_conflict_count == 0
+            and self.database_error_count == 0
+            and self.remaining_eligible_count == 0
+            and self.remaining_delayed_count == 0
+        )
+
+
+class _ManifestWriteResult(Enum):
+    SUCCESS = "success"
+    WARNING_RECORDED = "warning_recorded"
+    REPAIR_PENDING = "repair_pending"
+    CLAIM_LOST = "claim_lost"
+    DATABASE_ERROR = "database_error"
+
+
 class _ManifestReferenceClearResult(Enum):
     CLEARED = "cleared"
     ALREADY_NOT_REFERENCED = "already_not_referenced"
@@ -173,11 +208,18 @@ class _RetryableDownload(Exception):
         self.retry_after = retry_after
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _PartPathInspection:
     path: Path | None
     warning: PartCleanupWarningCode | None
     parent_components: tuple[Path, ...] = ()
+    parts_fd: int = -1
+    filename: str | None = None
+
+    def close(self) -> None:
+        if self.parts_fd >= 0:
+            os.close(self.parts_fd)
+            self.parts_fd = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,11 +231,13 @@ class _PartCleanupClaim:
     job_claim_token: str | None
     generation: int | None
     allow_pending: bool
+    attempt_count: int
 
 
 @dataclass(frozen=True, slots=True)
 class _PartCleanupTarget:
     project_id: str
+    job_id: str
     item_id: str
     part_relative_path: str
 
@@ -279,6 +323,9 @@ class ImageAcquisitionDownloadService:
         self.clock = clock
         self.sleeper = sleeper
         self.auto_start = auto_start
+        self._cleanup_scheduler_stop = threading.Event()
+        self._cleanup_scheduler_lock = threading.Lock()
+        self._cleanup_scheduler_thread: threading.Thread | None = None
         self._adapters = dict(adapters or {})
         if adapter is not None:
             self._adapters[ImageSourceType.DANBOORU] = adapter
@@ -303,12 +350,54 @@ class ImageAcquisitionDownloadService:
             max_redirects=settings.image_download_max_redirects,
         )
 
+    def start_cleanup_scheduler(self) -> None:
+        with self._cleanup_scheduler_lock:
+            if (
+                self._cleanup_scheduler_thread is not None
+                and self._cleanup_scheduler_thread.is_alive()
+            ):
+                return
+            self._cleanup_scheduler_stop.clear()
+            self._cleanup_scheduler_thread = threading.Thread(
+                target=self._run_cleanup_scheduler,
+                name="acquisition-cleanup-scheduler",
+                daemon=True,
+            )
+            self._cleanup_scheduler_thread.start()
+
+    def stop_cleanup_scheduler(self, timeout: float = 5.0) -> None:
+        self._cleanup_scheduler_stop.set()
+        thread = self._cleanup_scheduler_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(timeout, 0.0))
+        with self._cleanup_scheduler_lock:
+            if (
+                thread is not None
+                and thread is self._cleanup_scheduler_thread
+                and not thread.is_alive()
+            ):
+                self._cleanup_scheduler_thread = None
+
+    def _run_cleanup_scheduler(self) -> None:
+        interval = self.settings.image_download_cleanup_scheduler_interval_seconds
+        while not self._cleanup_scheduler_stop.wait(interval):
+            try:
+                self.reconcile_manifest_repairs()
+                self.recover_stale_jobs()
+                self.recover_part_cleanup_jobs(
+                    max_batches=self.settings.image_download_cleanup_max_batches,
+                    time_budget_seconds=self.settings.image_download_cleanup_time_budget_seconds,
+                    include_pending=True,
+                )
+                self.reconcile_manifest_repairs()
+            except Exception:
+                logger.exception("acquisition_cleanup_scheduler_failed")
+
     def start_job(self, plan_id: UUID, *, auto_start: bool | None = None) -> UUID:
         existing = self._active_or_finished_job(plan_id)
         if existing is not None:
             if auto_start is not False and existing.status in {
                 ImageAcquisitionJobStatus.QUEUED.value,
-                ImageAcquisitionJobStatus.STALE.value,
             }:
                 self._start_thread(UUID(existing.id))
             return UUID(existing.id)
@@ -400,6 +489,11 @@ class ImageAcquisitionDownloadService:
                 raise AcquisitionDownloadError(
                     DownloadFailureCode.SOURCE_POST_NOT_FOUND
                 )
+            cleanup_pending = session.scalar(
+                select(self._job_has_cleanup_pending(job.id))
+            )
+            if job.manifest_repair_state is not None or cleanup_pending:
+                return job_id
             if job.status not in {
                 ImageAcquisitionJobStatus.STALE.value,
                 ImageAcquisitionJobStatus.CANCELED.value,
@@ -474,6 +568,7 @@ class ImageAcquisitionDownloadService:
                     item.part_cleanup_claim_token = None
                     item.part_cleanup_claimed_at = None
                     item.part_cleanup_next_retry_at = None
+                    item.part_cleanup_attempt_count = 0
                     item.updated_at = now
                 job.active_key = job.plan_id
             session.commit()
@@ -512,7 +607,7 @@ class ImageAcquisitionDownloadService:
             seconds=self.settings.image_download_stale_after_seconds
         )
         queued_job_ids: list[UUID] = []
-        cleanup_item_ids: set[str] = set()
+        cleanup_item_ids_by_job: dict[str, set[str]] = {}
         try:
             with self.session_factory() as session:
                 candidates = session.execute(
@@ -551,11 +646,17 @@ class ImageAcquisitionDownloadService:
                     )
                     if job is None:
                         continue
+                    repair_claim_was_stale = (
+                        job.manifest_repair_state == ManifestRepairState.REPAIRING.value
+                    )
+                    if repair_claim_was_stale:
+                        job.manifest_repair_state = ManifestRepairState.PENDING.value
                     items = session.scalars(
                         select(ImageAcquisitionJobItemRecord).where(
                             ImageAcquisitionJobItemRecord.job_id == job.id
                         )
                     ).all()
+                    cleanup_item_ids: set[str] = set()
                     for item in items:
                         part_inspection = self._stale_part_path(job.project_id, item)
                         part = part_inspection.path
@@ -632,6 +733,7 @@ class ImageAcquisitionDownloadService:
                             item.part_cleanup_claim_token = None
                             item.part_cleanup_claimed_at = None
                             item.part_cleanup_next_retry_at = None
+                            item.part_cleanup_attempt_count = 0
                             cleanup_item_ids.add(item.id)
                             item.received_bytes = 0
                             item.etag = None
@@ -643,6 +745,7 @@ class ImageAcquisitionDownloadService:
                             item.part_cleanup_claim_token = None
                             item.part_cleanup_claimed_at = None
                             item.part_cleanup_next_retry_at = None
+                            item.part_cleanup_attempt_count = 0
                         item.status = target.value
                         item.image_asset_id = None
                         item.failure_code = None
@@ -650,7 +753,12 @@ class ImageAcquisitionDownloadService:
                         item.retryable = False
                         item.completed_at = None
                         item.updated_at = now
-                    job.status = ImageAcquisitionJobStatus.QUEUED.value
+                    if cleanup_item_ids or repair_claim_was_stale:
+                        cleanup_item_ids_by_job[job.id] = cleanup_item_ids
+                        job.status = ImageAcquisitionJobStatus.STALE.value
+                    else:
+                        job.status = ImageAcquisitionJobStatus.QUEUED.value
+                        queued_job_ids.append(UUID(job.id))
                     job.worker_id = None
                     job.claim_token = None
                     job.current_item_id = None
@@ -661,12 +769,21 @@ class ImageAcquisitionDownloadService:
                     job.error_summary = None
                     job.manifest_warning = None
                     job.updated_at = now
-                    queued_job_ids.append(UUID(job.id))
                 session.commit()
+            cleanup_item_ids = {
+                item_id
+                for item_ids in cleanup_item_ids_by_job.values()
+                for item_id in item_ids
+            }
             if cleanup_item_ids:
                 self.recover_part_cleanup_jobs(
                     item_ids=cleanup_item_ids,
                     include_pending=True,
+                    max_batches=max(
+                        1,
+                        (len(cleanup_item_ids) + PART_CLEANUP_BATCH_SIZE - 1)
+                        // PART_CLEANUP_BATCH_SIZE,
+                    ),
                 )
             if self.auto_start:
                 for job_id in queued_job_ids:
@@ -686,20 +803,21 @@ class ImageAcquisitionDownloadService:
         max_batches: int = 1,
         time_budget_seconds: float | None = None,
         include_pending: bool = False,
-    ) -> int:
+    ) -> PartCleanupRecoveryResult:
         if limit <= 0 or max_batches <= 0:
-            return 0
+            return PartCleanupRecoveryResult(0, 0, 0, 0, 0, 0, ())
         requested_ids = tuple(item_ids or ())
         if item_ids is not None and not requested_ids:
-            return 0
+            return PartCleanupRecoveryResult(0, 0, 0, 0, 0, 0, ())
         if time_budget_seconds is not None and time_budget_seconds <= 0:
-            return 0
+            return PartCleanupRecoveryResult(0, 0, 0, 0, 0, 0, ())
         started_at = self.clock()
         excluded_ids: set[str] = set()
-        processed_count = 0
+        success_count = 0
         warning_count = 0
         claim_conflict_count = 0
         database_error_count = 0
+        processed_item_ids: list[str] = []
         batch_count = 0
         while batch_count < max_batches:
             if (
@@ -718,17 +836,27 @@ class ImageAcquisitionDownloadService:
                 if "no such table: image_acquisition_" not in str(exc):
                     raise
                 logger.warning("acquisition_part_cleanup_tables_not_migrated")
-                return processed_count
+                return PartCleanupRecoveryResult(
+                    success_count,
+                    warning_count,
+                    claim_conflict_count,
+                    database_error_count + 1,
+                    0,
+                    0,
+                    tuple(processed_item_ids),
+                )
             if not candidate_ids:
                 break
             batch_count += 1
             for candidate_id in candidate_ids:
                 excluded_ids.add(candidate_id)
-                outcome = self._cleanup_part_item(candidate_id)
+                processed_item_ids.append(candidate_id)
+                outcome = self._cleanup_part_item(
+                    candidate_id, include_pending=include_pending
+                )
                 if outcome is _PartCleanupOutcome.SUCCESS:
-                    processed_count += 1
+                    success_count += 1
                 elif outcome is _PartCleanupOutcome.WARNING_CONTINUED:
-                    processed_count += 1
                     warning_count += 1
                 elif outcome is _PartCleanupOutcome.CLAIM_CONFLICT:
                     claim_conflict_count += 1
@@ -745,12 +873,173 @@ class ImageAcquisitionDownloadService:
                 "batch_count=%s processed_count=%s warning_count=%s "
                 "claim_conflict_count=%s database_error_count=%s",
                 batch_count,
-                processed_count,
+                len(processed_item_ids),
                 warning_count,
                 claim_conflict_count,
                 database_error_count,
             )
-        return processed_count
+        remaining_eligible_count, remaining_delayed_count = (
+            self._part_cleanup_backlog_counts(
+                requested_ids,
+                include_pending=include_pending,
+            )
+        )
+        if processed_item_ids:
+            self._promote_cleanup_ready_jobs(
+                self._job_ids_for_items(processed_item_ids)
+            )
+        return PartCleanupRecoveryResult(
+            success_count,
+            warning_count,
+            claim_conflict_count,
+            database_error_count,
+            remaining_eligible_count,
+            remaining_delayed_count,
+            tuple(processed_item_ids),
+        )
+
+    def _part_cleanup_backlog_counts(
+        self,
+        requested_ids: tuple[str, ...],
+        *,
+        include_pending: bool,
+    ) -> tuple[int, int]:
+        now = datetime.now(UTC)
+        claim_cutoff = now - timedelta(
+            seconds=max(self.settings.image_download_stale_after_seconds, 60)
+        )
+        with self.session_factory() as session:
+            statuses = set(PART_CLEANUP_ITEM_STATUSES)
+            if include_pending:
+                statuses.add(ImageAcquisitionItemStatus.PENDING.value)
+            base = [
+                ImageAcquisitionJobItemRecord.status.in_(statuses),
+                ImageAcquisitionJobItemRecord.retryable == False,  # noqa: E712
+                ImageAcquisitionJobItemRecord.part_cleanup_warning.in_(
+                    [
+                        PartCleanupWarningCode.PENDING.value,
+                        *PART_CLEANUP_WARNING_CODES,
+                    ]
+                ),
+            ]
+            if requested_ids:
+                base.append(ImageAcquisitionJobItemRecord.id.in_(requested_ids))
+            if include_pending:
+                base.append(
+                    (ImageAcquisitionJobItemRecord.status != "pending")
+                    | select(ImageAcquisitionJobRecord.id)
+                    .where(
+                        ImageAcquisitionJobRecord.id
+                        == ImageAcquisitionJobItemRecord.job_id,
+                        ImageAcquisitionJobRecord.status.in_(
+                            [
+                                ImageAcquisitionJobStatus.QUEUED.value,
+                                ImageAcquisitionJobStatus.STALE.value,
+                            ]
+                        ),
+                        ImageAcquisitionJobRecord.worker_id.is_(None),
+                        ImageAcquisitionJobRecord.claim_token.is_(None),
+                    )
+                    .correlate(ImageAcquisitionJobItemRecord)
+                    .exists()
+                )
+            claim_free = (
+                ImageAcquisitionJobItemRecord.part_cleanup_claim_token.is_(None)
+                | (ImageAcquisitionJobItemRecord.part_cleanup_claimed_at < claim_cutoff)
+                | ImageAcquisitionJobItemRecord.part_cleanup_claimed_at.is_(None)
+            )
+            eligible = session.scalar(
+                select(func.count(ImageAcquisitionJobItemRecord.id))
+                .join(
+                    ImageAcquisitionJobRecord,
+                    ImageAcquisitionJobRecord.id
+                    == ImageAcquisitionJobItemRecord.job_id,
+                )
+                .where(
+                    *base,
+                    (
+                        ImageAcquisitionJobItemRecord.part_cleanup_next_retry_at.is_(
+                            None
+                        )
+                        | (
+                            ImageAcquisitionJobItemRecord.part_cleanup_next_retry_at
+                            <= now
+                        )
+                    ),
+                    claim_free,
+                )
+            )
+            delayed = session.scalar(
+                select(func.count(ImageAcquisitionJobItemRecord.id))
+                .join(
+                    ImageAcquisitionJobRecord,
+                    ImageAcquisitionJobRecord.id
+                    == ImageAcquisitionJobItemRecord.job_id,
+                )
+                .where(
+                    *base,
+                    ImageAcquisitionJobItemRecord.part_cleanup_next_retry_at > now,
+                )
+            )
+            return int(eligible or 0), int(delayed or 0)
+
+    def _job_ids_for_items(self, item_ids: Iterable[str]) -> set[str]:
+        ids = tuple(item_ids)
+        if not ids:
+            return set()
+        with self.session_factory() as session:
+            return set(
+                session.scalars(
+                    select(ImageAcquisitionJobItemRecord.job_id).where(
+                        ImageAcquisitionJobItemRecord.id.in_(ids)
+                    )
+                ).all()
+            )
+
+    def _promote_cleanup_ready_jobs(self, job_ids: set[str]) -> list[UUID]:
+        if not job_ids:
+            return []
+        with self.session_factory() as session:
+            ready_ids: list[str] = []
+            for job in session.scalars(
+                select(ImageAcquisitionJobRecord).where(
+                    ImageAcquisitionJobRecord.id.in_(job_ids),
+                    ImageAcquisitionJobRecord.status
+                    == ImageAcquisitionJobStatus.STALE.value,
+                    ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
+                )
+            ).all():
+                has_pending = session.scalar(
+                    select(self._job_has_cleanup_pending(job.id))
+                )
+                if has_pending:
+                    continue
+                result = session.execute(
+                    update(ImageAcquisitionJobRecord)
+                    .where(
+                        ImageAcquisitionJobRecord.id == job.id,
+                        ImageAcquisitionJobRecord.status
+                        == ImageAcquisitionJobStatus.STALE.value,
+                        ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
+                    )
+                    .values(
+                        status=ImageAcquisitionJobStatus.QUEUED.value,
+                        worker_id=None,
+                        claim_token=None,
+                        current_item_id=None,
+                        heartbeat_at=None,
+                        updated_at=datetime.now(UTC),
+                    )
+                    .returning(ImageAcquisitionJobRecord.id)
+                ).scalar_one_or_none()
+                if result is not None:
+                    ready_ids.append(str(result))
+            session.commit()
+        uuid_ids = [UUID(job_id) for job_id in ready_ids]
+        if self.auto_start:
+            for job_id in uuid_ids:
+                self._start_thread(job_id)
+        return uuid_ids
 
     def _part_cleanup_candidate_ids(
         self,
@@ -797,8 +1086,12 @@ class ImageAcquisitionDownloadService:
                     .where(
                         ImageAcquisitionJobRecord.id
                         == ImageAcquisitionJobItemRecord.job_id,
-                        ImageAcquisitionJobRecord.status
-                        == ImageAcquisitionJobStatus.QUEUED.value,
+                        ImageAcquisitionJobRecord.status.in_(
+                            [
+                                ImageAcquisitionJobStatus.QUEUED.value,
+                                ImageAcquisitionJobStatus.STALE.value,
+                            ]
+                        ),
                         ImageAcquisitionJobRecord.worker_id.is_(None),
                         ImageAcquisitionJobRecord.claim_token.is_(None),
                     )
@@ -887,8 +1180,12 @@ class ImageAcquisitionDownloadService:
                         .where(
                             ImageAcquisitionJobRecord.id
                             == ImageAcquisitionJobItemRecord.job_id,
-                            ImageAcquisitionJobRecord.status
-                            == ImageAcquisitionJobStatus.QUEUED.value,
+                            ImageAcquisitionJobRecord.status.in_(
+                                [
+                                    ImageAcquisitionJobStatus.QUEUED.value,
+                                    ImageAcquisitionJobStatus.STALE.value,
+                                ]
+                            ),
                             ImageAcquisitionJobRecord.worker_id.is_(None),
                             ImageAcquisitionJobRecord.claim_token.is_(None),
                         )
@@ -925,12 +1222,13 @@ class ImageAcquisitionDownloadService:
                     .returning(
                         ImageAcquisitionJobItemRecord.id,
                         ImageAcquisitionJobItemRecord.job_id,
+                        ImageAcquisitionJobItemRecord.part_cleanup_attempt_count,
                     )
                 ).one_or_none()
                 if result is None:
                     session.rollback()
                     return _PartCleanupOutcome.CLAIM_CONFLICT
-                claimed_item_id, claimed_job_id = result
+                claimed_item_id, claimed_job_id, attempt_count = result
                 session.commit()
                 claim = _PartCleanupClaim(
                     item_id=str(claimed_item_id),
@@ -940,6 +1238,7 @@ class ImageAcquisitionDownloadService:
                     job_claim_token=token,
                     generation=generation,
                     allow_pending=include_pending,
+                    attempt_count=int(attempt_count or 0),
                 )
         except SQLAlchemyError:
             logger.warning("acquisition_part_cleanup_claim_failed")
@@ -948,19 +1247,25 @@ class ImageAcquisitionDownloadService:
         target = self._recheck_part_cleanup_claim(claim)
         if target is None:
             return _PartCleanupOutcome.CLAIM_CONFLICT
-        warning = self._cleanup_part_artifact(
-            self._stale_part_path(
-                target.project_id,
-                _PartCleanupTarget(
-                    project_id=target.project_id,
-                    item_id=target.item_id,
-                    part_relative_path=target.part_relative_path,
-                ),
-            )
+        inspection = self._stale_part_path(
+            target.project_id,
+            _PartCleanupTarget(
+                project_id=target.project_id,
+                job_id=target.job_id,
+                item_id=target.item_id,
+                part_relative_path=target.part_relative_path,
+            ),
+            open_directory_fd=True,
         )
+        try:
+            warning = self._cleanup_part_artifact(inspection)
+        finally:
+            inspection.close()
         result_now = datetime.now(UTC)
+        next_attempt_count = claim.attempt_count + 1 if warning is not None else 0
         next_retry_at = (
-            result_now + timedelta(seconds=self._cleanup_retry_delay())
+            result_now
+            + timedelta(seconds=self._cleanup_retry_delay(next_attempt_count))
             if warning is not None
             else None
         )
@@ -981,6 +1286,7 @@ class ImageAcquisitionDownloadService:
                         part_cleanup_claim_token=None,
                         part_cleanup_claimed_at=None,
                         part_cleanup_next_retry_at=next_retry_at,
+                        part_cleanup_attempt_count=next_attempt_count,
                         updated_at=result_now,
                     )
                 ).rowcount
@@ -997,10 +1303,14 @@ class ImageAcquisitionDownloadService:
             else _PartCleanupOutcome.SUCCESS
         )
 
-    def _cleanup_retry_delay(self) -> float:
-        return min(
-            self.settings.image_download_cleanup_retry_base_backoff_seconds,
-            self.settings.image_download_cleanup_retry_max_backoff_seconds,
+    def _cleanup_retry_delay(self, attempt_count: int = 1) -> float:
+        exponent = max(attempt_count - 1, 0)
+        return float(
+            min(
+                self.settings.image_download_cleanup_retry_base_backoff_seconds
+                * (2**exponent),
+                self.settings.image_download_cleanup_retry_max_backoff_seconds,
+            )
         )
 
     def _part_cleanup_claim_conditions(
@@ -1038,8 +1348,12 @@ class ImageAcquisitionDownloadService:
                 .where(
                     ImageAcquisitionJobRecord.id
                     == ImageAcquisitionJobItemRecord.job_id,
-                    ImageAcquisitionJobRecord.status
-                    == ImageAcquisitionJobStatus.QUEUED.value,
+                    ImageAcquisitionJobRecord.status.in_(
+                        [
+                            ImageAcquisitionJobStatus.QUEUED.value,
+                            ImageAcquisitionJobStatus.STALE.value,
+                        ]
+                    ),
                     ImageAcquisitionJobRecord.worker_id.is_(None),
                     ImageAcquisitionJobRecord.claim_token.is_(None),
                 )
@@ -1082,6 +1396,7 @@ class ImageAcquisitionDownloadService:
                 row = session.execute(
                     select(
                         ImageAcquisitionJobRecord.project_id,
+                        ImageAcquisitionJobRecord.id,
                         ImageAcquisitionJobItemRecord.id,
                         ImageAcquisitionJobItemRecord.part_relative_path,
                     )
@@ -1100,9 +1415,10 @@ class ImageAcquisitionDownloadService:
                 ).one_or_none()
                 if row is None:
                     return None
-                project_id, item_id, part_relative_path = row
+                project_id, job_id, item_id, part_relative_path = row
                 return _PartCleanupTarget(
                     project_id=str(project_id),
+                    job_id=str(job_id),
                     item_id=str(item_id),
                     part_relative_path=str(part_relative_path),
                 )
@@ -1216,21 +1532,14 @@ class ImageAcquisitionDownloadService:
         except AcquisitionDownloadError as exc:
             self._fail_all_unfinished(job_id, worker, token, generation, exc.code)
             counts = self._recompute_counts(job_id, worker, token, generation)
-            self._write_manifest(
-                job_id,
-                worker,
-                token,
-                generation,
-                ImageAcquisitionJobStatus.FAILED,
-                counts=counts,
-            )
-            self._finish_job(
+            self._complete_claimed_job(
                 job_id,
                 worker,
                 token,
                 generation,
                 ImageAcquisitionJobStatus.FAILED,
                 exc.code,
+                counts=counts,
             )
             return
         while True:
@@ -1288,8 +1597,58 @@ class ImageAcquisitionDownloadService:
         status, error = self._job_terminal_status(
             job_id, worker=worker, token=token, generation=generation
         )
-        self._write_manifest(job_id, worker, token, generation, status, counts=counts)
-        self._finish_job(job_id, worker, token, generation, status, error)
+        self._complete_claimed_job(
+            job_id,
+            worker,
+            token,
+            generation,
+            status,
+            error,
+            counts=counts,
+        )
+
+    def _complete_claimed_job(
+        self,
+        job_id: UUID,
+        worker: str,
+        token: str,
+        generation: int,
+        status: ImageAcquisitionJobStatus,
+        error: DownloadFailureCode | None,
+        *,
+        counts: _AcquisitionCountsSnapshot,
+    ) -> None:
+        try:
+            manifest_result = self._write_manifest(
+                job_id,
+                worker,
+                token,
+                generation,
+                status,
+                counts=counts,
+            )
+        except _ClaimLost:
+            logger.warning("acquisition_manifest_claim_lost job_id=%s", job_id)
+            return
+        except BaseException:
+            logger.exception("acquisition_manifest_result_ambiguous job_id=%s", job_id)
+            manifest_result = _ManifestWriteResult.DATABASE_ERROR
+
+        if manifest_result is _ManifestWriteResult.SUCCESS:
+            self._finish_job(job_id, worker, token, generation, status, error)
+            return
+        if manifest_result is _ManifestWriteResult.CLAIM_LOST:
+            logger.warning("acquisition_manifest_claim_lost job_id=%s", job_id)
+            return
+        try:
+            deferred = self._defer_manifest_repair(job_id, worker, token, generation)
+        except BaseException:
+            logger.exception(
+                "acquisition_manifest_repair_defer_failed job_id=%s", job_id
+            )
+            deferred = False
+        if not deferred:
+            logger.warning("acquisition_manifest_repair_claim_lost job_id=%s", job_id)
 
     def _process_item(
         self,
@@ -2106,6 +2465,25 @@ class ImageAcquisitionDownloadService:
             )
             return cast(ImageAcquisitionJobRecord | None, result)
 
+    @staticmethod
+    def _job_has_cleanup_pending(job_id: str) -> Any:
+        return (
+            select(ImageAcquisitionJobItemRecord.id)
+            .where(
+                ImageAcquisitionJobItemRecord.job_id == job_id,
+                (
+                    ImageAcquisitionJobItemRecord.part_cleanup_warning.is_not(None)
+                    | ImageAcquisitionJobItemRecord.part_cleanup_claim_token.is_not(
+                        None
+                    )
+                    | ImageAcquisitionJobItemRecord.part_cleanup_next_retry_at.is_not(
+                        None
+                    )
+                ),
+            )
+            .exists()
+        )
+
     def _claim_job(self, job_id: UUID, worker: str, token: str) -> int | None:
         with self.session_factory() as session:
             now = datetime.now(UTC)
@@ -2122,6 +2500,8 @@ class ImageAcquisitionDownloadService:
                     ImageAcquisitionJobRecord.cancellation_requested == False,  # noqa: E712
                     ImageAcquisitionJobRecord.worker_id.is_(None),
                     ImageAcquisitionJobRecord.claim_token.is_(None),
+                    ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
+                    ~self._job_has_cleanup_pending(str(job_id)),
                 )
                 .values(
                     status=ImageAcquisitionJobStatus.RUNNING.value,
@@ -2154,6 +2534,9 @@ class ImageAcquisitionDownloadService:
                         ]
                     ),
                     ImageAcquisitionJobItemRecord.retryable.in_([True, False]),
+                    ImageAcquisitionJobItemRecord.part_cleanup_warning.is_(None),
+                    ImageAcquisitionJobItemRecord.part_cleanup_claim_token.is_(None),
+                    ImageAcquisitionJobItemRecord.part_cleanup_next_retry_at.is_(None),
                     select(ImageAcquisitionJobRecord.id)
                     .where(
                         ImageAcquisitionJobRecord.id == str(job_id),
@@ -2175,10 +2558,6 @@ class ImageAcquisitionDownloadService:
                         else_=ImageAcquisitionItemStatus.DOWNLOADING.value,
                     ),
                     started_at=datetime.now(UTC),
-                    part_cleanup_warning=None,
-                    part_cleanup_claim_token=None,
-                    part_cleanup_claimed_at=None,
-                    part_cleanup_next_retry_at=None,
                     updated_at=datetime.now(UTC),
                 )
                 .returning(ImageAcquisitionJobItemRecord.id)
@@ -2221,6 +2600,9 @@ class ImageAcquisitionDownloadService:
                         == ImageAcquisitionItemStatus.VALIDATION_PENDING.value
                     )
                     | (ImageAcquisitionJobItemRecord.retryable == True),  # noqa: E712
+                    ImageAcquisitionJobItemRecord.part_cleanup_warning.is_(None),
+                    ImageAcquisitionJobItemRecord.part_cleanup_claim_token.is_(None),
+                    ImageAcquisitionJobItemRecord.part_cleanup_next_retry_at.is_(None),
                 )
                 .order_by(ImageAcquisitionJobItemRecord.display_order.asc())
             )
@@ -2305,6 +2687,7 @@ class ImageAcquisitionDownloadService:
                     part_cleanup_claim_token=None,
                     part_cleanup_claimed_at=None,
                     part_cleanup_next_retry_at=None,
+                    part_cleanup_attempt_count=0,
                 )
                 .returning(ImageAcquisitionJobItemRecord.id)
             ).scalar_one_or_none()
@@ -2621,6 +3004,7 @@ class ImageAcquisitionDownloadService:
                     part_cleanup_claim_token=None,
                     part_cleanup_claimed_at=None,
                     part_cleanup_next_retry_at=None,
+                    part_cleanup_attempt_count=0,
                     retry_count=ImageAcquisitionJobItemRecord.retry_count + 1,
                     updated_at=datetime.now(UTC),
                 )
@@ -2808,6 +3192,7 @@ class ImageAcquisitionDownloadService:
                     part_cleanup_claim_token=None,
                     part_cleanup_claimed_at=None,
                     part_cleanup_next_retry_at=None,
+                    part_cleanup_attempt_count=0,
                     completed_at=now,
                     updated_at=now,
                 )
@@ -2962,11 +3347,104 @@ class ImageAcquisitionDownloadService:
                 raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
             return path, item
 
-    def _stale_part_path(
+    @staticmethod
+    def _part_fd_traversal_supported() -> bool:
+        supported: set[Any] = getattr(os, "supports_dir_fd", set())
+        return bool(
+            os.name != "nt"
+            and hasattr(os, "O_DIRECTORY")
+            and hasattr(os, "O_NOFOLLOW")
+            and all(
+                operation in supported for operation in (os.open, os.stat, os.unlink)
+            )
+        )
+
+    def _open_part_cleanup_path(
         self,
         project_id: str,
         item: ImageAcquisitionJobItemRecord | _PartCleanupTarget,
     ) -> _PartPathInspection:
+        item_id = (
+            item.id if isinstance(item, ImageAcquisitionJobItemRecord) else item.item_id
+        )
+        job_id = (
+            item.job_id
+            if isinstance(item, ImageAcquisitionJobItemRecord)
+            else item.job_id
+        )
+        relative_path = item.part_relative_path
+        try:
+            project_uuid = UUID(project_id)
+            job_uuid = UUID(job_id)
+            item_uuid = UUID(item_id)
+        except (ValueError, TypeError):
+            return _PartPathInspection(None, PartCleanupWarningCode.PATH_INVALID)
+        expected_relative_path = f"acquisition/jobs/{job_id}/parts/{item_id}.part"
+        if (
+            str(project_uuid) != project_id
+            or str(job_uuid) != job_id
+            or str(item_uuid) != item_id
+            or relative_path.replace("\\", "/") != expected_relative_path
+        ):
+            return _PartPathInspection(None, PartCleanupWarningCode.PATH_INVALID)
+        root = self.projects.project_root(project_uuid)
+        path = root / "acquisition" / "jobs" / job_id / "parts" / f"{item_id}.part"
+        if not self._part_fd_traversal_supported():
+            if os.name != "nt":
+                return _PartPathInspection(None, PartCleanupWarningCode.PATH_INVALID)
+            return self._stale_part_path(project_id, item)
+        flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        current_fd = -1
+        try:
+            projects_root = self.settings.projects_dir.resolve(strict=True)
+            current_fd = os.open(projects_root, flags)
+            for component in (
+                project_id,
+                "acquisition",
+                "jobs",
+                job_id,
+                "parts",
+            ):
+                child_fd = os.open(component, flags, dir_fd=current_fd)
+                if not stat.S_ISDIR(os.fstat(child_fd).st_mode):
+                    os.close(child_fd)
+                    return _PartPathInspection(
+                        None, PartCleanupWarningCode.PATH_INVALID
+                    )
+                os.close(current_fd)
+                current_fd = child_fd
+            return _PartPathInspection(
+                path,
+                None,
+                (),
+                current_fd,
+                f"{item_id}.part",
+            )
+        except FileNotFoundError:
+            if current_fd >= 0:
+                os.close(current_fd)
+            return _PartPathInspection(path, None)
+        except OSError as exc:
+            if current_fd >= 0:
+                os.close(current_fd)
+            warning = (
+                PartCleanupWarningCode.SYMLINK_REJECTED
+                if exc.errno == errno.ELOOP
+                else PartCleanupWarningCode.PATH_INVALID
+            )
+            return _PartPathInspection(None, warning)
+
+    def _stale_part_path(
+        self,
+        project_id: str,
+        item: ImageAcquisitionJobItemRecord | _PartCleanupTarget,
+        *,
+        open_directory_fd: bool = False,
+    ) -> _PartPathInspection:
+        if open_directory_fd:
+            return self._open_part_cleanup_path(project_id, item)
         try:
             item_id = (
                 item.id
@@ -3057,6 +3535,35 @@ class ImageAcquisitionDownloadService:
         path = inspection.path
         if path is None:
             return PartCleanupWarningCode.PATH_INVALID
+        if inspection.parts_fd >= 0:
+            try:
+                try:
+                    mode = os.stat(
+                        inspection.filename or path.name,
+                        dir_fd=inspection.parts_fd,
+                        follow_symlinks=False,
+                    ).st_mode
+                except FileNotFoundError:
+                    return None
+                if stat.S_ISLNK(mode):
+                    return PartCleanupWarningCode.SYMLINK_REJECTED
+                if not stat.S_ISREG(mode):
+                    return PartCleanupWarningCode.NOT_REGULAR_FILE
+                os.unlink(
+                    inspection.filename or path.name,
+                    dir_fd=inspection.parts_fd,
+                )
+                try:
+                    os.fsync(inspection.parts_fd)
+                except OSError:
+                    return PartCleanupWarningCode.CLEANUP_FAILED
+                return None
+            except FileNotFoundError:
+                return None
+            except OSError:
+                return PartCleanupWarningCode.CLEANUP_FAILED
+            finally:
+                inspection.close()
         try:
             for parent in inspection.parent_components:
                 try:
@@ -3177,6 +3684,7 @@ class ImageAcquisitionDownloadService:
         item.part_cleanup_claim_token = None
         item.part_cleanup_claimed_at = None
         item.part_cleanup_next_retry_at = None
+        item.part_cleanup_attempt_count = 0
         self._finalize_stale_attempts(
             session,
             item,
@@ -3580,6 +4088,7 @@ class ImageAcquisitionDownloadService:
                     ImageAcquisitionJobRecord.worker_id == worker,
                     ImageAcquisitionJobRecord.claim_token == token,
                     ImageAcquisitionJobRecord.worker_generation == generation,
+                    ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
                 )
                 .values(
                     status=status.value,
@@ -3591,6 +4100,8 @@ class ImageAcquisitionDownloadService:
                     claim_token=None,
                     current_item_id=None,
                     active_key=None,
+                    manifest_repair_state=None,
+                    manifest_repair_attempted_at=None,
                     updated_at=completed_at,
                 )
                 .returning(ImageAcquisitionJobRecord.id)
@@ -3667,6 +4178,7 @@ class ImageAcquisitionDownloadService:
                 item.part_cleanup_claim_token = None
                 item.part_cleanup_claimed_at = None
                 item.part_cleanup_next_retry_at = None
+                item.part_cleanup_attempt_count = 0
                 item.updated_at = now
             session.commit()
         for item_id in cleanup_item_ids:
@@ -4230,9 +4742,12 @@ class ImageAcquisitionDownloadService:
                     ImageAcquisitionJobRecord.worker_id == worker,
                     ImageAcquisitionJobRecord.claim_token == token,
                     ImageAcquisitionJobRecord.worker_generation == generation,
+                    ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
                 )
                 .values(
                     manifest_warning="MANIFEST_WRITE_FAILED",
+                    manifest_repair_state=ManifestRepairState.PENDING.value,
+                    manifest_repair_attempted_at=datetime.now(UTC),
                     updated_at=datetime.now(UTC),
                 )
                 .returning(ImageAcquisitionJobRecord.id)
@@ -4241,6 +4756,203 @@ class ImageAcquisitionDownloadService:
                 session.rollback()
                 raise _ClaimLost()
             session.commit()
+
+    def _defer_manifest_repair(
+        self, job_id: UUID, worker: str, token: str, generation: int
+    ) -> bool:
+        with self.session_factory() as session:
+            now = datetime.now(UTC)
+            result = session.execute(
+                update(ImageAcquisitionJobRecord)
+                .where(
+                    ImageAcquisitionJobRecord.id == str(job_id),
+                    ImageAcquisitionJobRecord.status
+                    == ImageAcquisitionJobStatus.RUNNING.value,
+                    ImageAcquisitionJobRecord.worker_id == worker,
+                    ImageAcquisitionJobRecord.claim_token == token,
+                    ImageAcquisitionJobRecord.worker_generation == generation,
+                )
+                .values(
+                    status=ImageAcquisitionJobStatus.STALE.value,
+                    worker_id=None,
+                    claim_token=None,
+                    current_item_id=None,
+                    heartbeat_at=None,
+                    completed_at=None,
+                    active_key=None,
+                    manifest_repair_state=ManifestRepairState.PENDING.value,
+                    manifest_repair_attempted_at=now,
+                    manifest_warning="MANIFEST_REPAIR_PENDING",
+                    updated_at=now,
+                )
+                .returning(ImageAcquisitionJobRecord.id)
+            ).scalar_one_or_none()
+            if result is None:
+                session.rollback()
+                return False
+            session.commit()
+            return True
+
+    def _claim_manifest_repair_job(
+        self, job_id: str, worker: str, token: str
+    ) -> int | None:
+        with self.session_factory() as session:
+            result = session.execute(
+                update(ImageAcquisitionJobRecord)
+                .where(
+                    ImageAcquisitionJobRecord.id == job_id,
+                    ImageAcquisitionJobRecord.status
+                    == ImageAcquisitionJobStatus.STALE.value,
+                    ImageAcquisitionJobRecord.manifest_repair_state
+                    == ManifestRepairState.PENDING.value,
+                    ImageAcquisitionJobRecord.worker_id.is_(None),
+                    ImageAcquisitionJobRecord.claim_token.is_(None),
+                    ~self._job_has_cleanup_pending(job_id),
+                )
+                .values(
+                    status=ImageAcquisitionJobStatus.RUNNING.value,
+                    manifest_repair_state=ManifestRepairState.REPAIRING.value,
+                    manifest_repair_attempted_at=datetime.now(UTC),
+                    worker_id=worker,
+                    claim_token=token,
+                    worker_generation=ImageAcquisitionJobRecord.worker_generation + 1,
+                    heartbeat_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                )
+                .returning(ImageAcquisitionJobRecord.worker_generation)
+            ).scalar_one_or_none()
+            session.commit()
+            return int(result) if result is not None else None
+
+    def _release_manifest_repair_claim(
+        self, job_id: UUID, worker: str, token: str, generation: int
+    ) -> bool:
+        with self.session_factory() as session:
+            result = session.execute(
+                update(ImageAcquisitionJobRecord)
+                .where(
+                    ImageAcquisitionJobRecord.id == str(job_id),
+                    ImageAcquisitionJobRecord.status
+                    == ImageAcquisitionJobStatus.RUNNING.value,
+                    ImageAcquisitionJobRecord.worker_id == worker,
+                    ImageAcquisitionJobRecord.claim_token == token,
+                    ImageAcquisitionJobRecord.worker_generation == generation,
+                )
+                .values(
+                    status=ImageAcquisitionJobStatus.STALE.value,
+                    manifest_repair_state=ManifestRepairState.PENDING.value,
+                    worker_id=None,
+                    claim_token=None,
+                    current_item_id=None,
+                    heartbeat_at=None,
+                    updated_at=datetime.now(UTC),
+                )
+                .returning(ImageAcquisitionJobRecord.id)
+            ).scalar_one_or_none()
+            session.commit()
+            return result is not None
+
+    def reconcile_manifest_repairs(self, *, limit: int = STALE_JOB_BATCH_SIZE) -> int:
+        if limit <= 0:
+            return 0
+        try:
+            with self.session_factory() as session:
+                candidates = session.execute(
+                    select(
+                        ImageAcquisitionJobRecord.id,
+                        ImageAcquisitionJobRecord.project_id,
+                        ImageAcquisitionJobRecord.manifest_relative_path,
+                    )
+                    .where(
+                        ImageAcquisitionJobRecord.status
+                        == ImageAcquisitionJobStatus.STALE.value,
+                        ImageAcquisitionJobRecord.manifest_repair_state
+                        == ManifestRepairState.PENDING.value,
+                        ImageAcquisitionJobRecord.worker_id.is_(None),
+                        ImageAcquisitionJobRecord.claim_token.is_(None),
+                    )
+                    .order_by(
+                        ImageAcquisitionJobRecord.manifest_repair_attempted_at,
+                        ImageAcquisitionJobRecord.updated_at,
+                    )
+                    .limit(limit)
+                ).all()
+        except OperationalError as exc:
+            if "no such table: image_acquisition_jobs" not in str(exc):
+                raise
+            logger.warning("acquisition_manifest_repair_table_not_migrated")
+            return 0
+
+        repaired_count = 0
+        for job_id, project_id, old_relative_path in candidates:
+            job_uuid = UUID(str(job_id))
+            worker = f"manifest-repair-{uuid4().hex[:12]}"
+            token = uuid4().hex
+            generation = self._claim_manifest_repair_job(str(job_id), worker, token)
+            if generation is None:
+                continue
+            try:
+                with self.session_factory() as session:
+                    items = session.scalars(
+                        select(ImageAcquisitionJobItemRecord)
+                        .where(ImageAcquisitionJobItemRecord.job_id == str(job_id))
+                        .order_by(ImageAcquisitionJobItemRecord.display_order)
+                    ).all()
+                    counts = self._counts_snapshot(items)
+                status, error = self._job_terminal_status(
+                    job_uuid,
+                    worker=worker,
+                    token=token,
+                    generation=generation,
+                )
+                result = self._write_manifest(
+                    job_uuid,
+                    worker,
+                    token,
+                    generation,
+                    status,
+                    counts=counts,
+                )
+                if result is _ManifestWriteResult.SUCCESS:
+                    if old_relative_path and not self._cleanup_previous_manifest(
+                        str(project_id), str(old_relative_path)
+                    ):
+                        self._defer_manifest_repair(job_uuid, worker, token, generation)
+                        continue
+                    self._finish_job(job_uuid, worker, token, generation, status, error)
+                    repaired_count += 1
+                elif result is not _ManifestWriteResult.CLAIM_LOST:
+                    self._defer_manifest_repair(job_uuid, worker, token, generation)
+            except _ClaimLost:
+                logger.warning(
+                    "acquisition_manifest_repair_claim_lost job_id=%s", job_id
+                )
+            except BaseException:
+                logger.exception("acquisition_manifest_repair_failed job_id=%s", job_id)
+                try:
+                    self._defer_manifest_repair(job_uuid, worker, token, generation)
+                except BaseException:
+                    logger.exception(
+                        "acquisition_manifest_repair_defer_failed job_id=%s", job_id
+                    )
+        return repaired_count
+
+    def _cleanup_previous_manifest(self, project_id: str, relative_path: str) -> bool:
+        try:
+            _, manifest_dir, manifest_file = self._manifest_file_from_relative_path(
+                project_id, relative_path
+            )
+        except OSError as exc:
+            return "missing" in str(exc).lower()
+        except (AcquisitionDownloadError, ValueError):
+            return False
+        if not self._cleanup_manifest_artifact(manifest_file):
+            return False
+        try:
+            self._fsync_manifest_directory(manifest_dir)
+        except OSError:
+            return False
+        return True
 
     def _clear_manifest_reference_after_commit(
         self,
@@ -4358,7 +5070,7 @@ class ImageAcquisitionDownloadService:
         final_status: ImageAcquisitionJobStatus,
         *,
         counts: _AcquisitionCountsSnapshot | None = None,
-    ) -> None:
+    ) -> _ManifestWriteResult:
         with self.session_factory() as session:
             job = session.scalar(
                 select(ImageAcquisitionJobRecord).where(
@@ -4371,7 +5083,7 @@ class ImageAcquisitionDownloadService:
                 )
             )
             if job is None:
-                raise _ClaimLost()
+                return _ManifestWriteResult.CLAIM_LOST
             items = session.scalars(
                 select(ImageAcquisitionJobItemRecord)
                 .where(ImageAcquisitionJobItemRecord.job_id == job.id)
@@ -4381,7 +5093,7 @@ class ImageAcquisitionDownloadService:
             if counts is None:
                 counts = current_counts
             elif counts != current_counts:
-                raise _ClaimLost()
+                return _ManifestWriteResult.CLAIM_LOST
             completed_at = datetime.now(UTC)
             manifest = {
                 "schema_version": "phase8b-manifest-v1",
@@ -4532,7 +5244,10 @@ class ImageAcquisitionDownloadService:
                         self._cleanup_manifest_artifact(
                             final, directory_fd=directory.fd
                         )
-                    self._record_manifest_warning(job_id, worker, token, generation)
+                    try:
+                        self._record_manifest_warning(job_id, worker, token, generation)
+                    except _ClaimLost:
+                        return _ManifestWriteResult.CLAIM_LOST
                     logger.warning(
                         "acquisition_manifest_write_failed "
                         "job_id=%s error_type=%s operation=%s",
@@ -4540,7 +5255,7 @@ class ImageAcquisitionDownloadService:
                         type(exc).__name__,
                         operation,
                     )
-                    return
+                    return _ManifestWriteResult.WARNING_RECORDED
 
                 relative_path = (
                     f"acquisition/jobs/{manifest_job_id}/manifests/{final.name}"
@@ -4563,6 +5278,8 @@ class ImageAcquisitionDownloadService:
                             .values(
                                 manifest_relative_path=relative_path,
                                 manifest_warning=None,
+                                manifest_repair_state=None,
+                                manifest_repair_attempted_at=None,
                                 updated_at=datetime.now(UTC),
                             )
                             .returning(ImageAcquisitionJobRecord.id)
@@ -4585,7 +5302,7 @@ class ImageAcquisitionDownloadService:
                                 self._cleanup_manifest_artifact(
                                     final, directory_fd=directory.fd
                                 )
-                            raise
+                            return _ManifestWriteResult.DATABASE_ERROR
                 except _ClaimLost:
                     self._cleanup_manifest_artifact(final, directory_fd=directory.fd)
                     raise
@@ -4594,7 +5311,11 @@ class ImageAcquisitionDownloadService:
                         self._cleanup_manifest_artifact(
                             final, directory_fd=directory.fd
                         )
-                    raise
+                    try:
+                        self._record_manifest_warning(job_id, worker, token, generation)
+                    except _ClaimLost:
+                        return _ManifestWriteResult.CLAIM_LOST
+                    return _ManifestWriteResult.DATABASE_ERROR
                 operation = "post_commit_verify"
                 try:
                     if directory.fd >= 0:
@@ -4609,7 +5330,7 @@ class ImageAcquisitionDownloadService:
                 except (AcquisitionDownloadError, OSError, ValueError):
                     post_commit_valid = False
                 if not post_commit_valid:
-                    self._handle_manifest_post_commit_failure(
+                    clear_result = self._handle_manifest_post_commit_failure(
                         job_id,
                         worker,
                         token,
@@ -4625,11 +5346,21 @@ class ImageAcquisitionDownloadService:
                         manifest_job_id,
                         operation,
                     )
-                    return
+                    if clear_result is _ManifestReferenceClearResult.DATABASE_ERROR:
+                        return _ManifestWriteResult.DATABASE_ERROR
+                    try:
+                        self._record_manifest_warning(job_id, worker, token, generation)
+                    except _ClaimLost:
+                        return _ManifestWriteResult.CLAIM_LOST
+                    return _ManifestWriteResult.REPAIR_PENDING
+                return _ManifestWriteResult.SUCCESS
         except _ClaimLost:
-            raise
+            return _ManifestWriteResult.CLAIM_LOST
         except (AcquisitionDownloadError, OSError, ValueError) as exc:
-            self._record_manifest_warning(job_id, worker, token, generation)
+            try:
+                self._record_manifest_warning(job_id, worker, token, generation)
+            except _ClaimLost:
+                return _ManifestWriteResult.CLAIM_LOST
             logger.warning(
                 "acquisition_manifest_write_failed "
                 "job_id=%s error_type=%s operation=%s",
@@ -4637,7 +5368,7 @@ class ImageAcquisitionDownloadService:
                 type(exc).__name__,
                 operation,
             )
-            return
+            return _ManifestWriteResult.WARNING_RECORDED
 
 
 def _job_view(job: ImageAcquisitionJobRecord) -> AcquisitionJobView:

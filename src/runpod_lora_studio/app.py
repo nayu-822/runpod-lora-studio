@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 from pathlib import Path
 from typing import cast
 
@@ -113,6 +114,9 @@ def create_app(
         max_batches=runtime_settings.image_download_cleanup_max_batches,
         time_budget_seconds=runtime_settings.image_download_cleanup_time_budget_seconds,
     )
+    acquisition_download.reconcile_manifest_repairs()
+    acquisition_download.start_cleanup_scheduler()
+    atexit.register(acquisition_download.stop_cleanup_scheduler)
     path_rows = build_paths_dataframe(runtime_settings)
 
     with gr.Blocks(title=runtime_settings.app_title) as demo:

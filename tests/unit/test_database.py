@@ -67,7 +67,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0034_phase8b_cleanup_retry_schedule"
+            "0035_phase8c_cleanup_repair_scheduler"
         )
 
 
@@ -353,6 +353,20 @@ def test_phase8b_part_cleanup_claims_downgrade_and_reupgrade(
             for index in inspector.get_indexes("image_acquisition_job_items")
         }
         command.upgrade(config, "head")
+        upgraded_inspector = inspect(create_engine_for_settings(settings))
+        upgraded_item_columns = {
+            column["name"]
+            for column in upgraded_inspector.get_columns("image_acquisition_job_items")
+        }
+        upgraded_job_columns = {
+            column["name"]
+            for column in upgraded_inspector.get_columns("image_acquisition_jobs")
+        }
+        assert "part_cleanup_attempt_count" in upgraded_item_columns
+        assert {
+            "manifest_repair_state",
+            "manifest_repair_attempted_at",
+        }.issubset(upgraded_job_columns)
     finally:
         get_settings.cache_clear()
         if old_path is None:
@@ -361,7 +375,7 @@ def test_phase8b_part_cleanup_claims_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0034_phase8b_cleanup_retry_schedule"
+            "0035_phase8c_cleanup_repair_scheduler"
         )
 
 
@@ -394,7 +408,7 @@ def test_phase8b_cleanup_retry_schedule_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0034_phase8b_cleanup_retry_schedule"
+            "0035_phase8c_cleanup_repair_scheduler"
         )
 
 
@@ -426,7 +440,7 @@ def test_phase8a_page_checkpoint_migration_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0034_phase8b_cleanup_retry_schedule"
+            "0035_phase8c_cleanup_repair_scheduler"
         )
 
 
@@ -483,7 +497,7 @@ def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0034_phase8b_cleanup_retry_schedule"
+            "0035_phase8c_cleanup_repair_scheduler"
         )
 
 
@@ -511,7 +525,7 @@ def test_phase4_downgrade_and_reupgrade_preserves_phase3_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0034_phase8b_cleanup_retry_schedule"
+            "0035_phase8c_cleanup_repair_scheduler"
         )
 
 
@@ -525,7 +539,7 @@ def test_phase5_upgrades_existing_0006_database_to_head(
         assert "managed_models" in tables
         assert "storage_transfer_jobs" in tables
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0034_phase8b_cleanup_retry_schedule"
+            "0035_phase8c_cleanup_repair_scheduler"
         )
 
 
@@ -546,7 +560,7 @@ def test_phase5_heartbeat_migration_upgrades_existing_0007_database(
             "current_file_transferred_bytes",
         }.issubset(columns)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0034_phase8b_cleanup_retry_schedule"
+            "0035_phase8c_cleanup_repair_scheduler"
         )
 
 
@@ -594,7 +608,7 @@ def test_phase5_progress_migration_upgrades_existing_0008_database(
         ).one()
         assert row == ("running", 0, 0)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0034_phase8b_cleanup_retry_schedule"
+            "0035_phase8c_cleanup_repair_scheduler"
         )
 
 
@@ -621,7 +635,7 @@ def test_phase5_progress_downgrade_and_reupgrade(test_workspace: Path) -> None:
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0034_phase8b_cleanup_retry_schedule"
+            "0035_phase8c_cleanup_repair_scheduler"
         )
 
 

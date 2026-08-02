@@ -221,6 +221,9 @@ class AppSettings(BaseSettings):  # type: ignore[misc]
     image_download_cleanup_time_budget_seconds: float = Field(
         default=5.0, gt=0.0, le=60.0
     )
+    image_download_cleanup_scheduler_interval_seconds: float = Field(
+        default=30.0, gt=0.0, le=3600.0
+    )
     image_download_disk_safety_margin_bytes: int = Field(
         default=256 * 1024 * 1024, ge=0
     )
