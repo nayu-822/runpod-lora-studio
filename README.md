@@ -303,7 +303,11 @@ stale復旧ではdownloadingをpendingへ戻し、downloaded／validating／vali
 
 stale claimの回収は、job ID、running status、stale heartbeat、worker ID、claim token、worker generationを含む条件付き更新で原子的に行います。回収後のjobは`queued`へ戻し、新しいworker claimの下でcounter再計算、terminal status判定、manifest生成、`completed_at`設定、active key解除を行います。そのため、import済みitemだけが残るstale jobも、専用workerのclaim後にjobとmanifestを終端化できます。
 
-source metadata取得の`get_post()`は単発requestとし、item attemptをretryの正本にします。request前後とRetry-After待機中はcancel、claim token、worker generation、heartbeatを確認し、metadata request数とattempt監査が二重retryなしで対応します。レビュー対応後の品質チェックは、`ruff format --check .`、`ruff check .`、`mypy src`が成功し、`pytest`は`324 passed, 2 skipped`です。
+source metadata取得の`get_post()`は単発requestとし、item attemptをretryの正本にします。request前後とRetry-After待機中はcancel、claim token、worker generation、heartbeatを確認します。cancelで呼出元workerが先に戻る場合も、実transportはクライアント単位の上限1 executorで継続し、source limiterのleaseと`after_request`は実transport終了後にだけ解放・実行します。そのため、cancel直後に次の外部requestを開始せず、background threadがrequestごとに無制限に増えません。429とRetry-After、callback／transport／cancel／claim喪失時の例外・release監査を維持し、URL、Authorization、API key、raw responseはログへ出しません。
+
+manifestはworker generationとランダムUUID断片によるworker固有のtemporary／final fileへ書き込み、JSON書込みとSQLite transactionを分離します。final fileを書いた後にclaim条件付きUPDATEで`manifest_relative_path`を保存し、claimを失ったold workerは自分が作成したfileだけをcleanupします。DBが参照するpathはprojects root内のregular fileに限定し、共有`.manifest.tmp`や固定`manifest.json`の競合を使用しません。plan検証の恒久エラー時は、`PENDING`、`DOWNLOADING`、`DOWNLOADED`、`VALIDATION_PENDING`、`VALIDATING`、`VALIDATED`、`IMPORTING`の全非終端itemとrunning attemptを同じfailure codeでFAILED・非retryableに終端化し、安全な`.part`をcleanupしてからcounterを再計算し、manifestを生成します。
+
+最新HEADでの品質チェックは、`ruff format --check .`、`ruff check .`、`mypy src`が成功し、`pytest`は`342 passed, 2 skipped, 77 warnings`です。
 ## Phase 6A: SDXL LoRA学習ジョブ基盤
 
 Phase 6Aでは、完成済みデータセットスナップショットと検証済みローカルモデルを入力に、学習設定・ジョブをSQLiteへ保存し、安全な引数配列で `sdxl_train_network.py` を起動します。ジョブはPID、worker heartbeat、stdout/stderrログ、終了コードを記録し、キャンセル、stale復旧、boundedなログ末尾取得に対応します。

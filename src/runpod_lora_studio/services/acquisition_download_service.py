@@ -15,7 +15,7 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import case, select, update
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from runpod_lora_studio.config.settings import AppSettings
 from runpod_lora_studio.domain.acquisition_download_models import (
@@ -665,8 +665,6 @@ class ImageAcquisitionDownloadService:
         except AcquisitionDownloadError as exc:
             self._fail_all_unfinished(job_id, worker, token, generation, exc.code)
             counts = self._recompute_counts(job_id, worker, token, generation)
-            if counts is None:
-                raise _ClaimLost() from exc
             self._write_manifest(
                 job_id,
                 worker,
@@ -736,8 +734,6 @@ class ImageAcquisitionDownloadService:
                     generation=generation,
                 )
         counts = self._recompute_counts(job_id, worker, token, generation)
-        if counts is None:
-            raise _ClaimLost()
         status, error = self._job_terminal_status(
             job_id, worker=worker, token=token, generation=generation
         )
@@ -2650,24 +2646,9 @@ class ImageAcquisitionDownloadService:
             raise
 
     def _recompute_counts(
-        self,
-        job_id: UUID,
-        worker: str | None = None,
-        token: str | None = None,
-        generation: int | None = None,
-    ) -> _AcquisitionCountsSnapshot | None:
-        if (worker is None) != (token is None) or (
-            worker is not None and generation is None
-        ):
-            raise ValueError("worker, token, and generation must be provided together")
+        self, job_id: UUID, worker: str, token: str, generation: int
+    ) -> _AcquisitionCountsSnapshot:
         with self.session_factory() as session:
-            job_exists = session.scalar(
-                select(ImageAcquisitionJobRecord).where(
-                    ImageAcquisitionJobRecord.id == str(job_id)
-                )
-            )
-            if job_exists is None:
-                return None
             items = session.scalars(
                 select(ImageAcquisitionJobItemRecord).where(
                     ImageAcquisitionJobItemRecord.job_id == str(job_id)
@@ -2675,21 +2656,17 @@ class ImageAcquisitionDownloadService:
             ).all()
             snapshot = self._counts_snapshot(items)
             now = datetime.now(UTC)
-            conditions = [ImageAcquisitionJobRecord.id == str(job_id)]
-            if worker is not None:
-                conditions.extend(
-                    [
-                        ImageAcquisitionJobRecord.status
-                        == ImageAcquisitionJobStatus.RUNNING.value,
-                        ImageAcquisitionJobRecord.worker_id == worker,
-                        ImageAcquisitionJobRecord.claim_token == token,
-                        ImageAcquisitionJobRecord.worker_generation == generation,
-                    ]
-                )
+            conditions = [
+                ImageAcquisitionJobRecord.id == str(job_id),
+                ImageAcquisitionJobRecord.status
+                == ImageAcquisitionJobStatus.RUNNING.value,
+                ImageAcquisitionJobRecord.worker_id == worker,
+                ImageAcquisitionJobRecord.claim_token == token,
+                ImageAcquisitionJobRecord.worker_generation == generation,
+            ]
             values: dict[str, object] = {**snapshot.job_values()}
             values["updated_at"] = now
-            if worker is not None:
-                values["heartbeat_at"] = now
+            values["heartbeat_at"] = now
             result = session.execute(
                 update(ImageAcquisitionJobRecord)
                 .where(*conditions)
@@ -2698,9 +2675,7 @@ class ImageAcquisitionDownloadService:
             ).scalar_one_or_none()
             if result is None:
                 session.rollback()
-                if worker is not None:
-                    raise _ClaimLost()
-                return None
+                raise _ClaimLost()
             session.commit()
             return snapshot
 
@@ -2913,36 +2888,132 @@ class ImageAcquisitionDownloadService:
         generation: int,
         code: DownloadFailureCode,
     ) -> None:
+        unfinished_statuses = [
+            ImageAcquisitionItemStatus.PENDING.value,
+            ImageAcquisitionItemStatus.DOWNLOADING.value,
+            ImageAcquisitionItemStatus.DOWNLOADED.value,
+            ImageAcquisitionItemStatus.VALIDATION_PENDING.value,
+            ImageAcquisitionItemStatus.VALIDATING.value,
+            ImageAcquisitionItemStatus.VALIDATED.value,
+            ImageAcquisitionItemStatus.IMPORTING.value,
+        ]
         with self.session_factory() as session:
-            session.execute(
-                update(ImageAcquisitionJobItemRecord)
-                .where(
+            claim = [
+                ImageAcquisitionJobRecord.id == str(job_id),
+                ImageAcquisitionJobRecord.status
+                == ImageAcquisitionJobStatus.RUNNING.value,
+                ImageAcquisitionJobRecord.worker_id == worker,
+                ImageAcquisitionJobRecord.claim_token == token,
+                ImageAcquisitionJobRecord.worker_generation == generation,
+            ]
+            now = datetime.now(UTC)
+            project_id = session.scalar(
+                select(ImageAcquisitionJobRecord.project_id).where(*claim)
+            )
+            if project_id is None:
+                session.rollback()
+                raise _ClaimLost()
+            claim_result = session.execute(
+                update(ImageAcquisitionJobRecord)
+                .where(*claim)
+                .values(updated_at=now)
+                .returning(ImageAcquisitionJobRecord.id)
+            ).scalar_one_or_none()
+            if claim_result is None:
+                session.rollback()
+                raise _ClaimLost()
+            items = session.scalars(
+                select(ImageAcquisitionJobItemRecord).where(
                     ImageAcquisitionJobItemRecord.job_id == str(job_id),
-                    ImageAcquisitionJobItemRecord.status.in_(
-                        [
-                            ImageAcquisitionItemStatus.PENDING.value,
-                            ImageAcquisitionItemStatus.DOWNLOADING.value,
-                        ]
-                    ),
-                    select(ImageAcquisitionJobRecord.id)
-                    .where(
-                        ImageAcquisitionJobRecord.id == str(job_id),
-                        ImageAcquisitionJobRecord.status
-                        == ImageAcquisitionJobStatus.RUNNING.value,
-                        ImageAcquisitionJobRecord.worker_id == worker,
-                        ImageAcquisitionJobRecord.claim_token == token,
-                        ImageAcquisitionJobRecord.worker_generation == generation,
-                    )
-                    .exists(),
+                    ImageAcquisitionJobItemRecord.status.in_(unfinished_statuses),
+                )
+            ).all()
+            cleanup_paths: list[Path] = []
+            for item in items:
+                part = self._stale_part_path(str(project_id), item)
+                if part is not None:
+                    cleanup_paths.append(part)
+                self._finalize_stale_attempts(
+                    session,
+                    item,
+                    now,
+                    code,
+                    retryable=False,
+                )
+                item.status = ImageAcquisitionItemStatus.FAILED.value
+                item.failure_code = code.value
+                item.failure_message = code.value
+                item.retryable = False
+                item.image_asset_id = None
+                item.completed_at = now
+                item.updated_at = now
+            session.commit()
+        for part in cleanup_paths:
+            if not part.exists() or part.is_symlink() or not part.is_file():
+                continue
+            try:
+                part.unlink()
+            except OSError:
+                logger.warning("acquisition_part_cleanup_failed item_id=%s", part.stem)
+
+    def _manifest_paths(
+        self, project_id: str, job_id: str, generation: int
+    ) -> tuple[Path, Path, Path]:
+        project_path = self.projects.project_root(UUID(project_id))
+        projects_root = self.settings.projects_dir.resolve()
+        if project_path.is_symlink():
+            raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
+        project_root = project_path.resolve()
+        if not project_root.is_relative_to(projects_root) or not project_root.is_dir():
+            raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
+        manifest_dir = (
+            project_root / "acquisition" / "jobs" / job_id / "manifests"
+        ).resolve()
+        if not manifest_dir.is_relative_to(project_root):
+            raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
+        final_name = f"manifest-g{generation}-{uuid4().hex[:12]}.json"
+        final = manifest_dir / final_name
+        temporary = manifest_dir / f".{final_name}.tmp"
+        if any(path.exists() or path.is_symlink() for path in (temporary, final)):
+            raise OSError("manifest path already exists")
+        return manifest_dir, temporary, final
+
+    @staticmethod
+    def _cleanup_manifest_artifact(path: Path) -> None:
+        try:
+            if path.is_symlink() or not path.exists():
+                return
+            if path.is_file():
+                path.unlink()
+        except OSError:
+            logger.warning(
+                "acquisition_manifest_cleanup_failed error_type=%s",
+                "OSError",
+            )
+
+    def _record_manifest_warning(
+        self, job_id: UUID, worker: str, token: str, generation: int
+    ) -> None:
+        with self.session_factory() as session:
+            result = session.execute(
+                update(ImageAcquisitionJobRecord)
+                .where(
+                    ImageAcquisitionJobRecord.id == str(job_id),
+                    ImageAcquisitionJobRecord.status
+                    == ImageAcquisitionJobStatus.RUNNING.value,
+                    ImageAcquisitionJobRecord.worker_id == worker,
+                    ImageAcquisitionJobRecord.claim_token == token,
+                    ImageAcquisitionJobRecord.worker_generation == generation,
                 )
                 .values(
-                    status=ImageAcquisitionItemStatus.FAILED.value,
-                    failure_code=code.value,
-                    failure_message=code.value,
-                    retryable=False,
+                    manifest_warning="manifest generation failed",
                     updated_at=datetime.now(UTC),
                 )
-            )
+                .returning(ImageAcquisitionJobRecord.id)
+            ).scalar_one_or_none()
+            if result is None:
+                session.rollback()
+                raise _ClaimLost()
             session.commit()
 
     def _write_manifest(
@@ -2968,9 +3039,6 @@ class ImageAcquisitionDownloadService:
             )
             if job is None:
                 raise _ClaimLost()
-            project_root = self.projects.project_root(UUID(job.project_id)).resolve()
-            manifest_dir = project_root / "acquisition" / "jobs" / job.id / "manifests"
-            manifest_dir.mkdir(parents=True, exist_ok=True)
             items = session.scalars(
                 select(ImageAcquisitionJobItemRecord)
                 .where(ImageAcquisitionJobItemRecord.job_id == job.id)
@@ -3027,21 +3095,55 @@ class ImageAcquisitionDownloadService:
                     for item in items
                 ],
             }
-            temporary = manifest_dir / ".manifest.tmp"
-            final = manifest_dir / "manifest.json"
-            try:
-                temporary.parent.mkdir(parents=True, exist_ok=True)
-                with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-                    json.dump(
-                        manifest,
-                        handle,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, final)
+            project_id = job.project_id
+            manifest_job_id = job.id
+
+        temporary: Path | None = None
+        final: Path | None = None
+        final_written = False
+        operation = "path"
+        try:
+            manifest_dir, temporary, final = self._manifest_paths(
+                project_id, manifest_job_id, generation
+            )
+            operation = "mkdir"
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            operation = "write"
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(
+                    manifest,
+                    handle,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            operation = "replace"
+            os.replace(temporary, final)
+            final_written = True
+            operation = "validate"
+            if final.is_symlink() or not final.is_file():
+                raise OSError("manifest final path is not a regular file")
+        except (AcquisitionDownloadError, OSError, ValueError) as exc:
+            if temporary is not None:
+                self._cleanup_manifest_artifact(temporary)
+            if final_written and final is not None:
+                self._cleanup_manifest_artifact(final)
+            self._record_manifest_warning(job_id, worker, token, generation)
+            logger.warning(
+                "acquisition_manifest_write_failed "
+                "job_id=%s error_type=%s operation=%s",
+                manifest_job_id,
+                type(exc).__name__,
+                operation,
+            )
+            return
+
+        assert final is not None
+        relative_path = f"acquisition/jobs/{manifest_job_id}/manifests/{final.name}"
+        try:
+            with self.session_factory() as session:
                 result = session.execute(
                     update(ImageAcquisitionJobRecord)
                     .where(
@@ -3053,45 +3155,20 @@ class ImageAcquisitionDownloadService:
                         ImageAcquisitionJobRecord.worker_generation == generation,
                     )
                     .values(
-                        manifest_relative_path=(
-                            f"acquisition/jobs/{job.id}/manifests/manifest.json"
-                        ),
+                        manifest_relative_path=relative_path,
+                        manifest_warning=None,
                         updated_at=datetime.now(UTC),
                     )
                     .returning(ImageAcquisitionJobRecord.id)
-                )
-                if result.scalar_one_or_none() is None:
+                ).scalar_one_or_none()
+                if result is None:
                     session.rollback()
-                    final.unlink(missing_ok=True)
+                    self._cleanup_manifest_artifact(final)
                     raise _ClaimLost()
                 session.commit()
-            except OSError as exc:
-                temporary.unlink(missing_ok=True)
-                result = session.execute(
-                    update(ImageAcquisitionJobRecord)
-                    .where(
-                        ImageAcquisitionJobRecord.id == str(job_id),
-                        ImageAcquisitionJobRecord.status
-                        == ImageAcquisitionJobStatus.RUNNING.value,
-                        ImageAcquisitionJobRecord.worker_id == worker,
-                        ImageAcquisitionJobRecord.claim_token == token,
-                        ImageAcquisitionJobRecord.worker_generation == generation,
-                    )
-                    .values(
-                        manifest_warning="manifest generation failed",
-                        updated_at=datetime.now(UTC),
-                    )
-                    .returning(ImageAcquisitionJobRecord.id)
-                )
-                logger.warning(
-                    "acquisition_manifest_write_failed job_id=%s error_type=%s",
-                    job.id,
-                    type(exc).__name__,
-                )
-                if result.scalar_one_or_none() is None:
-                    session.rollback()
-                    raise _ClaimLost() from exc
-                session.commit()
+        except SQLAlchemyError:
+            self._cleanup_manifest_artifact(final)
+            raise
 
 
 def _job_view(job: ImageAcquisitionJobRecord) -> AcquisitionJobView:

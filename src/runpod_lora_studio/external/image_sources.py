@@ -13,6 +13,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+)
+from concurrent.futures import (
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from ipaddress import ip_address
@@ -113,6 +120,48 @@ class HttpResponse:
 
 class HttpTransport(Protocol):
     def get(self, params: Mapping[str, str]) -> HttpResponse: ...
+
+
+class _PendingTransport(Exception):
+    """A canceled monitor whose transport still owns the source limiter."""
+
+    def __init__(
+        self,
+        error: BaseException,
+        future: Future[HttpResponse],
+        after_request: Callable[[], None] | None,
+    ) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.future = future
+        self.after_request = after_request
+
+    def finish(self, limiter: SourceRateLimiter) -> None:
+        def cleanup(future: Future[HttpResponse]) -> None:
+            try:
+                future.result()
+            except BaseException as exc:
+                logger.warning(
+                    "source_transport_finished_with_error error_type=%s",
+                    type(exc).__name__,
+                )
+            if self.after_request is not None:
+                try:
+                    self.after_request()
+                except BaseException as exc:
+                    logger.warning(
+                        "source_after_request_failed error_type=%s",
+                        type(exc).__name__,
+                    )
+            try:
+                limiter.release()
+            except BaseException as exc:
+                logger.warning(
+                    "source_rate_limiter_release_failed error_type=%s",
+                    type(exc).__name__,
+                )
+
+        self.future.add_done_callback(cleanup)
 
 
 class DanbooruHttpTransport:
@@ -228,7 +277,11 @@ class SourceRateLimiter:
         *,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> None:
-        self._semaphore.acquire()
+        while not self._semaphore.acquire(timeout=0.25):
+            if cancel_requested is not None and cancel_requested():
+                raise DanbooruSourceError(
+                    AcquisitionErrorCode.CANCELED, "source request canceled"
+                )
         try:
             now = self.clock()
             wait = 0.0
@@ -312,6 +365,9 @@ class DanbooruApiClient:
         self.limiter = limiter or SourceRateLimiter()
         self.retry_policy = retry_policy or DanbooruRetryPolicy()
         self.sleeper = sleeper
+        self._transport_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="danbooru-source"
+        )
 
     def get_json(
         self,
@@ -380,22 +436,35 @@ class DanbooruApiClient:
         poll_interval_seconds: float | None,
     ) -> HttpResponse:
         acquired = False
+        deferred_release = False
         primary_error: BaseException | None = None
+        transport_started = False
         try:
             self.limiter.acquire(cancel_requested=cancel_requested)
             acquired = True
             try:
                 if before_request is not None:
                     before_request()
+                if cancel_requested is not None and cancel_requested():
+                    raise DanbooruSourceError(
+                        AcquisitionErrorCode.CANCELED, "source request canceled"
+                    )
+                transport_started = True
                 response = self._get_transport_response(
                     params,
                     cancel_requested=cancel_requested,
                     before_request=before_request,
+                    after_request=after_request,
                     poll_interval_seconds=poll_interval_seconds,
                 )
+            except _PendingTransport as pending:
+                deferred_release = True
+                primary_error = pending.error
+                pending.finish(self.limiter)
+                raise pending.error from pending
             except BaseException as exc:
                 primary_error = exc
-                if after_request is not None:
+                if transport_started and after_request is not None:
                     try:
                         after_request()
                     except BaseException as after_error:
@@ -410,10 +479,10 @@ class DanbooruApiClient:
                     raise
             return response
         finally:
-            if acquired:
+            if acquired and not deferred_release:
                 try:
                     self.limiter.release()
-                except Exception as release_error:
+                except BaseException as release_error:
                     if primary_error is None:
                         raise
                     logger.warning(
@@ -427,6 +496,7 @@ class DanbooruApiClient:
         *,
         cancel_requested: Callable[[], bool] | None,
         before_request: Callable[[], None] | None,
+        after_request: Callable[[], None] | None,
         poll_interval_seconds: float | None,
     ) -> HttpResponse:
         if (
@@ -436,38 +506,21 @@ class DanbooruApiClient:
         ):
             return self.transport.get(params)
 
-        completed = threading.Event()
-        response: list[HttpResponse] = []
-        errors: list[BaseException] = []
-
-        def run_transport() -> None:
+        future = self._transport_executor.submit(self.transport.get, params)
+        while True:
             try:
-                response.append(self.transport.get(params))
-            except BaseException as exc:
-                errors.append(exc)
-            finally:
-                completed.set()
-
-        threading.Thread(
-            target=run_transport,
-            name="danbooru-metadata-request",
-            daemon=True,
-        ).start()
-        while not completed.wait(poll_interval_seconds):
-            if before_request is not None:
-                before_request()
-            if cancel_requested is not None and cancel_requested():
-                raise DanbooruSourceError(
-                    AcquisitionErrorCode.CANCELED, "source request canceled"
-                )
-        if errors:
-            raise errors[0]
-        if not response:
-            raise DanbooruSourceError(
-                AcquisitionErrorCode.UNKNOWN_SOURCE_ERROR,
-                "source request returned no response",
-            )
-        return response[0]
+                return future.result(timeout=poll_interval_seconds)
+            except FutureTimeoutError:
+                try:
+                    if before_request is not None:
+                        before_request()
+                    if cancel_requested is not None and cancel_requested():
+                        raise DanbooruSourceError(
+                            AcquisitionErrorCode.CANCELED,
+                            "source request canceled",
+                        )
+                except BaseException as exc:
+                    raise _PendingTransport(exc, future, after_request) from exc
 
 
 class DanbooruImageSourceAdapter:

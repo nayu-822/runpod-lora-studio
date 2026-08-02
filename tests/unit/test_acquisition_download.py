@@ -54,6 +54,9 @@ from runpod_lora_studio.persistence.models import (
     ImageAcquisitionJobItemRecord,
     ImageAcquisitionJobRecord,
 )
+from runpod_lora_studio.services import (
+    acquisition_download_service as acquisition_download_module,
+)
 from runpod_lora_studio.services.acquisition_download_service import (
     AcquisitionDownloadError,
     ImageAcquisitionDownloadService,
@@ -204,14 +207,16 @@ def test_download_validates_imports_and_writes_safe_manifest(
     project_root = settings.projects_dir / str(job.project_id)
     original_files = list((project_root / "originals").glob("*.png"))
     assert len(original_files) == 1
-    manifest = (
-        project_root
-        / "acquisition"
-        / "jobs"
-        / str(job_id)
-        / "manifests"
-        / "manifest.json"
-    )
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.manifest_relative_path is not None
+        manifest = project_root / stored_job.manifest_relative_path
+        assert manifest.is_file()
     manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
     assert manifest_data["status"] == "completed"
     assert "file_url" not in json.dumps(manifest_data)
@@ -773,15 +778,20 @@ def test_stale_importing_state_is_completed_from_existing_idempotent_import(
         assert job.active_key is None
         assert job.completed_at is not None
         assert job.manifest_relative_path is not None
-    manifest = (
-        settings.projects_dir
-        / str(job_view.project_id)
-        / "acquisition"
-        / "jobs"
-        / str(job_id)
-        / "manifests"
-        / "manifest.json"
-    )
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.manifest_relative_path is not None
+        manifest = (
+            settings.projects_dir
+            / str(job_view.project_id)
+            / stored_job.manifest_relative_path
+        )
+        assert manifest.is_file()
     manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
     assert manifest_data["status"] == ImageAcquisitionJobStatus.COMPLETED.value
     assert manifest_data["item_count"] == 1
@@ -1337,6 +1347,350 @@ def test_old_worker_counter_update_is_rejected_after_stale_reclaim(
         assert job.status == ImageAcquisitionJobStatus.RUNNING.value
         assert job.worker_id == "new-worker"
         assert job.imported_count == 1
+
+
+@pytest.mark.parametrize(
+    ("final_status", "item_statuses"),
+    [
+        (
+            ImageAcquisitionJobStatus.COMPLETED,
+            (ImageAcquisitionItemStatus.IMPORTED,),
+        ),
+        (
+            ImageAcquisitionJobStatus.PARTIALLY_COMPLETED,
+            (
+                ImageAcquisitionItemStatus.IMPORTED,
+                ImageAcquisitionItemStatus.FAILED,
+            ),
+        ),
+        (
+            ImageAcquisitionJobStatus.FAILED,
+            (ImageAcquisitionItemStatus.FAILED,),
+        ),
+    ],
+)
+def test_old_worker_cannot_remove_new_manifest_for_any_terminal_status(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    final_status: ImageAcquisitionJobStatus,
+    item_statuses: tuple[ImageAcquisitionItemStatus, ...],
+) -> None:
+    settings = _settings(test_workspace)
+    posts = tuple(
+        _post(str(1330 + index), _png_bytes((20 + index, 100, 180)))
+        for index in range(len(item_statuses))
+    )
+    plan_id, adapter = _make_plan(settings, posts)
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    old_generation = service._claim_job(job_id, "old-worker", "old-token")
+    assert old_generation is not None
+    session_factory = create_session_factory(settings)
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        items = session.scalars(
+            select(ImageAcquisitionJobItemRecord)
+            .where(ImageAcquisitionJobItemRecord.job_id == str(job_id))
+            .order_by(ImageAcquisitionJobItemRecord.display_order)
+        ).all()
+        assert job is not None
+        project_id = job.project_id
+        assert len(items) == len(item_statuses)
+        for item, status in zip(items, item_statuses, strict=True):
+            item.status = status.value
+            if status is ImageAcquisitionItemStatus.FAILED:
+                item.failure_code = DownloadFailureCode.PLAN_METADATA_CHANGED.value
+                item.failure_message = DownloadFailureCode.PLAN_METADATA_CHANGED.value
+                item.retryable = False
+        job.heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+        session.commit()
+
+    old_counts = service._recompute_counts(
+        job_id, "old-worker", "old-token", old_generation
+    )
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert job is not None
+        job.heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+        session.commit()
+    paused_after_replace = threading.Event()
+    release_old_worker = threading.Event()
+    old_error: list[BaseException] = []
+    replace_calls = 0
+    original_replace = acquisition_download_module.os.replace
+
+    def pause_after_replace(source: Path, destination: Path) -> None:
+        nonlocal replace_calls
+        original_replace(source, destination)
+        replace_calls += 1
+        if replace_calls == 1:
+            paused_after_replace.set()
+            assert release_old_worker.wait(5.0)
+
+    monkeypatch.setattr(acquisition_download_module.os, "replace", pause_after_replace)
+
+    def old_worker() -> None:
+        try:
+            service._write_manifest(
+                job_id,
+                "old-worker",
+                "old-token",
+                old_generation,
+                final_status,
+                counts=old_counts,
+            )
+        except BaseException as exc:
+            old_error.append(exc)
+
+    old_thread = threading.Thread(target=old_worker)
+    old_thread.start()
+    assert paused_after_replace.wait(1.0)
+    manifest_dir = (
+        settings.projects_dir
+        / project_id
+        / "acquisition"
+        / "jobs"
+        / str(job_id)
+        / "manifests"
+    )
+    old_manifest_files = list(manifest_dir.glob("manifest-*.json"))
+    assert len(old_manifest_files) == 1
+
+    with session_factory() as session:
+        assert service._claim_stale_job(
+            session,
+            str(job_id),
+            "old-worker",
+            "old-token",
+            old_generation,
+            datetime.now(UTC) - timedelta(minutes=5),
+            datetime.now(UTC),
+        )
+        session.commit()
+    new_generation = service._claim_job(job_id, "new-worker", "new-token")
+    assert new_generation is not None
+    new_counts = service._recompute_counts(
+        job_id, "new-worker", "new-token", new_generation
+    )
+    service._write_manifest(
+        job_id,
+        "new-worker",
+        "new-token",
+        new_generation,
+        final_status,
+        counts=new_counts,
+    )
+    service._finish_job(
+        job_id,
+        "new-worker",
+        "new-token",
+        new_generation,
+        final_status,
+        None,
+    )
+    with session_factory() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.manifest_relative_path is not None
+        new_manifest = (
+            settings.projects_dir
+            / stored_job.project_id
+            / stored_job.manifest_relative_path
+        )
+        assert new_manifest.is_file()
+        assert json.loads(new_manifest.read_text(encoding="utf-8"))["status"] == (
+            final_status.value
+        )
+
+    release_old_worker.set()
+    old_thread.join(1.0)
+    assert not old_thread.is_alive()
+    assert old_error and isinstance(old_error[0], _ClaimLost)
+    assert old_manifest_files[0] != new_manifest
+    assert not old_manifest_files[0].exists()
+    assert list(manifest_dir.glob("manifest-*.json")) == [new_manifest]
+    assert not list(manifest_dir.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize(
+    "unfinished_status",
+    [
+        ImageAcquisitionItemStatus.PENDING,
+        ImageAcquisitionItemStatus.DOWNLOADING,
+        ImageAcquisitionItemStatus.DOWNLOADED,
+        ImageAcquisitionItemStatus.VALIDATION_PENDING,
+        ImageAcquisitionItemStatus.VALIDATING,
+        ImageAcquisitionItemStatus.VALIDATED,
+        ImageAcquisitionItemStatus.IMPORTING,
+    ],
+)
+def test_plan_validation_failure_finishes_every_unfinished_item(
+    test_workspace: Path,
+    unfinished_status: ImageAcquisitionItemStatus,
+) -> None:
+    settings = _settings(test_workspace)
+    body = _png_bytes((90, 20, 180))
+    post = _post("1340", body)
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    generation = service._claim_job(job_id, "validation-worker", "validation-token")
+    assert generation is not None
+    session_factory = create_session_factory(settings)
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        item.status = unfinished_status.value
+        item.received_bytes = 1
+        item.attempt_count = 1
+        part = settings.projects_dir / job.project_id / item.part_relative_path
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(b"x")
+        now = datetime.now(UTC)
+        session.add(
+            ImageAcquisitionAttemptRecord(
+                id=f"validation-attempt-{unfinished_status.value}",
+                job_item_id=item.id,
+                attempt_number=1,
+                status="running",
+                worker_generation=generation,
+                started_at=now,
+                created_at=now,
+            )
+        )
+        session.commit()
+
+    service._fail_all_unfinished(
+        job_id,
+        "validation-worker",
+        "validation-token",
+        generation,
+        DownloadFailureCode.PLAN_METADATA_CHANGED,
+    )
+    counts = service._recompute_counts(
+        job_id, "validation-worker", "validation-token", generation
+    )
+    service._write_manifest(
+        job_id,
+        "validation-worker",
+        "validation-token",
+        generation,
+        ImageAcquisitionJobStatus.FAILED,
+        counts=counts,
+    )
+    service._finish_job(
+        job_id,
+        "validation-worker",
+        "validation-token",
+        generation,
+        ImageAcquisitionJobStatus.FAILED,
+        DownloadFailureCode.PLAN_METADATA_CHANGED,
+    )
+
+    item_view = service.list_items(job_id)[0]
+    assert item_view.status is ImageAcquisitionItemStatus.FAILED
+    assert item_view.failure_code == DownloadFailureCode.PLAN_METADATA_CHANGED.value
+    assert not part.exists()
+    with session_factory() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        attempt = session.scalar(select(ImageAcquisitionAttemptRecord))
+        assert stored_job is not None
+        assert stored_job.manifest_relative_path is not None
+        assert stored_job.pending_count == 0
+        assert stored_job.downloading_count == 0
+        assert attempt is not None
+        assert attempt.status == "failed"
+        assert attempt.failure_code == DownloadFailureCode.PLAN_METADATA_CHANGED.value
+        manifest = (
+            settings.projects_dir
+            / stored_job.project_id
+            / stored_job.manifest_relative_path
+        )
+        manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+        assert manifest_data["status"] == ImageAcquisitionJobStatus.FAILED.value
+        assert manifest_data["pending_count"] == 0
+        assert manifest_data["downloading_count"] == 0
+        assert manifest_data["failed_count"] == 1
+
+
+def test_stale_validation_pending_plan_change_finishes_job_as_failed(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace)
+    body = _png_bytes((100, 40, 200))
+    post = _post("1341", body)
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    generation = service._claim_job(job_id, "stale-worker", "stale-token")
+    assert generation is not None
+    session_factory = create_session_factory(settings)
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        item.status = ImageAcquisitionItemStatus.DOWNLOADED.value
+        item.received_bytes = len(body)
+        part = settings.projects_dir / job.project_id / item.part_relative_path
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(body)
+        job.heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+        session.commit()
+
+    assert service.recover_stale_jobs() == 1
+    assert (
+        service.list_items(job_id)[0].status
+        is ImageAcquisitionItemStatus.VALIDATION_PENDING
+    )
+    adapter.adapter_version = "changed-after-stale-recovery"  # type: ignore[misc]
+    service.run_job_sync(job_id)
+
+    job = service.get_job(job_id)
+    assert job is not None
+    assert job.status is ImageAcquisitionJobStatus.FAILED
+    item = service.list_items(job_id)[0]
+    assert item.status is ImageAcquisitionItemStatus.FAILED
+    assert item.failure_code == DownloadFailureCode.PLAN_METADATA_CHANGED.value
+    assert not part.exists()
 
 
 def test_terminal_status_rejects_nonterminal_items(

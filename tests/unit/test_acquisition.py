@@ -411,20 +411,31 @@ def test_source_request_releases_limiter_once_on_callback_or_transport_failure(
 def test_metadata_request_polling_cancels_and_reuses_limiter() -> None:
     started = threading.Event()
     unblock = threading.Event()
+    second_started = threading.Event()
+    after_done = threading.Event()
     canceled = False
     heartbeat_calls = 0
     after_calls = 0
 
     class BlockingTransport:
         calls = 0
+        active = 0
+        max_active = 0
 
         def get(self, params: dict[str, str]) -> HttpResponse:
             del params
             self.calls += 1
-            if self.calls == 1:
-                started.set()
-                assert unblock.wait(5.0)
-            return HttpResponse(200, {"Content-Type": "application/json"}, b"[]")
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                if self.calls == 1:
+                    started.set()
+                    assert unblock.wait(5.0)
+                else:
+                    second_started.set()
+                return HttpResponse(200, {"Content-Type": "application/json"}, b"[]")
+            finally:
+                self.active -= 1
 
     transport = BlockingTransport()
     client = DanbooruApiClient(
@@ -441,6 +452,7 @@ def test_metadata_request_polling_cancels_and_reuses_limiter() -> None:
     def after_request() -> None:
         nonlocal after_calls
         after_calls += 1
+        after_done.set()
 
     result: list[BaseException] = []
 
@@ -465,11 +477,34 @@ def test_metadata_request_polling_cancels_and_reuses_limiter() -> None:
     assert result and isinstance(result[0], DanbooruSourceError)
     assert result[0].code is AcquisitionErrorCode.CANCELED
     assert heartbeat_calls >= 1
-    assert after_calls == 1
+    assert after_calls == 0
+    assert not second_started.is_set()
 
-    payload, _, _, _ = client.get_json({"tags": "solo"})
-    assert payload == []
+    second_result: list[tuple[object, int, int, int]] = []
+
+    def second_request() -> None:
+        second_result.append(client.get_json({"tags": "solo"}))
+
+    second_thread = threading.Thread(target=second_request)
+    second_thread.start()
+    time.sleep(0.05)
+    assert not second_started.is_set()
+    assert transport.calls == 1
+    assert (
+        sum(
+            thread.name.startswith("danbooru-source")
+            for thread in threading.enumerate()
+        )
+        <= 1
+    )
+
     unblock.set()
+    assert after_done.wait(1.0)
+    second_thread.join(1.0)
+    assert not second_thread.is_alive()
+    assert second_result and second_result[0][0] == []
+    assert transport.calls == 2
+    assert transport.max_active == 1
 
 
 def test_get_post_uses_one_request_and_leaves_retry_to_download_worker() -> None:
