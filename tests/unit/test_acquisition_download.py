@@ -1430,17 +1430,26 @@ def test_old_worker_cannot_remove_new_manifest_for_any_terminal_status(
     release_old_worker = threading.Event()
     old_error: list[BaseException] = []
     replace_calls = 0
-    original_replace = acquisition_download_module.os.replace
+    original_atomic_replace = service._atomic_replace_manifest
 
-    def pause_after_replace(source: Path, destination: Path) -> None:
+    def pause_after_replace(
+        source: Path,
+        destination: Path,
+        *,
+        directory_fd: int | None = None,
+    ) -> None:
         nonlocal replace_calls
-        original_replace(source, destination)
+        original_atomic_replace(
+            source,
+            destination,
+            directory_fd=directory_fd,
+        )
         replace_calls += 1
         if replace_calls == 1:
             paused_after_replace.set()
             assert release_old_worker.wait(5.0)
 
-    monkeypatch.setattr(acquisition_download_module.os, "replace", pause_after_replace)
+    monkeypatch.setattr(service, "_atomic_replace_manifest", pause_after_replace)
 
     def old_worker() -> None:
         try:
@@ -1791,6 +1800,160 @@ def test_plan_validation_cleanup_result_is_audited(
     assert "intentional test failure" not in json.dumps(manifest_data)
 
 
+def test_pending_part_cleanup_is_recovered_after_worker_stops(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1348", _png_bytes((40, 110, 190)))
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    generation = service._claim_job(job_id, "stopping-worker", "stopping-token")
+    assert generation is not None
+    session_factory = create_session_factory(settings)
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        item.status = ImageAcquisitionItemStatus.DOWNLOADING.value
+        item.received_bytes = 1
+        item.attempt_count = 1
+        part = settings.projects_dir / job.project_id / item.part_relative_path
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(b"orphan")
+        now = datetime.now(UTC)
+        session.add(
+            ImageAcquisitionAttemptRecord(
+                id="stopping-cleanup-attempt",
+                job_item_id=item.id,
+                attempt_number=1,
+                status="running",
+                worker_generation=generation,
+                started_at=now,
+                created_at=now,
+            )
+        )
+        session.commit()
+
+    def stop_before_cleanup(_: object) -> PartCleanupWarningCode:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(service, "_cleanup_part_artifact", stop_before_cleanup)
+    with pytest.raises(KeyboardInterrupt):
+        service._fail_all_unfinished(
+            job_id,
+            "stopping-worker",
+            "stopping-token",
+            generation,
+            DownloadFailureCode.PLAN_METADATA_CHANGED,
+        )
+    monkeypatch.setattr(
+        service,
+        "_cleanup_part_artifact",
+        ImageAcquisitionDownloadService._cleanup_part_artifact,
+    )
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        job.heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+        assert item.status == ImageAcquisitionItemStatus.FAILED.value
+        assert item.part_cleanup_warning == PartCleanupWarningCode.PENDING.value
+        session.commit()
+
+    assert service.recover_stale_jobs() == 1
+    item_view = service.list_items(job_id)[0]
+    assert item_view.status is ImageAcquisitionItemStatus.FAILED
+    assert item_view.part_cleanup_warning is None
+    assert not part.exists()
+    with session_factory() as session:
+        attempt = session.scalar(select(ImageAcquisitionAttemptRecord))
+        assert attempt is not None and attempt.status == "failed"
+
+
+def test_part_cleanup_warning_survives_retry_and_clears_only_after_cleanup(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1349", _png_bytes((70, 130, 210)))
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    session_factory = create_session_factory(settings)
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        job.status = ImageAcquisitionJobStatus.FAILED.value
+        item.status = ImageAcquisitionItemStatus.FAILED.value
+        item.failure_code = DownloadFailureCode.PLAN_METADATA_CHANGED.value
+        item.failure_message = DownloadFailureCode.PLAN_METADATA_CHANGED.value
+        item.retryable = False
+        item.part_cleanup_warning = PartCleanupWarningCode.CLEANUP_FAILED.value
+        part = settings.projects_dir / job.project_id / item.part_relative_path
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(b"retry-me")
+        session.commit()
+
+    monkeypatch.setattr(
+        service,
+        "_cleanup_part_artifact",
+        lambda _: PartCleanupWarningCode.CLEANUP_FAILED,
+    )
+    service.recover_stale_jobs()
+    with session_factory() as session:
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert item is not None
+        assert item.status == ImageAcquisitionItemStatus.FAILED.value
+        assert item.part_cleanup_warning == PartCleanupWarningCode.CLEANUP_FAILED.value
+    assert part.exists()
+
+    monkeypatch.setattr(
+        service,
+        "_cleanup_part_artifact",
+        ImageAcquisitionDownloadService._cleanup_part_artifact,
+    )
+    service.recover_stale_jobs()
+    item_view = service.list_items(job_id)[0]
+    assert item_view.status is ImageAcquisitionItemStatus.FAILED
+    assert item_view.part_cleanup_warning is None
+    assert not part.exists()
+
+
 @pytest.mark.parametrize("component", ["acquisition", "jobs", "job", "manifests"])
 def test_manifest_rejects_symlink_parent_components(
     test_workspace: Path,
@@ -1921,6 +2084,171 @@ def test_manifest_rejects_existing_artifact_symlink(
     assert target.read_bytes() == b"must remain"
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="manifest fd race coverage requires POSIX directory descriptors",
+)
+@pytest.mark.parametrize(
+    "race_point", ["validation", "open", "temporary", "rename", "fsync", "cleanup"]
+)
+@pytest.mark.parametrize("target_scope", ["same-project", "outside-project"])
+def test_manifest_fd_operations_reject_directory_swap_races(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    race_point: str,
+    target_scope: str,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1348", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    generation = service._claim_job(job_id, "race-worker", "race-token")
+    assert generation is not None
+    counts = service._recompute_counts(job_id, "race-worker", "race-token", generation)
+    with create_session_factory(settings)() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert job is not None
+        project_id = job.project_id
+    project_root = settings.projects_dir / project_id
+    manifest_dir = project_root / "acquisition" / "jobs" / str(job_id) / "manifests"
+    manifest_dir.mkdir(parents=True)
+    same_project_target = project_root / "manifest-race-same-project"
+    outside_project_target = test_workspace / "manifest-race-outside-project"
+    target = (
+        same_project_target
+        if target_scope == "same-project"
+        else outside_project_target
+    )
+    target.mkdir()
+    backup = manifest_dir.with_name("manifests-race-backup")
+    swapped = False
+
+    def swap_manifest_path() -> None:
+        nonlocal swapped
+        if swapped:
+            return
+        manifest_dir.rename(backup)
+        manifest_dir.symlink_to(target, target_is_directory=True)
+        swapped = True
+
+    try:
+        if race_point == "validation":
+            original_validate = service._validate_manifest_directory
+
+            def validate(
+                project_root_value: Path,
+                manifest_dir_value: Path,
+                *,
+                create_missing: bool,
+                allow_missing: bool = False,
+            ) -> None:
+                original_validate(
+                    project_root_value,
+                    manifest_dir_value,
+                    create_missing=create_missing,
+                    allow_missing=allow_missing,
+                )
+                if not create_missing:
+                    swap_manifest_path()
+
+            monkeypatch.setattr(service, "_validate_manifest_directory", validate)
+        elif race_point == "open":
+            original_open_directory = service._open_manifest_directory
+
+            def open_directory(
+                project_id_value: str,
+                job_id_value: str,
+                *,
+                create_missing: bool,
+            ) -> object:
+                handle = original_open_directory(
+                    project_id_value,
+                    job_id_value,
+                    create_missing=create_missing,
+                )
+                swap_manifest_path()
+                return handle
+
+            monkeypatch.setattr(service, "_open_manifest_directory", open_directory)
+        elif race_point == "temporary":
+            original_open_temporary = service._open_manifest_temporary
+
+            def open_temporary(
+                path: Path, *, directory_fd: int | None = None
+            ) -> object:
+                swap_manifest_path()
+                return original_open_temporary(path, directory_fd=directory_fd)
+
+            monkeypatch.setattr(service, "_open_manifest_temporary", open_temporary)
+        elif race_point == "rename":
+            original_replace = service._atomic_replace_manifest
+
+            def replace(
+                temporary: Path,
+                final: Path,
+                *,
+                directory_fd: int | None = None,
+            ) -> None:
+                original_replace(temporary, final, directory_fd=directory_fd)
+                swap_manifest_path()
+
+            monkeypatch.setattr(service, "_atomic_replace_manifest", replace)
+        elif race_point == "fsync":
+            original_directory_fsync = service._fsync_manifest_directory
+
+            def fsync_directory(path: Path, directory_fd: int | None = None) -> None:
+                original_directory_fsync(path, directory_fd)
+                swap_manifest_path()
+
+            monkeypatch.setattr(service, "_fsync_manifest_directory", fsync_directory)
+        else:
+            original_cleanup = service._cleanup_manifest_artifact
+
+            def fail_fsync(path: Path, directory_fd: int | None = None) -> None:
+                raise OSError("intentional directory fsync failure")
+
+            def cleanup(path: Path, *, directory_fd: int | None = None) -> None:
+                swap_manifest_path()
+                original_cleanup(path, directory_fd=directory_fd)
+
+            monkeypatch.setattr(service, "_fsync_manifest_directory", fail_fsync)
+            monkeypatch.setattr(service, "_cleanup_manifest_artifact", cleanup)
+
+        service._write_manifest(
+            job_id,
+            "race-worker",
+            "race-token",
+            generation,
+            ImageAcquisitionJobStatus.COMPLETED,
+            counts=counts,
+        )
+    finally:
+        if manifest_dir.is_symlink():
+            manifest_dir.unlink()
+        if backup.is_dir():
+            backup.rename(manifest_dir)
+
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.manifest_relative_path is None
+        assert stored_job.manifest_warning == "MANIFEST_WRITE_FAILED"
+    assert not list(target.glob("manifest-*.json"))
+    assert not list(manifest_dir.glob("manifest-*.json"))
+    assert not list(manifest_dir.glob(".*.tmp"))
+
+
 def test_manifest_operations_sync_directory_before_db_update(
     test_workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1943,21 +2271,26 @@ def test_manifest_operations_sync_directory_before_db_update(
     original_replace = service._atomic_replace_manifest
     original_directory_fsync = service._fsync_manifest_directory
 
-    def open_temporary(path: Path) -> object:
+    def open_temporary(path: Path, *, directory_fd: int | None = None) -> object:
         events.append("temporary_write")
-        return original_open(path)
+        return original_open(path, directory_fd=directory_fd)
 
     def fsync(descriptor: int) -> None:
         events.append("file_fsync")
         original_fsync(descriptor)
 
-    def replace(temporary: Path, final: Path) -> None:
+    def replace(
+        temporary: Path,
+        final: Path,
+        *,
+        directory_fd: int | None = None,
+    ) -> None:
         events.append("atomic_replace")
-        original_replace(temporary, final)
+        original_replace(temporary, final, directory_fd=directory_fd)
 
-    def fsync_directory(path: Path) -> None:
+    def fsync_directory(path: Path, directory_fd: int | None = None) -> None:
         events.append("directory_fsync")
-        original_directory_fsync(path)
+        original_directory_fsync(path, directory_fd)
 
     monkeypatch.setattr(service, "_open_manifest_temporary", open_temporary)
     monkeypatch.setattr(acquisition_download_module.os, "fsync", fsync)
@@ -2002,7 +2335,7 @@ def test_manifest_directory_fsync_failure_does_not_update_db(
         job_id, "fsync-worker", "fsync-token", generation
     )
 
-    def fail_directory_fsync(_: Path) -> None:
+    def fail_directory_fsync(_: Path, _directory_fd: int | None = None) -> None:
         raise OSError("intentional fsync failure")
 
     monkeypatch.setattr(service, "_fsync_manifest_directory", fail_directory_fsync)

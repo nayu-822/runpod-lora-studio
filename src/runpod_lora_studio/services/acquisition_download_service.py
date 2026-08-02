@@ -16,7 +16,7 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import case, select, update
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from runpod_lora_studio.config.settings import AppSettings
 from runpod_lora_studio.domain.acquisition_download_models import (
@@ -146,6 +146,24 @@ class _PartPathInspection:
     path: Path | None
     warning: PartCleanupWarningCode | None
     parent_components: tuple[Path, ...] = ()
+
+
+@dataclass(slots=True)
+class _ManifestDirectoryHandle:
+    project_root: Path
+    manifest_dir: Path
+    fd: int
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def __enter__(self) -> _ManifestDirectoryHandle:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,11 +491,6 @@ class ImageAcquisitionDownloadService:
                     for item in items:
                         part_inspection = self._stale_part_path(job.project_id, item)
                         part = part_inspection.path
-                        item.part_cleanup_warning = (
-                            part_inspection.warning.value
-                            if part_inspection.warning is not None
-                            else None
-                        )
                         part_matches = self._part_matches_item(part, item)
                         if item.status == ImageAcquisitionItemStatus.IMPORTING.value:
                             if self._recover_importing_item(
@@ -568,6 +581,7 @@ class ImageAcquisitionDownloadService:
                     job.updated_at = now
                     queued_job_ids.append(UUID(job.id))
                 session.commit()
+            self._recover_terminal_part_cleanups()
             if self.auto_start:
                 for job_id in queued_job_ids:
                     self._start_thread(job_id)
@@ -577,6 +591,63 @@ class ImageAcquisitionDownloadService:
                 raise
             logger.warning("acquisition_jobs_table_not_migrated")
             return 0
+
+    def _recover_terminal_part_cleanups(self) -> None:
+        terminal_statuses = [
+            ImageAcquisitionItemStatus.IMPORTED.value,
+            ImageAcquisitionItemStatus.LINKED_EXISTING.value,
+            ImageAcquisitionItemStatus.SKIPPED.value,
+            ImageAcquisitionItemStatus.FAILED.value,
+            ImageAcquisitionItemStatus.CANCELED.value,
+        ]
+        with self.session_factory() as session:
+            rows = session.execute(
+                select(
+                    ImageAcquisitionJobItemRecord,
+                    ImageAcquisitionJobRecord.project_id,
+                )
+                .join(
+                    ImageAcquisitionJobRecord,
+                    ImageAcquisitionJobRecord.id
+                    == ImageAcquisitionJobItemRecord.job_id,
+                )
+                .where(ImageAcquisitionJobItemRecord.status.in_(terminal_statuses))
+            ).all()
+            for item, _project_id in rows:
+                item.part_cleanup_warning = PartCleanupWarningCode.PENDING.value
+            if rows:
+                session.commit()
+
+        cleanup_results: dict[str, PartCleanupWarningCode | None] = {}
+        cleanup_items: dict[str, ImageAcquisitionJobItemRecord] = {}
+        for item, project_id in rows:
+            inspection = self._stale_part_path(str(project_id), item)
+            cleanup_results[item.id] = self._cleanup_part_artifact(inspection)
+            cleanup_items[item.id] = item
+
+        try:
+            with self.session_factory() as session:
+                for item_id, warning in cleanup_results.items():
+                    item = cleanup_items[item_id]
+                    session.execute(
+                        update(ImageAcquisitionJobItemRecord)
+                        .where(
+                            ImageAcquisitionJobItemRecord.id == item_id,
+                            ImageAcquisitionJobItemRecord.job_id == item.job_id,
+                            ImageAcquisitionJobItemRecord.part_cleanup_warning
+                            == PartCleanupWarningCode.PENDING.value,
+                        )
+                        .values(
+                            part_cleanup_warning=(
+                                warning.value if warning is not None else None
+                            ),
+                            updated_at=datetime.now(UTC),
+                        )
+                    )
+                if cleanup_results:
+                    session.commit()
+        except SQLAlchemyError:
+            logger.warning("acquisition_terminal_part_cleanup_persist_failed")
 
     def _claim_stale_job(
         self,
@@ -2466,7 +2537,11 @@ class ImageAcquisitionDownloadService:
                 flags |= getattr(os, "O_NOFOLLOW", 0)
                 parent_fd = os.open(path.parent, flags)
                 try:
-                    mode = os.lstat(path.name, dir_fd=parent_fd).st_mode
+                    mode = os.stat(
+                        path.name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    ).st_mode
                     if stat.S_ISLNK(mode):
                         return PartCleanupWarningCode.SYMLINK_REJECTED
                     if not stat.S_ISREG(mode):
@@ -3061,41 +3136,47 @@ class ImageAcquisitionDownloadService:
                 item.retryable = False
                 item.image_asset_id = None
                 item.completed_at = now
+                item.part_cleanup_warning = PartCleanupWarningCode.PENDING.value
                 item.updated_at = now
             session.commit()
         cleanup_warnings = {
             item_id: self._cleanup_part_artifact(inspection)
             for item_id, inspection in cleanup_inspections.items()
         }
-        with self.session_factory() as session:
-            claim = [
-                ImageAcquisitionJobRecord.id == str(job_id),
-                ImageAcquisitionJobRecord.status
-                == ImageAcquisitionJobStatus.RUNNING.value,
-                ImageAcquisitionJobRecord.worker_id == worker,
-                ImageAcquisitionJobRecord.claim_token == token,
-                ImageAcquisitionJobRecord.worker_generation == generation,
-            ]
-            for item_id, warning in cleanup_warnings.items():
-                result = session.execute(
-                    update(ImageAcquisitionJobItemRecord)
-                    .where(
-                        ImageAcquisitionJobItemRecord.id == item_id,
-                        ImageAcquisitionJobItemRecord.job_id == str(job_id),
-                        select(ImageAcquisitionJobRecord.id).where(*claim).exists(),
-                    )
-                    .values(
-                        part_cleanup_warning=(
-                            warning.value if warning is not None else None
-                        ),
-                        updated_at=datetime.now(UTC),
-                    )
-                    .returning(ImageAcquisitionJobItemRecord.id)
-                ).scalar_one_or_none()
-                if result is None:
-                    session.rollback()
-                    raise _ClaimLost()
-            session.commit()
+        try:
+            with self.session_factory() as session:
+                claim = [
+                    ImageAcquisitionJobRecord.id == str(job_id),
+                    ImageAcquisitionJobRecord.status
+                    == ImageAcquisitionJobStatus.RUNNING.value,
+                    ImageAcquisitionJobRecord.worker_id == worker,
+                    ImageAcquisitionJobRecord.claim_token == token,
+                    ImageAcquisitionJobRecord.worker_generation == generation,
+                ]
+                for item_id, warning in cleanup_warnings.items():
+                    result = session.execute(
+                        update(ImageAcquisitionJobItemRecord)
+                        .where(
+                            ImageAcquisitionJobItemRecord.id == item_id,
+                            ImageAcquisitionJobItemRecord.job_id == str(job_id),
+                            select(ImageAcquisitionJobRecord.id).where(*claim).exists(),
+                        )
+                        .values(
+                            part_cleanup_warning=(
+                                warning.value if warning is not None else None
+                            ),
+                            updated_at=datetime.now(UTC),
+                        )
+                        .returning(ImageAcquisitionJobItemRecord.id)
+                    ).scalar_one_or_none()
+                    if result is None:
+                        session.rollback()
+                        raise _ClaimLost()
+                session.commit()
+        except _ClaimLost:
+            raise
+        except SQLAlchemyError:
+            logger.warning("acquisition_part_cleanup_warning_persist_failed")
 
     def _manifest_project_root(self, project_id: str) -> Path:
         try:
@@ -3114,6 +3195,116 @@ class ImageAcquisitionDownloadService:
             raise AcquisitionDownloadError(
                 DownloadFailureCode.STAGING_PATH_INVALID
             ) from None
+
+    @staticmethod
+    def _manifest_fd_traversal_supported() -> bool:
+        supported: set[Any] = getattr(os, "supports_dir_fd", set())
+        return bool(
+            os.name != "nt"
+            and hasattr(os, "O_DIRECTORY")
+            and hasattr(os, "O_NOFOLLOW")
+            and all(
+                operation in supported
+                for operation in (os.open, os.mkdir, os.rename, os.unlink, os.stat)
+            )
+        )
+
+    @staticmethod
+    def _open_manifest_directory_fd(
+        name: str | Path, *, parent_fd: int | None = None
+    ) -> int:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = -1
+        try:
+            if parent_fd is None:
+                descriptor = os.open(name, flags)
+            else:
+                descriptor = os.open(name, flags, dir_fd=parent_fd)
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
+            return descriptor
+        except AcquisitionDownloadError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+        except OSError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise AcquisitionDownloadError(
+                DownloadFailureCode.STAGING_PATH_INVALID
+            ) from None
+
+    def _manifest_project_parts(self, project_id: str) -> tuple[Path, Path, str]:
+        try:
+            project_path = self.projects.project_root(UUID(project_id))
+            projects_root = self.settings.projects_dir
+            relative = project_path.relative_to(projects_root)
+            if len(relative.parts) != 1 or relative.name != project_id:
+                raise ValueError
+            return project_path, projects_root, relative.name
+        except (OSError, ValueError):
+            raise AcquisitionDownloadError(
+                DownloadFailureCode.STAGING_PATH_INVALID
+            ) from None
+
+    def _open_manifest_directory(
+        self, project_id: str, job_id: str, *, create_missing: bool
+    ) -> _ManifestDirectoryHandle:
+        project_path, projects_root, project_name = self._manifest_project_parts(
+            project_id
+        )
+        manifest_dir = project_path / "acquisition" / "jobs" / job_id / "manifests"
+        if not self._manifest_fd_traversal_supported():
+            if os.name != "nt":
+                logger.warning("acquisition_manifest_fd_traversal_unavailable")
+                raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
+            logger.warning("acquisition_manifest_fd_traversal_unavailable")
+            self._validate_manifest_directory(
+                project_path,
+                manifest_dir,
+                create_missing=create_missing,
+                allow_missing=not create_missing,
+            )
+            return _ManifestDirectoryHandle(project_path, manifest_dir, -1)
+
+        projects_fd = -1
+        current_fd = -1
+        try:
+            projects_fd = self._open_manifest_directory_fd(projects_root)
+            current_fd = self._open_manifest_directory_fd(
+                project_name, parent_fd=projects_fd
+            )
+            os.close(projects_fd)
+            projects_fd = -1
+            for component in ("acquisition", "jobs", job_id, "manifests"):
+                created = False
+                try:
+                    child_fd = self._open_manifest_directory_fd(
+                        component, parent_fd=current_fd
+                    )
+                except AcquisitionDownloadError:
+                    if not create_missing:
+                        raise
+                    try:
+                        os.mkdir(component, 0o700, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                    child_fd = self._open_manifest_directory_fd(
+                        component, parent_fd=current_fd
+                    )
+                    created = True
+                if created:
+                    os.fsync(current_fd)
+                os.close(current_fd)
+                current_fd = child_fd
+            return _ManifestDirectoryHandle(project_path, manifest_dir, current_fd)
+        except Exception:
+            if current_fd >= 0:
+                os.close(current_fd)
+            if projects_fd >= 0:
+                os.close(projects_fd)
+            raise
 
     @staticmethod
     def _validate_manifest_directory(
@@ -3201,10 +3392,15 @@ class ImageAcquisitionDownloadService:
             raise OSError("manifest path already exists")
         return manifest_dir, temporary, final
 
-    def _open_manifest_temporary(self, path: Path) -> Any:
+    def _open_manifest_temporary(
+        self, path: Path, *, directory_fd: int | None = None
+    ) -> Any:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         flags |= getattr(os, "O_BINARY", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
+        if directory_fd is not None and directory_fd >= 0:
+            descriptor = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+            return os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
         if len(path.parents) < 5:
             raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
         self._validate_manifest_directory(
@@ -3223,7 +3419,34 @@ class ImageAcquisitionDownloadService:
             descriptor = os.open(path, flags, 0o600)
         return os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
 
-    def _atomic_replace_manifest(self, temporary: Path, final: Path) -> None:
+    def _atomic_replace_manifest(
+        self,
+        temporary: Path,
+        final: Path,
+        *,
+        directory_fd: int | None = None,
+    ) -> None:
+        if directory_fd is not None and directory_fd >= 0:
+            try:
+                temporary_mode = os.stat(
+                    temporary.name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                ).st_mode
+                if not stat.S_ISREG(temporary_mode):
+                    raise OSError("manifest temporary is not a regular file")
+                os.stat(final.name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
+            os.rename(
+                temporary.name,
+                final.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            return
         if len(temporary.parents) < 5:
             raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
         self._validate_manifest_directory(
@@ -3262,7 +3485,21 @@ class ImageAcquisitionDownloadService:
         os.replace(temporary, final)
 
     @staticmethod
-    def _fsync_manifest_directory(path: Path) -> None:
+    def _validate_manifest_artifact_fd(name: str, directory_fd: int) -> None:
+        try:
+            mode = os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_mode
+        except FileNotFoundError:
+            raise OSError("manifest artifact is missing") from None
+        if stat.S_ISLNK(mode):
+            raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
+        if not stat.S_ISREG(mode):
+            raise OSError("manifest artifact is not a regular file")
+
+    @staticmethod
+    def _fsync_manifest_directory(path: Path, directory_fd: int | None = None) -> None:
+        if directory_fd is not None and directory_fd >= 0:
+            os.fsync(directory_fd)
+            return
         flags = os.O_RDONLY
         flags |= getattr(os, "O_DIRECTORY", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -3330,14 +3567,29 @@ class ImageAcquisitionDownloadService:
                 == relative_path
             )
 
-    def _cleanup_manifest_artifact(self, path: Path) -> None:
+    def _cleanup_manifest_artifact(
+        self, path: Path, *, directory_fd: int | None = None
+    ) -> None:
         try:
-            if len(path.parents) < 5:
-                return
             if not re.fullmatch(
                 r"(?:manifest-g[0-9]+-[0-9a-f]{12}\.json|\.manifest-g[0-9]+-[0-9a-f]{12}\.json\.tmp)",
                 path.name,
             ):
+                return
+            if directory_fd is not None and directory_fd >= 0:
+                try:
+                    mode = os.stat(
+                        path.name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    ).st_mode
+                except FileNotFoundError:
+                    return
+                if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+                    return
+                os.unlink(path.name, dir_fd=directory_fd)
+                return
+            if len(path.parents) < 5:
                 return
             project_root = path.parents[4]
             projects_root = self.settings.projects_dir.resolve(strict=True)
@@ -3478,63 +3730,163 @@ class ImageAcquisitionDownloadService:
 
         temporary: Path | None = None
         final: Path | None = None
-        final_written = False
         operation = "path"
         try:
             project_root = self._manifest_project_root(project_id)
-            manifest_dir, temporary, final = self._manifest_paths(
+            _, temporary_candidate, final_candidate = self._manifest_paths(
                 project_id, manifest_job_id, generation
             )
-            operation = "mkdir"
-            self._validate_manifest_directory(
-                project_root, manifest_dir, create_missing=True
-            )
-            operation = "write"
-            with self._open_manifest_temporary(temporary) as handle:
-                json.dump(
-                    manifest,
-                    handle,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
+            with self._open_manifest_directory(
+                project_id, manifest_job_id, create_missing=True
+            ) as directory:
+                manifest_dir = directory.manifest_dir
+                temporary = manifest_dir / temporary_candidate.name
+                final = manifest_dir / final_candidate.name
+                final_written = False
+                operation = "write"
+                try:
+                    if directory.fd >= 0:
+                        with self._open_manifest_temporary(
+                            temporary, directory_fd=directory.fd
+                        ) as handle:
+                            json.dump(
+                                manifest,
+                                handle,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                    else:
+                        with self._open_manifest_temporary(temporary) as handle:
+                            json.dump(
+                                manifest,
+                                handle,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                    operation = "recheck_claim"
+                    if not self._manifest_claim_exists(
+                        job_id, worker, token, generation
+                    ):
+                        raise _ClaimLost()
+                    operation = "replace"
+                    if directory.fd >= 0:
+                        self._atomic_replace_manifest(
+                            temporary, final, directory_fd=directory.fd
+                        )
+                    else:
+                        self._atomic_replace_manifest(temporary, final)
+                    final_written = True
+                    operation = "directory_fsync"
+                    if directory.fd >= 0:
+                        self._fsync_manifest_directory(manifest_dir, directory.fd)
+                    else:
+                        self._fsync_manifest_directory(manifest_dir)
+                    operation = "validate"
+                    if directory.fd >= 0:
+                        self._validate_manifest_artifact_fd(final.name, directory.fd)
+                    else:
+                        self._validate_manifest_directory(
+                            project_root, manifest_dir, create_missing=False
+                        )
+                        self._validate_manifest_file(final, regular=True)
+                    operation = "path_revalidate"
+                    self._validate_manifest_directory(
+                        project_root, manifest_dir, create_missing=False
+                    )
+                except _ClaimLost:
+                    self._cleanup_manifest_artifact(
+                        temporary, directory_fd=directory.fd
+                    )
+                    if final_written:
+                        self._cleanup_manifest_artifact(
+                            final, directory_fd=directory.fd
+                        )
+                    raise
+                except (AcquisitionDownloadError, OSError, ValueError) as exc:
+                    self._cleanup_manifest_artifact(
+                        temporary, directory_fd=directory.fd
+                    )
+                    if final_written:
+                        self._cleanup_manifest_artifact(
+                            final, directory_fd=directory.fd
+                        )
+                    self._record_manifest_warning(job_id, worker, token, generation)
+                    logger.warning(
+                        "acquisition_manifest_write_failed "
+                        "job_id=%s error_type=%s operation=%s",
+                        manifest_job_id,
+                        type(exc).__name__,
+                        operation,
+                    )
+                    return
+
+                relative_path = (
+                    f"acquisition/jobs/{manifest_job_id}/manifests/{final.name}"
                 )
-                handle.flush()
-                os.fsync(handle.fileno())
-            operation = "recheck_claim"
-            if not self._manifest_claim_exists(job_id, worker, token, generation):
-                raise _ClaimLost()
-            operation = "revalidate_before_replace"
-            self._validate_manifest_directory(
-                project_root, manifest_dir, create_missing=False
-            )
-            self._validate_manifest_file(temporary, regular=True)
-            try:
-                os.lstat(final)
-            except FileNotFoundError:
-                pass
-            else:
-                raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
-            operation = "replace"
-            self._atomic_replace_manifest(temporary, final)
-            final_written = True
-            operation = "directory_fsync"
-            self._fsync_manifest_directory(manifest_dir)
-            operation = "validate"
-            self._validate_manifest_directory(
-                project_root, manifest_dir, create_missing=False
-            )
-            self._validate_manifest_file(final, regular=True)
+                db_references_own_file = False
+                db_committed = False
+                try:
+                    with self.session_factory() as session:
+                        result = session.execute(
+                            update(ImageAcquisitionJobRecord)
+                            .where(
+                                ImageAcquisitionJobRecord.id == str(job_id),
+                                ImageAcquisitionJobRecord.status
+                                == ImageAcquisitionJobStatus.RUNNING.value,
+                                ImageAcquisitionJobRecord.worker_id == worker,
+                                ImageAcquisitionJobRecord.claim_token == token,
+                                ImageAcquisitionJobRecord.worker_generation
+                                == generation,
+                            )
+                            .values(
+                                manifest_relative_path=relative_path,
+                                manifest_warning=None,
+                                updated_at=datetime.now(UTC),
+                            )
+                            .returning(ImageAcquisitionJobRecord.id)
+                        ).scalar_one_or_none()
+                        if result is None:
+                            session.rollback()
+                            self._cleanup_manifest_artifact(
+                                final, directory_fd=directory.fd
+                            )
+                            raise _ClaimLost()
+                        try:
+                            session.commit()
+                            db_committed = True
+                        except BaseException:
+                            session.rollback()
+                            db_references_own_file = self._manifest_db_references(
+                                job_id, relative_path
+                            )
+                            if not db_references_own_file:
+                                self._cleanup_manifest_artifact(
+                                    final, directory_fd=directory.fd
+                                )
+                            raise
+                except _ClaimLost:
+                    self._cleanup_manifest_artifact(final, directory_fd=directory.fd)
+                    raise
+                except BaseException:
+                    if not db_references_own_file and not db_committed:
+                        self._cleanup_manifest_artifact(
+                            final, directory_fd=directory.fd
+                        )
+                    raise
+                operation = "post_commit_verify"
+                if directory.fd >= 0:
+                    self._validate_manifest_artifact_fd(final.name, directory.fd)
+                else:
+                    self._manifest_file_from_relative_path(project_id, relative_path)
         except _ClaimLost:
-            if temporary is not None:
-                self._cleanup_manifest_artifact(temporary)
-            if final_written and final is not None:
-                self._cleanup_manifest_artifact(final)
             raise
         except (AcquisitionDownloadError, OSError, ValueError) as exc:
-            if temporary is not None:
-                self._cleanup_manifest_artifact(temporary)
-            if final_written and final is not None:
-                self._cleanup_manifest_artifact(final)
             self._record_manifest_warning(job_id, worker, token, generation)
             logger.warning(
                 "acquisition_manifest_write_failed "
@@ -3544,55 +3896,6 @@ class ImageAcquisitionDownloadService:
                 operation,
             )
             return
-
-        assert final is not None
-        relative_path = f"acquisition/jobs/{manifest_job_id}/manifests/{final.name}"
-        self._validate_manifest_directory(
-            project_root, manifest_dir, create_missing=False
-        )
-        self._validate_manifest_file(final, regular=True)
-        db_references_own_file = False
-        try:
-            with self.session_factory() as session:
-                result = session.execute(
-                    update(ImageAcquisitionJobRecord)
-                    .where(
-                        ImageAcquisitionJobRecord.id == str(job_id),
-                        ImageAcquisitionJobRecord.status
-                        == ImageAcquisitionJobStatus.RUNNING.value,
-                        ImageAcquisitionJobRecord.worker_id == worker,
-                        ImageAcquisitionJobRecord.claim_token == token,
-                        ImageAcquisitionJobRecord.worker_generation == generation,
-                    )
-                    .values(
-                        manifest_relative_path=relative_path,
-                        manifest_warning=None,
-                        updated_at=datetime.now(UTC),
-                    )
-                    .returning(ImageAcquisitionJobRecord.id)
-                ).scalar_one_or_none()
-                if result is None:
-                    session.rollback()
-                    self._cleanup_manifest_artifact(final)
-                    raise _ClaimLost()
-                try:
-                    session.commit()
-                except BaseException:
-                    session.rollback()
-                    db_references_own_file = self._manifest_db_references(
-                        job_id, relative_path
-                    )
-                    if not db_references_own_file:
-                        self._cleanup_manifest_artifact(final)
-                    raise
-        except _ClaimLost:
-            self._cleanup_manifest_artifact(final)
-            raise
-        except BaseException:
-            if not db_references_own_file:
-                self._cleanup_manifest_artifact(final)
-            raise
-        self._manifest_file_from_relative_path(project_id, relative_path)
 
 
 def _job_view(job: ImageAcquisitionJobRecord) -> AcquisitionJobView:

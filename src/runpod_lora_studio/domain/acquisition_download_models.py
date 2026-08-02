@@ -78,6 +78,7 @@ class DownloadFailureCode(StrEnum):
 
 
 class PartCleanupWarningCode(StrEnum):
+    PENDING = "PART_CLEANUP_PENDING"
     CLEANUP_FAILED = "PART_CLEANUP_FAILED"
     PATH_INVALID = "PART_PATH_INVALID"
     SYMLINK_REJECTED = "PART_SYMLINK_REJECTED"

@@ -86,6 +86,13 @@ mypy src
 pytest
 ```
 
+### 画像取得ジョブの復旧とmanifestの耐久性
+
+- RunPod Linuxでは、manifestの保存先をプロジェクトルートからfdで一段ずつ`O_DIRECTORY|O_NOFOLLOW`付きで開き、各ディレクトリ作成後に親ディレクトリをfsyncします。manifestは一時ファイルのfsync、claim再確認、同一ディレクトリfd内のatomic rename、manifestディレクトリのfsync、DB更新の順で確定します。
+- manifestの一時ファイル、完成ファイル、削除処理は保持中のディレクトリfdとbasenameだけを使います。保存先のsymlink交換やファイル種別の変更は固定failure codeへ変換し、秘密情報・絶対パス・生の例外内容をmanifestやログへ出しません。
+- 終端化したitemの`.part`削除はDB上で`PART_CLEANUP_PENDING`を記録してから実行します。プロセス停止やclaim喪失後も、次回のstale復旧で通常ファイルを再試行し、削除成功または対象不存在になった場合だけ警告をクリアします。
+- Windowsのローカル開発環境ではfdトラバーサル非対応のため既存の安全なパス検証フォールバックを使用します。本番のRunPod Linuxではfd方式が必須です。
+
 ## 現時点で未実装の内容
 
 Phase 1 では、以下はまだ実装していません。

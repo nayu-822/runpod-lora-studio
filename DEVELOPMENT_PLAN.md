@@ -332,8 +332,10 @@ Phase 5のレビュー対応を完了し、完了扱いへ更新する。Alembic
 - stale claimはjob ID、running status、stale heartbeat、worker ID、claim token、worker generationを含む条件付きUPDATEで原子的に取得し、条件不一致時はitem、attempt、ファイルを変更しない
 - stale復旧後はjobを`queued`へ戻し、新しいworker claimの下でcounter再計算、terminal status判定、manifest生成、`completed_at`設定、active key解除を行う。import成功済みitemだけが残る場合もjobとmanifestを終端化する
 - `get_post()`はmetadataの単発requestとし、item attemptをretryの正本にする。request前後とRetry-After待機中にcancel、claim、generation、heartbeatを確認し、二重retryを行わない
+- manifest保存はRunPod Linuxのプロジェクトルートからfdで一段ずつ`O_DIRECTORY|O_NOFOLLOW`付きでトラバースし、ディレクトリ作成ごとに子ディレクトリのfstatと親ディレクトリのfsyncを行う。保持したmanifestディレクトリfd内で一時ファイルを作成・fsyncし、claim再確認、basenameのみのatomic rename、ディレクトリfsync、DB更新、保存後検証の順序を守る。非対応OSは本番経路として扱わず、Linux以外のローカル開発では既存の検証済みフォールバックを使う
+- 終端化時の`.part`削除はitem／attemptの終端化と同じトランザクションで`PART_CLEANUP_PENDING`を記録し、commit後に実行する。cleanup失敗、worker停止、claim喪失で保留状態を失わず、stale復旧時にterminal itemも含めて通常ファイルの削除を再試行し、対象不存在または成功時だけ警告を消す
 
-Phase 8Bの実装とレビュー指摘対応は、追加テストと品質チェックの成功を確認済み。`ruff format --check .`、`ruff check .`、`mypy src`が成功し、`pytest`は`348 passed, 10 skipped, 77 warnings`である。Google Driveへの成果物同期、完了manifestのDrive保存、PodのStop／TerminateはPhase 9で実装する。
+Phase 8Bの実装とレビュー指摘対応は、追加テストと品質チェックの成功を確認済み。manifestのfdトラバーサル、ディレクトリdurability、TOCTOU検知、`.part` cleanupの再開可能な保留状態を実装した。既存の`0032_phase8b_part_cleanup_warnings`で保持していた警告列を再利用しているため、この対応で新しいmigrationは追加していない。Google Driveへの成果物同期、完了manifestのDrive保存、PodのStop／TerminateはPhase 9で実装する。
 
 ## Phase 9: 完了処理・Google Drive同期・Pod終了
 
