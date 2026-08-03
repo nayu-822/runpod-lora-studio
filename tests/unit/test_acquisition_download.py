@@ -23,6 +23,7 @@ from runpod_lora_studio.domain.acquisition_download_models import (
     DownloadFailureCode,
     ImageAcquisitionItemStatus,
     ImageAcquisitionJobStatus,
+    ManifestRepairState,
     PartCleanupWarningCode,
 )
 from runpod_lora_studio.domain.acquisition_models import (
@@ -554,8 +555,18 @@ def test_resume_continues_cumulative_attempt_numbers_after_cancel(
     service.run_job_sync(job_id)
 
     canceled_item = service.list_items(job_id)[0]
-    assert service.get_job(job_id).status is ImageAcquisitionJobStatus.CANCELED  # type: ignore[union-attr]
+    canceled_job = service.get_job(job_id)
+    assert canceled_job is not None
+    assert canceled_job.status is ImageAcquisitionJobStatus.CANCELED
     assert canceled_item.attempt_count == 1
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.manifest_relative_path is not None
     service.resume_job(job_id, auto_start=False)
     service.run_job_sync(job_id)
 
@@ -2485,6 +2496,230 @@ def test_part_cleanup_restarts_after_unlink_before_result_commit(
     monkeypatch.setattr(service, "session_factory", original_factory)
     assert service.recover_part_cleanup_jobs().processed_count == 1
     assert service.list_items(job_id)[0].part_cleanup_warning is None
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX directory descriptor cleanup coverage",
+)
+def test_part_cleanup_missing_parent_does_not_fallback_to_path_unlink(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1351-missing-parent", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    with create_session_factory(settings)() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        project_id = job.project_id
+        item_id = item.id
+        part_relative_path = item.part_relative_path
+
+    project_root = settings.projects_dir / project_id
+    acquisition_dir = project_root / "acquisition"
+    acquisition_dir.mkdir(parents=True, exist_ok=True)
+    outside_root = test_workspace / "outside-part-root"
+    outside_part = outside_root / str(job_id) / "parts" / f"{item_id}.part"
+    outside_part.parent.mkdir(parents=True)
+    outside_part.write_bytes(b"must-remain")
+
+    inspection = service._open_part_cleanup_path(
+        project_id,
+        SimpleNamespace(
+            id=item_id,
+            job_id=str(job_id),
+            part_relative_path=part_relative_path,
+        ),
+    )
+    assert inspection.path is None
+    assert inspection.parts_fd == -1
+    assert inspection.artifact_absent
+
+    (acquisition_dir / "jobs").symlink_to(outside_root, target_is_directory=True)
+    assert service._cleanup_part_artifact(inspection) is None
+    assert outside_part.exists()
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX directory descriptor cleanup coverage",
+)
+def test_part_cleanup_missing_file_requires_directory_fsync(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace, cleanup_retry_base=0.0)
+    post = _post("1351-missing-file", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    with create_session_factory(settings)() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        job.status = ImageAcquisitionJobStatus.FAILED.value
+        item.status = ImageAcquisitionItemStatus.FAILED.value
+        item.retryable = False
+        item.part_cleanup_warning = PartCleanupWarningCode.PENDING.value
+        part = settings.projects_dir / job.project_id / item.part_relative_path
+        part.parent.mkdir(parents=True, exist_ok=True)
+        session.commit()
+
+    original_fsync = acquisition_download_module.os.fsync
+    fsync_calls: list[int] = []
+
+    def fail_first_fsync(descriptor: int) -> None:
+        fsync_calls.append(descriptor)
+        if len(fsync_calls) == 1:
+            raise OSError("intentional directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(acquisition_download_module.os, "fsync", fail_first_fsync)
+    assert service.recover_part_cleanup_jobs().processed_count == 1
+    with create_session_factory(settings)() as session:
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert item is not None
+        assert item.part_cleanup_warning == PartCleanupWarningCode.CLEANUP_FAILED.value
+        assert item.part_cleanup_next_retry_at is not None
+
+    assert service.recover_part_cleanup_jobs().processed_count == 1
+    assert len(fsync_calls) == 2
+    assert service.list_items(job_id)[0].part_cleanup_warning is None
+
+
+def test_cleanup_retry_delay_is_bounded_before_exponentiation(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace)
+    service = ImageAcquisitionDownloadService(
+        settings,
+        adapter=FakeImageSourceAdapter({}),
+        auto_start=False,
+    )
+    settings.image_download_cleanup_retry_base_backoff_seconds = 2.0
+    settings.image_download_cleanup_retry_max_backoff_seconds = 10.0
+    assert service._cleanup_retry_delay(0) == 2.0
+    assert service._cleanup_retry_delay(1) == 2.0
+    assert service._cleanup_retry_delay(2) == 4.0
+    assert service._cleanup_retry_delay(3) == 8.0
+    assert service._cleanup_retry_delay(4) == 10.0
+    assert service._cleanup_retry_delay(10**6) == 10.0
+
+    settings.image_download_cleanup_retry_base_backoff_seconds = 0.0
+    assert service._cleanup_retry_delay(10**6) == 0.0
+    settings.image_download_cleanup_retry_base_backoff_seconds = 20.0
+    settings.image_download_cleanup_retry_max_backoff_seconds = 10.0
+    assert service._cleanup_retry_delay(2) == 10.0
+
+
+def test_unexpected_worker_failure_completes_through_manifest(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1351-unexpected-worker", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+
+    def fail_worker(*_: object) -> None:
+        raise RuntimeError("intentional worker failure")
+
+    monkeypatch.setattr(service, "_run_claimed_job", fail_worker)
+    service.run_job_sync(job_id)
+
+    job = service.get_job(job_id)
+    assert job is not None
+    assert job.status is ImageAcquisitionJobStatus.FAILED
+    assert job.completed_at is not None
+    assert job.error_code == DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR.value
+    item = service.list_items(job_id)[0]
+    assert item.failure_code == DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR.value
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None and stored_job.manifest_relative_path is not None
+        manifest = (
+            settings.projects_dir
+            / stored_job.project_id
+            / stored_job.manifest_relative_path
+        )
+    assert json.loads(manifest.read_text(encoding="utf-8"))["status"] == (
+        ImageAcquisitionJobStatus.FAILED.value
+    )
+
+
+def test_unexpected_worker_failure_defers_manifest_repair_if_counts_fail(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1351-worker-counts", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    original_recompute = service._recompute_counts
+
+    def fail_counts(*_: object, **__: object) -> object:
+        raise RuntimeError("intentional count failure")
+
+    def fail_worker(*_: object) -> None:
+        raise RuntimeError("worker")
+
+    monkeypatch.setattr(service, "_run_claimed_job", fail_worker)
+    monkeypatch.setattr(service, "_recompute_counts", fail_counts)
+    service.run_job_sync(job_id)
+
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.status == ImageAcquisitionJobStatus.STALE.value
+        assert stored_job.manifest_repair_state == ManifestRepairState.PENDING.value
+        assert stored_job.completed_at is None
+
+    monkeypatch.setattr(service, "_recompute_counts", original_recompute)
+    assert service.reconcile_manifest_repairs() == 1
+    repaired = service.get_job(job_id)
+    assert repaired is not None
+    assert repaired.status is ImageAcquisitionJobStatus.FAILED
 
 
 def test_part_cleanup_and_resume_race_rejects_terminal_resume(

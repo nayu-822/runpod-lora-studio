@@ -92,6 +92,8 @@ pytest
 - manifestの一時ファイル、完成ファイル、削除処理は保持中のディレクトリfdとbasenameだけを使います。保存先のsymlink交換やファイル種別の変更は固定failure codeへ変換し、秘密情報・絶対パス・生の例外内容をmanifestやログへ出しません。
 - 終端化したitemの`.part`削除はDB上で`PART_CLEANUP_PENDING`を記録してから実行します。プロセス停止やclaim喪失後も、次回のstale復旧で通常ファイルを再試行し、削除成功または対象不存在になった場合だけ警告をクリアします。
 - Windowsのローカル開発環境ではfdトラバーサル非対応のため既存の安全なパス検証フォールバックを使用します。本番のRunPod Linuxではfd方式が必須です。
+- POSIXのfdトラバーサル中にディレクトリが消えた場合はartifact absentとして扱い、絶対pathのunlinkへフォールバックしません。対象ファイルが既に無い場合も保持中のparts directoryをfsyncし、fsync失敗は固定warningとして再試行します。
+- 通常・cancel・予期せぬworker例外の終端化はmanifest完了処理を経由し、監査またはcounter再計算が安全に完了できない場合はclaim条件付きで`STALE`／`manifest_repair_state=pending`へ退避します。
 
 ## 現時点で未実装の内容
 

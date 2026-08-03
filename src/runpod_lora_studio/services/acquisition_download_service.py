@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -215,6 +216,7 @@ class _PartPathInspection:
     parent_components: tuple[Path, ...] = ()
     parts_fd: int = -1
     filename: str | None = None
+    artifact_absent: bool = False
 
     def close(self) -> None:
         if self.parts_fd >= 0:
@@ -1304,14 +1306,22 @@ class ImageAcquisitionDownloadService:
         )
 
     def _cleanup_retry_delay(self, attempt_count: int = 1) -> float:
-        exponent = max(attempt_count - 1, 0)
-        return float(
-            min(
-                self.settings.image_download_cleanup_retry_base_backoff_seconds
-                * (2**exponent),
-                self.settings.image_download_cleanup_retry_max_backoff_seconds,
-            )
+        base = max(
+            float(self.settings.image_download_cleanup_retry_base_backoff_seconds), 0.0
         )
+        maximum = max(
+            float(self.settings.image_download_cleanup_retry_max_backoff_seconds), 0.0
+        )
+        if base == 0.0 or maximum == 0.0:
+            return 0.0
+        if base >= maximum or attempt_count <= 1:
+            return min(base, maximum)
+
+        exponent = attempt_count - 1
+        threshold = math.ceil(math.log2(maximum / base))
+        if exponent >= threshold:
+            return maximum
+        return min(math.ldexp(base, exponent), maximum)
 
     def _part_cleanup_claim_conditions(
         self,
@@ -1479,19 +1489,64 @@ class ImageAcquisitionDownloadService:
             logger.warning("acquisition_worker_claim_lost job_id=%s", job_id)
         except Exception:
             logger.exception("acquisition_worker_failed job_id=%s", job_id)
+            self._handle_unexpected_worker_failure(job_id, worker, token, generation)
+
+    def _handle_unexpected_worker_failure(
+        self, job_id: UUID, worker: str, token: str, generation: int
+    ) -> None:
+        try:
+            self._fail_all_unfinished(
+                job_id,
+                worker,
+                token,
+                generation,
+                DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR,
+            )
+        except _ClaimLost:
+            logger.warning("acquisition_worker_claim_lost job_id=%s", job_id)
+            return
+        except Exception:
+            logger.exception(
+                "acquisition_worker_failure_audit_failed job_id=%s", job_id
+            )
+
+        try:
+            counts = self._recompute_counts(job_id, worker, token, generation)
+        except _ClaimLost:
+            logger.warning("acquisition_worker_claim_lost job_id=%s", job_id)
+            return
+        except Exception:
+            logger.exception(
+                "acquisition_worker_count_recompute_failed job_id=%s", job_id
+            )
             try:
-                self._recompute_counts(job_id, worker, token, generation)
-            except _ClaimLost:
-                logger.warning("acquisition_worker_claim_lost job_id=%s", job_id)
-                return
-            self._finish_job(
+                self._defer_manifest_repair(job_id, worker, token, generation)
+            except Exception:
+                logger.exception(
+                    "acquisition_worker_manifest_repair_defer_failed job_id=%s", job_id
+                )
+            return
+
+        try:
+            self._complete_claimed_job(
                 job_id,
                 worker,
                 token,
                 generation,
                 ImageAcquisitionJobStatus.FAILED,
                 DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR,
+                counts=counts,
             )
+        except _ClaimLost:
+            logger.warning("acquisition_worker_claim_lost job_id=%s", job_id)
+        except Exception:
+            logger.exception("acquisition_worker_completion_failed job_id=%s", job_id)
+            try:
+                self._defer_manifest_repair(job_id, worker, token, generation)
+            except Exception:
+                logger.exception(
+                    "acquisition_worker_manifest_repair_defer_failed job_id=%s", job_id
+                )
 
     def _start_thread(self, job_id: UUID) -> None:
         threading.Thread(
@@ -1547,13 +1602,15 @@ class ImageAcquisitionDownloadService:
             if item_id is None:
                 break
             if self._is_cancel_requested(job_id):
-                self._finish_job(
+                counts = self._recompute_counts(job_id, worker, token, generation)
+                self._complete_claimed_job(
                     job_id,
                     worker,
                     token,
                     generation,
                     ImageAcquisitionJobStatus.CANCELED,
                     DownloadFailureCode.CANCELED,
+                    counts=counts,
                 )
                 return
             if not self._claim_item(job_id, item_id, worker, token, generation):
@@ -1571,13 +1628,15 @@ class ImageAcquisitionDownloadService:
                     canceled=True,
                     generation=generation,
                 )
-                self._finish_job(
+                counts = self._recompute_counts(job_id, worker, token, generation)
+                self._complete_claimed_job(
                     job_id,
                     worker,
                     token,
                     generation,
                     ImageAcquisitionJobStatus.CANCELED,
                     DownloadFailureCode.CANCELED,
+                    counts=counts,
                 )
                 return
             except _ClaimLost:
@@ -3425,7 +3484,7 @@ class ImageAcquisitionDownloadService:
         except FileNotFoundError:
             if current_fd >= 0:
                 os.close(current_fd)
-            return _PartPathInspection(path, None)
+            return _PartPathInspection(None, None, artifact_absent=True)
         except OSError as exc:
             if current_fd >= 0:
                 os.close(current_fd)
@@ -3532,6 +3591,8 @@ class ImageAcquisitionDownloadService:
     ) -> PartCleanupWarningCode | None:
         if inspection.warning is not None:
             return inspection.warning
+        if inspection.artifact_absent:
+            return None
         path = inspection.path
         if path is None:
             return PartCleanupWarningCode.PATH_INVALID
@@ -3544,6 +3605,10 @@ class ImageAcquisitionDownloadService:
                         follow_symlinks=False,
                     ).st_mode
                 except FileNotFoundError:
+                    try:
+                        os.fsync(inspection.parts_fd)
+                    except OSError:
+                        return PartCleanupWarningCode.CLEANUP_FAILED
                     return None
                 if stat.S_ISLNK(mode):
                     return PartCleanupWarningCode.SYMLINK_REJECTED
@@ -3559,11 +3624,17 @@ class ImageAcquisitionDownloadService:
                     return PartCleanupWarningCode.CLEANUP_FAILED
                 return None
             except FileNotFoundError:
+                try:
+                    os.fsync(inspection.parts_fd)
+                except OSError:
+                    return PartCleanupWarningCode.CLEANUP_FAILED
                 return None
             except OSError:
                 return PartCleanupWarningCode.CLEANUP_FAILED
             finally:
                 inspection.close()
+        if os.name != "nt":
+            return PartCleanupWarningCode.PATH_INVALID
         try:
             for parent in inspection.parent_components:
                 try:
