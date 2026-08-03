@@ -132,10 +132,12 @@ PART_CLEANUP_ITEM_STATUSES = frozenset(
         ImageAcquisitionItemStatus.LINKED_EXISTING.value,
         ImageAcquisitionItemStatus.SKIPPED.value,
         ImageAcquisitionItemStatus.FAILED.value,
+        ImageAcquisitionItemStatus.CANCELED.value,
     }
 )
 PART_CLEANUP_BATCH_SIZE = 32
 STALE_JOB_BATCH_SIZE = 32
+MANIFEST_REPAIR_INTENT_PREFIX = "MANIFEST_REPAIR_PENDING:"
 
 
 class _PartCleanupOutcome(Enum):
@@ -1318,7 +1320,10 @@ class ImageAcquisitionDownloadService:
             return min(base, maximum)
 
         exponent = attempt_count - 1
-        threshold = math.ceil(math.log2(maximum / base))
+        # Subnormal bases can overflow when represented as ``maximum / base``.
+        # Subtracting logarithms keeps the threshold finite while retaining the
+        # same power-of-two cap behavior.
+        threshold = max(1, math.ceil(math.log2(maximum) - math.log2(base)))
         if exponent >= threshold:
             return maximum
         return min(math.ldexp(base, exponent), maximum)
@@ -1509,6 +1514,21 @@ class ImageAcquisitionDownloadService:
             logger.exception(
                 "acquisition_worker_failure_audit_failed job_id=%s", job_id
             )
+            try:
+                self._defer_manifest_repair(
+                    job_id,
+                    worker,
+                    token,
+                    generation,
+                    ImageAcquisitionJobStatus.FAILED,
+                    DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR,
+                )
+            except Exception:
+                logger.exception(
+                    "acquisition_worker_manifest_repair_defer_failed job_id=%s",
+                    job_id,
+                )
+            return
 
         try:
             counts = self._recompute_counts(job_id, worker, token, generation)
@@ -1520,7 +1540,14 @@ class ImageAcquisitionDownloadService:
                 "acquisition_worker_count_recompute_failed job_id=%s", job_id
             )
             try:
-                self._defer_manifest_repair(job_id, worker, token, generation)
+                self._defer_manifest_repair(
+                    job_id,
+                    worker,
+                    token,
+                    generation,
+                    ImageAcquisitionJobStatus.FAILED,
+                    DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR,
+                )
             except Exception:
                 logger.exception(
                     "acquisition_worker_manifest_repair_defer_failed job_id=%s", job_id
@@ -1542,7 +1569,14 @@ class ImageAcquisitionDownloadService:
         except Exception:
             logger.exception("acquisition_worker_completion_failed job_id=%s", job_id)
             try:
-                self._defer_manifest_repair(job_id, worker, token, generation)
+                self._defer_manifest_repair(
+                    job_id,
+                    worker,
+                    token,
+                    generation,
+                    ImageAcquisitionJobStatus.FAILED,
+                    DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR,
+                )
             except Exception:
                 logger.exception(
                     "acquisition_worker_manifest_repair_defer_failed job_id=%s", job_id
@@ -1602,6 +1636,14 @@ class ImageAcquisitionDownloadService:
             if item_id is None:
                 break
             if self._is_cancel_requested(job_id):
+                self._fail_all_unfinished(
+                    job_id,
+                    worker,
+                    token,
+                    generation,
+                    DownloadFailureCode.CANCELED,
+                    item_status=ImageAcquisitionItemStatus.CANCELED,
+                )
                 counts = self._recompute_counts(job_id, worker, token, generation)
                 self._complete_claimed_job(
                     job_id,
@@ -1627,6 +1669,14 @@ class ImageAcquisitionDownloadService:
                     False,
                     canceled=True,
                     generation=generation,
+                )
+                self._fail_all_unfinished(
+                    job_id,
+                    worker,
+                    token,
+                    generation,
+                    DownloadFailureCode.CANCELED,
+                    item_status=ImageAcquisitionItemStatus.CANCELED,
                 )
                 counts = self._recompute_counts(job_id, worker, token, generation)
                 self._complete_claimed_job(
@@ -1700,7 +1750,9 @@ class ImageAcquisitionDownloadService:
             logger.warning("acquisition_manifest_claim_lost job_id=%s", job_id)
             return
         try:
-            deferred = self._defer_manifest_repair(job_id, worker, token, generation)
+            deferred = self._defer_manifest_repair(
+                job_id, worker, token, generation, status, error
+            )
         except BaseException:
             logger.exception(
                 "acquisition_manifest_repair_defer_failed job_id=%s", job_id
@@ -4147,7 +4199,7 @@ class ImageAcquisitionDownloadService:
         generation: int,
         status: ImageAcquisitionJobStatus,
         error: DownloadFailureCode | None,
-    ) -> None:
+    ) -> bool:
         with self.session_factory() as session:
             completed_at = datetime.now(UTC)
             result = session.execute(
@@ -4178,8 +4230,7 @@ class ImageAcquisitionDownloadService:
                 .returning(ImageAcquisitionJobRecord.id)
             ).scalar_one_or_none()
             session.commit()
-            if result is None:
-                return
+            return result is not None
 
     def _fail_all_unfinished(
         self,
@@ -4188,6 +4239,8 @@ class ImageAcquisitionDownloadService:
         token: str,
         generation: int,
         code: DownloadFailureCode,
+        *,
+        item_status: ImageAcquisitionItemStatus = ImageAcquisitionItemStatus.FAILED,
     ) -> None:
         unfinished_statuses = [
             ImageAcquisitionItemStatus.PENDING.value,
@@ -4239,7 +4292,7 @@ class ImageAcquisitionDownloadService:
                     code,
                     retryable=False,
                 )
-                item.status = ImageAcquisitionItemStatus.FAILED.value
+                item.status = item_status.value
                 item.failure_code = code.value
                 item.failure_message = code.value
                 item.retryable = False
@@ -4828,8 +4881,38 @@ class ImageAcquisitionDownloadService:
                 raise _ClaimLost()
             session.commit()
 
+    @staticmethod
+    def _manifest_repair_status_from_warning(
+        warning: str | None,
+    ) -> ImageAcquisitionJobStatus | None:
+        if not warning or not warning.startswith(MANIFEST_REPAIR_INTENT_PREFIX):
+            return None
+        value = warning[len(MANIFEST_REPAIR_INTENT_PREFIX) :]
+        try:
+            status = ImageAcquisitionJobStatus(value)
+        except ValueError:
+            return None
+        return status if status is not ImageAcquisitionJobStatus.STALE else None
+
+    @staticmethod
+    def _download_failure_code_from_value(
+        value: str | None,
+    ) -> DownloadFailureCode | None:
+        if not value:
+            return None
+        try:
+            return DownloadFailureCode(value)
+        except ValueError:
+            return None
+
     def _defer_manifest_repair(
-        self, job_id: UUID, worker: str, token: str, generation: int
+        self,
+        job_id: UUID,
+        worker: str,
+        token: str,
+        generation: int,
+        status: ImageAcquisitionJobStatus,
+        error: DownloadFailureCode | None,
     ) -> bool:
         with self.session_factory() as session:
             now = datetime.now(UTC)
@@ -4853,7 +4936,9 @@ class ImageAcquisitionDownloadService:
                     active_key=None,
                     manifest_repair_state=ManifestRepairState.PENDING.value,
                     manifest_repair_attempted_at=now,
-                    manifest_warning="MANIFEST_REPAIR_PENDING",
+                    error_code=error.value if error else None,
+                    error_summary=error.value if error else None,
+                    manifest_warning=f"{MANIFEST_REPAIR_INTENT_PREFIX}{status.value}",
                     updated_at=now,
                 )
                 .returning(ImageAcquisitionJobRecord.id)
@@ -4933,6 +5018,8 @@ class ImageAcquisitionDownloadService:
                         ImageAcquisitionJobRecord.id,
                         ImageAcquisitionJobRecord.project_id,
                         ImageAcquisitionJobRecord.manifest_relative_path,
+                        ImageAcquisitionJobRecord.error_code,
+                        ImageAcquisitionJobRecord.manifest_warning,
                     )
                     .where(
                         ImageAcquisitionJobRecord.status
@@ -4955,45 +5042,103 @@ class ImageAcquisitionDownloadService:
             return 0
 
         repaired_count = 0
-        for job_id, project_id, old_relative_path in candidates:
+        for (
+            job_id,
+            project_id,
+            old_relative_path,
+            stored_error_code,
+            manifest_warning,
+        ) in candidates:
             job_uuid = UUID(str(job_id))
             worker = f"manifest-repair-{uuid4().hex[:12]}"
             token = uuid4().hex
+            target_status = self._manifest_repair_status_from_warning(manifest_warning)
+            target_error = self._download_failure_code_from_value(stored_error_code)
             generation = self._claim_manifest_repair_job(str(job_id), worker, token)
             if generation is None:
                 continue
             try:
+                if target_status is None:
+                    target_status, derived_error = self._job_terminal_status(
+                        job_uuid,
+                        worker=worker,
+                        token=token,
+                        generation=generation,
+                    )
+                    target_error = target_error or derived_error
+                    if target_error is DownloadFailureCode.CANCELED:
+                        target_status = ImageAcquisitionJobStatus.CANCELED
+                assert target_status is not None
+
                 with self.session_factory() as session:
                     items = session.scalars(
                         select(ImageAcquisitionJobItemRecord)
                         .where(ImageAcquisitionJobItemRecord.job_id == str(job_id))
                         .order_by(ImageAcquisitionJobItemRecord.display_order)
                     ).all()
-                    counts = self._counts_snapshot(items)
-                status, error = self._job_terminal_status(
-                    job_uuid,
-                    worker=worker,
-                    token=token,
-                    generation=generation,
-                )
+                terminal_item_statuses = {
+                    ImageAcquisitionItemStatus.IMPORTED.value,
+                    ImageAcquisitionItemStatus.LINKED_EXISTING.value,
+                    ImageAcquisitionItemStatus.SKIPPED.value,
+                    ImageAcquisitionItemStatus.FAILED.value,
+                    ImageAcquisitionItemStatus.CANCELED.value,
+                }
+                if any(item.status not in terminal_item_statuses for item in items):
+                    audit_code = (
+                        target_error or DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR
+                    )
+                    self._fail_all_unfinished(
+                        job_uuid,
+                        worker,
+                        token,
+                        generation,
+                        audit_code,
+                        item_status=(
+                            ImageAcquisitionItemStatus.CANCELED
+                            if target_status is ImageAcquisitionJobStatus.CANCELED
+                            else ImageAcquisitionItemStatus.FAILED
+                        ),
+                    )
+                counts = self._recompute_counts(job_uuid, worker, token, generation)
                 result = self._write_manifest(
                     job_uuid,
                     worker,
                     token,
                     generation,
-                    status,
+                    target_status,
                     counts=counts,
                 )
                 if result is _ManifestWriteResult.SUCCESS:
                     if old_relative_path and not self._cleanup_previous_manifest(
                         str(project_id), str(old_relative_path)
                     ):
-                        self._defer_manifest_repair(job_uuid, worker, token, generation)
+                        self._defer_manifest_repair(
+                            job_uuid,
+                            worker,
+                            token,
+                            generation,
+                            target_status,
+                            target_error,
+                        )
                         continue
-                    self._finish_job(job_uuid, worker, token, generation, status, error)
-                    repaired_count += 1
+                    if self._finish_job(
+                        job_uuid,
+                        worker,
+                        token,
+                        generation,
+                        target_status,
+                        target_error,
+                    ):
+                        repaired_count += 1
                 elif result is not _ManifestWriteResult.CLAIM_LOST:
-                    self._defer_manifest_repair(job_uuid, worker, token, generation)
+                    self._defer_manifest_repair(
+                        job_uuid,
+                        worker,
+                        token,
+                        generation,
+                        target_status,
+                        target_error,
+                    )
             except _ClaimLost:
                 logger.warning(
                     "acquisition_manifest_repair_claim_lost job_id=%s", job_id
@@ -5001,7 +5146,14 @@ class ImageAcquisitionDownloadService:
             except BaseException:
                 logger.exception("acquisition_manifest_repair_failed job_id=%s", job_id)
                 try:
-                    self._defer_manifest_repair(job_uuid, worker, token, generation)
+                    self._defer_manifest_repair(
+                        job_uuid,
+                        worker,
+                        token,
+                        generation,
+                        target_status or ImageAcquisitionJobStatus.FAILED,
+                        target_error,
+                    )
                 except BaseException:
                     logger.exception(
                         "acquisition_manifest_repair_defer_failed job_id=%s", job_id

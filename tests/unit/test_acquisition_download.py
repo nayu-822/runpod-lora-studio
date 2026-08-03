@@ -66,7 +66,9 @@ from runpod_lora_studio.services.acquisition_download_service import (
     AcquisitionDownloadError,
     ImageAcquisitionDownloadService,
     PartCleanupRecoveryResult,
+    _Canceled,
     _ClaimLost,
+    _PartCleanupTarget,
 )
 from runpod_lora_studio.services.acquisition_service import ImageAcquisitionService
 from runpod_lora_studio.services.project_service import ProjectInput, ProjectService
@@ -2538,9 +2540,10 @@ def test_part_cleanup_missing_parent_does_not_fallback_to_path_unlink(
 
     inspection = service._open_part_cleanup_path(
         project_id,
-        SimpleNamespace(
-            id=item_id,
+        _PartCleanupTarget(
+            project_id=project_id,
             job_id=str(job_id),
+            item_id=item_id,
             part_relative_path=part_relative_path,
         ),
     )
@@ -2638,6 +2641,14 @@ def test_cleanup_retry_delay_is_bounded_before_exponentiation(
     settings.image_download_cleanup_retry_max_backoff_seconds = 10.0
     assert service._cleanup_retry_delay(2) == 10.0
 
+    settings.image_download_cleanup_retry_base_backoff_seconds = 5e-324
+    settings.image_download_cleanup_retry_max_backoff_seconds = 3600.0
+    for attempt_count in (1, 2, 10**6):
+        delay = service._cleanup_retry_delay(attempt_count)
+        assert 0.0 <= delay <= 3600.0
+    settings.image_download_cleanup_retry_max_backoff_seconds = 0.0
+    assert service._cleanup_retry_delay(-1) == 0.0
+
 
 def test_unexpected_worker_failure_completes_through_manifest(
     test_workspace: Path,
@@ -2720,6 +2731,229 @@ def test_unexpected_worker_failure_defers_manifest_repair_if_counts_fail(
     repaired = service.get_job(job_id)
     assert repaired is not None
     assert repaired.status is ImageAcquisitionJobStatus.FAILED
+
+
+def test_unexpected_worker_failure_defers_until_failure_audit_can_retry(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1351-worker-audit", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    original_audit = service._fail_all_unfinished
+    audit_calls = 0
+
+    def fail_audit_once(*args: object, **kwargs: object) -> None:
+        nonlocal audit_calls
+        audit_calls += 1
+        if audit_calls == 1:
+            raise RuntimeError("intentional audit failure")
+        original_audit(*args, **kwargs)
+
+    def fail_worker(*_: object) -> None:
+        raise RuntimeError("worker")
+
+    monkeypatch.setattr(service, "_run_claimed_job", fail_worker)
+    monkeypatch.setattr(service, "_fail_all_unfinished", fail_audit_once)
+    service.run_job_sync(job_id)
+
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.status == ImageAcquisitionJobStatus.STALE.value
+        assert stored_job.manifest_repair_state == ManifestRepairState.PENDING.value
+        assert stored_job.completed_at is None
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert item is not None
+        assert item.status == ImageAcquisitionItemStatus.PENDING.value
+
+    monkeypatch.setattr(service, "_fail_all_unfinished", original_audit)
+    assert service.reconcile_manifest_repairs() == 1
+    repaired = service.get_job(job_id)
+    assert repaired is not None
+    assert repaired.status is ImageAcquisitionJobStatus.FAILED
+    assert repaired.error_code == DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR.value
+    assert service.list_items(job_id)[0].status is ImageAcquisitionItemStatus.FAILED
+    assert service.reconcile_manifest_repairs() == 0
+
+
+def test_unexpected_worker_manifest_repair_preserves_unknown_error(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1351-worker-manifest", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    original_write = service._write_manifest
+
+    def fail_worker(*_: object) -> None:
+        raise RuntimeError("worker")
+
+    def fail_manifest(*_: object, **__: object) -> object:
+        return acquisition_download_module._ManifestWriteResult.DATABASE_ERROR
+
+    monkeypatch.setattr(service, "_run_claimed_job", fail_worker)
+    monkeypatch.setattr(service, "_write_manifest", fail_manifest)
+    service.run_job_sync(job_id)
+
+    pending = service.get_job(job_id)
+    assert pending is not None
+    assert pending.status is ImageAcquisitionJobStatus.STALE
+    assert pending.error_code == DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR.value
+
+    monkeypatch.setattr(service, "_write_manifest", original_write)
+    assert service.reconcile_manifest_repairs() == 1
+    repaired = service.get_job(job_id)
+    assert repaired is not None
+    assert repaired.status is ImageAcquisitionJobStatus.FAILED
+    assert repaired.error_code == DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR.value
+
+
+def test_old_manifest_repair_generation_cannot_finish_target_job(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1351-repair-generation", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    worker = "repair-old-worker"
+    token = "repair-old-token"
+    generation = service._claim_job(job_id, worker, token)
+    assert generation is not None
+    assert service._defer_manifest_repair(
+        job_id,
+        worker,
+        token,
+        generation,
+        ImageAcquisitionJobStatus.FAILED,
+        DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR,
+    )
+    repair_worker = "repair-new-worker"
+    repair_token = "repair-new-token"
+    repair_generation = service._claim_manifest_repair_job(
+        str(job_id), repair_worker, repair_token
+    )
+    assert repair_generation is not None
+    assert not service._finish_job(
+        job_id,
+        worker,
+        token,
+        generation,
+        ImageAcquisitionJobStatus.CANCELED,
+        DownloadFailureCode.CANCELED,
+    )
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.status == ImageAcquisitionJobStatus.RUNNING.value
+        assert stored_job.worker_id == repair_worker
+        assert stored_job.manifest_repair_state == ManifestRepairState.REPAIRING.value
+        assert stored_job.error_code == DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR.value
+
+
+@pytest.mark.parametrize("cancel_during_item", [False, True])
+def test_canceled_manifest_repair_preserves_status_and_error(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_during_item: bool,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post(
+        "1351-cancel-during" if cancel_during_item else "1351-cancel-before",
+        _png_bytes(),
+    )
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    worker = "cancel-worker"
+    token = "cancel-token"
+    generation = service._claim_job(job_id, worker, token)
+    assert generation is not None
+    service.cancel_job(job_id)
+    original_write = service._write_manifest
+
+    def fail_manifest(*_: object, **__: object) -> object:
+        return acquisition_download_module._ManifestWriteResult.DATABASE_ERROR
+
+    monkeypatch.setattr(service, "_write_manifest", fail_manifest)
+    if cancel_during_item:
+
+        def cancel_item(*_: object, **__: object) -> None:
+            raise _Canceled()
+
+        monkeypatch.setattr(
+            service,
+            "_process_item",
+            cancel_item,
+        )
+
+    service._run_claimed_job(job_id, worker, token, generation)
+
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.status == ImageAcquisitionJobStatus.STALE.value
+        assert stored_job.manifest_repair_state == ManifestRepairState.PENDING.value
+        assert stored_job.completed_at is None
+        assert stored_job.error_code == DownloadFailureCode.CANCELED.value
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert item is not None
+        assert item.status == ImageAcquisitionItemStatus.CANCELED.value
+
+    monkeypatch.setattr(service, "_write_manifest", original_write)
+    assert service.reconcile_manifest_repairs() == 1
+    repaired = service.get_job(job_id)
+    assert repaired is not None
+    assert repaired.status is ImageAcquisitionJobStatus.CANCELED
+    assert repaired.error_code == DownloadFailureCode.CANCELED.value
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None and stored_job.manifest_relative_path is not None
+        manifest = (
+            settings.projects_dir
+            / stored_job.project_id
+            / stored_job.manifest_relative_path
+        )
+    assert json.loads(manifest.read_text(encoding="utf-8"))["status"] == (
+        ImageAcquisitionJobStatus.CANCELED.value
+    )
 
 
 def test_part_cleanup_and_resume_race_rejects_terminal_resume(
