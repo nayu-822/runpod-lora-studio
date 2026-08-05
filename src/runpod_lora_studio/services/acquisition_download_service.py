@@ -138,6 +138,14 @@ PART_CLEANUP_ITEM_STATUSES = frozenset(
 PART_CLEANUP_BATCH_SIZE = 32
 STALE_JOB_BATCH_SIZE = 32
 MANIFEST_REPAIR_INTENT_PREFIX = "MANIFEST_REPAIR_PENDING:"
+TERMINAL_JOB_STATUS_VALUES = frozenset(
+    {
+        ImageAcquisitionJobStatus.PARTIALLY_COMPLETED.value,
+        ImageAcquisitionJobStatus.COMPLETED.value,
+        ImageAcquisitionJobStatus.FAILED.value,
+        ImageAcquisitionJobStatus.CANCELED.value,
+    }
+)
 
 
 class _PartCleanupOutcome(Enum):
@@ -591,17 +599,44 @@ class ImageAcquisitionDownloadService:
             )
             if job is None:
                 return
+            now = datetime.now(UTC)
+            if (
+                job.status in TERMINAL_JOB_STATUS_VALUES
+                and job.manifest_repair_state is None
+                and job.completed_at is not None
+            ):
+                session.commit()
+                return
             job.cancellation_requested = True
             if job.status in {
                 ImageAcquisitionJobStatus.QUEUED.value,
                 ImageAcquisitionJobStatus.STALE.value,
+                ImageAcquisitionJobStatus.CANCELED.value,
             }:
-                job.status = ImageAcquisitionJobStatus.CANCELED.value
-                job.completed_at = datetime.now(UTC)
+                job.status = ImageAcquisitionJobStatus.STALE.value
+                job.manifest_repair_state = ManifestRepairState.PENDING.value
+                job.manifest_target_status = ImageAcquisitionJobStatus.CANCELED.value
+                job.manifest_target_error_code = DownloadFailureCode.CANCELED.value
+                job.manifest_warning = "MANIFEST_WRITE_FAILED"
+                job.manifest_repair_attempted_at = now
+                job.completed_at = None
                 job.active_key = None
                 job.worker_id = None
                 job.claim_token = None
-            job.updated_at = datetime.now(UTC)
+                job.current_item_id = None
+                job.heartbeat_at = None
+                job.error_code = DownloadFailureCode.CANCELED.value
+                job.error_summary = DownloadFailureCode.CANCELED.value
+            elif job.manifest_repair_state in {
+                ManifestRepairState.PENDING.value,
+                ManifestRepairState.REPAIRING.value,
+            }:
+                job.manifest_target_status = ImageAcquisitionJobStatus.CANCELED.value
+                job.manifest_target_error_code = DownloadFailureCode.CANCELED.value
+                job.manifest_warning = "MANIFEST_WRITE_FAILED"
+                job.error_code = DownloadFailureCode.CANCELED.value
+                job.error_summary = DownloadFailureCode.CANCELED.value
+            job.updated_at = now
             session.commit()
 
     def recover_stale_jobs(self, *, limit: int = STALE_JOB_BATCH_SIZE) -> int:
@@ -650,11 +685,21 @@ class ImageAcquisitionDownloadService:
                     )
                     if job is None:
                         continue
-                    repair_claim_was_stale = (
-                        job.manifest_repair_state == ManifestRepairState.REPAIRING.value
-                    )
-                    if repair_claim_was_stale:
+                    repair_recovery = job.manifest_repair_state in {
+                        ManifestRepairState.PENDING.value,
+                        ManifestRepairState.REPAIRING.value,
+                    }
+                    if job.manifest_repair_state == ManifestRepairState.REPAIRING.value:
                         job.manifest_repair_state = ManifestRepairState.PENDING.value
+                    if repair_recovery and job.cancellation_requested:
+                        job.manifest_target_status = (
+                            ImageAcquisitionJobStatus.CANCELED.value
+                        )
+                        job.manifest_target_error_code = (
+                            DownloadFailureCode.CANCELED.value
+                        )
+                        job.error_code = DownloadFailureCode.CANCELED.value
+                        job.error_summary = DownloadFailureCode.CANCELED.value
                     items = session.scalars(
                         select(ImageAcquisitionJobItemRecord).where(
                             ImageAcquisitionJobItemRecord.job_id == job.id
@@ -757,21 +802,26 @@ class ImageAcquisitionDownloadService:
                         item.retryable = False
                         item.completed_at = None
                         item.updated_at = now
-                    if cleanup_item_ids or repair_claim_was_stale:
+                    if repair_recovery:
                         cleanup_item_ids_by_job[job.id] = cleanup_item_ids
                         job.status = ImageAcquisitionJobStatus.STALE.value
                     else:
-                        job.status = ImageAcquisitionJobStatus.QUEUED.value
-                        queued_job_ids.append(UUID(job.id))
+                        if cleanup_item_ids:
+                            cleanup_item_ids_by_job[job.id] = cleanup_item_ids
+                            job.status = ImageAcquisitionJobStatus.STALE.value
+                        else:
+                            job.status = ImageAcquisitionJobStatus.QUEUED.value
+                            queued_job_ids.append(UUID(job.id))
                     job.worker_id = None
                     job.claim_token = None
                     job.current_item_id = None
                     job.active_key = job.plan_id
                     job.heartbeat_at = None
                     job.completed_at = None
-                    job.error_code = None
-                    job.error_summary = None
-                    job.manifest_warning = None
+                    if not repair_recovery:
+                        job.error_code = None
+                        job.error_summary = None
+                        job.manifest_warning = None
                     job.updated_at = now
                 session.commit()
             cleanup_item_ids = {
@@ -1010,13 +1060,19 @@ class ImageAcquisitionDownloadService:
                     ImageAcquisitionJobRecord.id.in_(job_ids),
                     ImageAcquisitionJobRecord.status
                     == ImageAcquisitionJobStatus.STALE.value,
-                    ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
                 )
             ).all():
                 has_pending = session.scalar(
                     select(self._job_has_cleanup_pending(job.id))
                 )
                 if has_pending:
+                    continue
+                if job.manifest_repair_state == ManifestRepairState.PENDING.value:
+                    # Cleanup recovery must leave manifest repairs on their
+                    # repair path. It is intentionally not promoted to the
+                    # normal acquisition worker queue.
+                    continue
+                if job.manifest_repair_state is not None:
                     continue
                 result = session.execute(
                     update(ImageAcquisitionJobRecord)
@@ -1734,6 +1790,7 @@ class ImageAcquisitionDownloadService:
                 token,
                 generation,
                 status,
+                final_error=error,
                 counts=counts,
             )
         except _ClaimLost:
@@ -1744,7 +1801,16 @@ class ImageAcquisitionDownloadService:
             manifest_result = _ManifestWriteResult.DATABASE_ERROR
 
         if manifest_result is _ManifestWriteResult.SUCCESS:
-            self._finish_job(job_id, worker, token, generation, status, error)
+            if not self._finish_job(job_id, worker, token, generation, status, error):
+                try:
+                    self._defer_manifest_repair(
+                        job_id, worker, token, generation, status, error
+                    )
+                except BaseException:
+                    logger.exception(
+                        "acquisition_manifest_repair_defer_failed job_id=%s",
+                        job_id,
+                    )
             return
         if manifest_result is _ManifestWriteResult.CLAIM_LOST:
             logger.warning("acquisition_manifest_claim_lost job_id=%s", job_id)
@@ -2595,6 +2661,10 @@ class ImageAcquisitionDownloadService:
             .exists()
         )
 
+    def _job_has_cleanup_pending_now(self, job_id: str) -> bool:
+        with self.session_factory() as session:
+            return bool(session.scalar(select(self._job_has_cleanup_pending(job_id))))
+
     def _claim_job(self, job_id: UUID, worker: str, token: str) -> int | None:
         with self.session_factory() as session:
             now = datetime.now(UTC)
@@ -3349,6 +3419,9 @@ class ImageAcquisitionDownloadService:
                 .returning(ImageAcquisitionAttemptRecord.id)
             ).scalar_one_or_none()
             if attempt_result is None:
+                if canceled:
+                    session.commit()
+                    return
                 raise _ClaimLost()
             session.commit()
         if cleanup_required:
@@ -4212,6 +4285,11 @@ class ImageAcquisitionDownloadService:
                     ImageAcquisitionJobRecord.claim_token == token,
                     ImageAcquisitionJobRecord.worker_generation == generation,
                     ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
+                    ~self._job_has_cleanup_pending(str(job_id)),
+                    (
+                        ImageAcquisitionJobRecord.cancellation_requested == False  # noqa: E712
+                    )
+                    | (status == ImageAcquisitionJobStatus.CANCELED),
                 )
                 .values(
                     status=status.value,
@@ -4225,6 +4303,8 @@ class ImageAcquisitionDownloadService:
                     active_key=None,
                     manifest_repair_state=None,
                     manifest_repair_attempted_at=None,
+                    manifest_target_status=None,
+                    manifest_target_error_code=None,
                     updated_at=completed_at,
                 )
                 .returning(ImageAcquisitionJobRecord.id)
@@ -4251,6 +4331,8 @@ class ImageAcquisitionDownloadService:
             ImageAcquisitionItemStatus.VALIDATED.value,
             ImageAcquisitionItemStatus.IMPORTING.value,
         ]
+        if item_status is ImageAcquisitionItemStatus.CANCELED:
+            unfinished_statuses.append(ImageAcquisitionItemStatus.FAILED.value)
         with self.session_factory() as session:
             claim = [
                 ImageAcquisitionJobRecord.id == str(job_id),
@@ -4854,9 +4936,25 @@ class ImageAcquisitionDownloadService:
             return False
 
     def _record_manifest_warning(
-        self, job_id: UUID, worker: str, token: str, generation: int
+        self,
+        job_id: UUID,
+        worker: str,
+        token: str,
+        generation: int,
+        target_status: ImageAcquisitionJobStatus,
+        target_error: DownloadFailureCode | None,
     ) -> None:
+        if target_status.value not in TERMINAL_JOB_STATUS_VALUES:
+            raise ValueError("manifest repair target must be terminal")
+        target_status_value = target_status.value
+        target_error_value = target_error.value if target_error else None
         with self.session_factory() as session:
+            cancellation_requested = (
+                ImageAcquisitionJobRecord.cancellation_requested == True  # noqa: E712
+            )
+            target_was_missing = ImageAcquisitionJobRecord.manifest_target_status.is_(
+                None
+            )
             result = session.execute(
                 update(ImageAcquisitionJobRecord)
                 .where(
@@ -4866,12 +4964,43 @@ class ImageAcquisitionDownloadService:
                     ImageAcquisitionJobRecord.worker_id == worker,
                     ImageAcquisitionJobRecord.claim_token == token,
                     ImageAcquisitionJobRecord.worker_generation == generation,
-                    ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
+                    (
+                        ImageAcquisitionJobRecord.manifest_repair_state.is_(None)
+                        | ImageAcquisitionJobRecord.manifest_repair_state.in_(
+                            [
+                                ManifestRepairState.PENDING.value,
+                                ManifestRepairState.REPAIRING.value,
+                            ]
+                        )
+                    ),
                 )
                 .values(
                     manifest_warning="MANIFEST_WRITE_FAILED",
                     manifest_repair_state=ManifestRepairState.PENDING.value,
                     manifest_repair_attempted_at=datetime.now(UTC),
+                    manifest_target_status=case(
+                        (
+                            cancellation_requested,
+                            ImageAcquisitionJobStatus.CANCELED.value,
+                        ),
+                        (target_was_missing, target_status_value),
+                        else_=ImageAcquisitionJobRecord.manifest_target_status,
+                    ),
+                    manifest_target_error_code=case(
+                        (cancellation_requested, DownloadFailureCode.CANCELED.value),
+                        (target_was_missing, target_error_value),
+                        else_=ImageAcquisitionJobRecord.manifest_target_error_code,
+                    ),
+                    error_code=case(
+                        (cancellation_requested, DownloadFailureCode.CANCELED.value),
+                        (target_was_missing, target_error_value),
+                        else_=ImageAcquisitionJobRecord.error_code,
+                    ),
+                    error_summary=case(
+                        (cancellation_requested, DownloadFailureCode.CANCELED.value),
+                        (target_was_missing, target_error_value),
+                        else_=ImageAcquisitionJobRecord.error_summary,
+                    ),
                     updated_at=datetime.now(UTC),
                 )
                 .returning(ImageAcquisitionJobRecord.id)
@@ -4882,17 +5011,26 @@ class ImageAcquisitionDownloadService:
             session.commit()
 
     @staticmethod
+    def _manifest_repair_status_from_value(
+        value: str | None,
+    ) -> ImageAcquisitionJobStatus | None:
+        if value not in TERMINAL_JOB_STATUS_VALUES:
+            return None
+        try:
+            status = ImageAcquisitionJobStatus(value)
+        except ValueError:
+            return None
+        return status
+
+    @classmethod
     def _manifest_repair_status_from_warning(
+        cls,
         warning: str | None,
     ) -> ImageAcquisitionJobStatus | None:
         if not warning or not warning.startswith(MANIFEST_REPAIR_INTENT_PREFIX):
             return None
         value = warning[len(MANIFEST_REPAIR_INTENT_PREFIX) :]
-        try:
-            status = ImageAcquisitionJobStatus(value)
-        except ValueError:
-            return None
-        return status if status is not ImageAcquisitionJobStatus.STALE else None
+        return cls._manifest_repair_status_from_value(value)
 
     @staticmethod
     def _download_failure_code_from_value(
@@ -4914,6 +5052,14 @@ class ImageAcquisitionDownloadService:
         status: ImageAcquisitionJobStatus,
         error: DownloadFailureCode | None,
     ) -> bool:
+        if status.value not in TERMINAL_JOB_STATUS_VALUES:
+            return False
+        target_status_missing = ImageAcquisitionJobRecord.manifest_target_status.is_(
+            None
+        )
+        cancellation_requested = (
+            ImageAcquisitionJobRecord.cancellation_requested == True  # noqa: E712
+        )
         with self.session_factory() as session:
             now = datetime.now(UTC)
             result = session.execute(
@@ -4936,9 +5082,30 @@ class ImageAcquisitionDownloadService:
                     active_key=None,
                     manifest_repair_state=ManifestRepairState.PENDING.value,
                     manifest_repair_attempted_at=now,
-                    error_code=error.value if error else None,
-                    error_summary=error.value if error else None,
-                    manifest_warning=f"{MANIFEST_REPAIR_INTENT_PREFIX}{status.value}",
+                    manifest_target_status=case(
+                        (
+                            cancellation_requested,
+                            ImageAcquisitionJobStatus.CANCELED.value,
+                        ),
+                        (target_status_missing, status.value),
+                        else_=ImageAcquisitionJobRecord.manifest_target_status,
+                    ),
+                    manifest_target_error_code=case(
+                        (cancellation_requested, DownloadFailureCode.CANCELED.value),
+                        (target_status_missing, error.value if error else None),
+                        else_=ImageAcquisitionJobRecord.manifest_target_error_code,
+                    ),
+                    error_code=case(
+                        (cancellation_requested, DownloadFailureCode.CANCELED.value),
+                        (target_status_missing, error.value if error else None),
+                        else_=ImageAcquisitionJobRecord.error_code,
+                    ),
+                    error_summary=case(
+                        (cancellation_requested, DownloadFailureCode.CANCELED.value),
+                        (target_status_missing, error.value if error else None),
+                        else_=ImageAcquisitionJobRecord.error_summary,
+                    ),
+                    manifest_warning="MANIFEST_WRITE_FAILED",
                     updated_at=now,
                 )
                 .returning(ImageAcquisitionJobRecord.id)
@@ -4948,6 +5115,79 @@ class ImageAcquisitionDownloadService:
                 return False
             session.commit()
             return True
+
+    def _set_manifest_repair_target(
+        self,
+        job_id: UUID,
+        worker: str,
+        token: str,
+        generation: int,
+        status: ImageAcquisitionJobStatus,
+        error: DownloadFailureCode | None,
+    ) -> bool:
+        if status.value not in TERMINAL_JOB_STATUS_VALUES:
+            return False
+        with self.session_factory() as session:
+            cancellation_requested = (
+                ImageAcquisitionJobRecord.cancellation_requested == True  # noqa: E712
+            )
+            result = session.execute(
+                update(ImageAcquisitionJobRecord)
+                .where(
+                    ImageAcquisitionJobRecord.id == str(job_id),
+                    ImageAcquisitionJobRecord.status
+                    == ImageAcquisitionJobStatus.RUNNING.value,
+                    ImageAcquisitionJobRecord.worker_id == worker,
+                    ImageAcquisitionJobRecord.claim_token == token,
+                    ImageAcquisitionJobRecord.worker_generation == generation,
+                    ImageAcquisitionJobRecord.manifest_repair_state
+                    == ManifestRepairState.REPAIRING.value,
+                )
+                .values(
+                    manifest_target_status=case(
+                        (
+                            cancellation_requested,
+                            ImageAcquisitionJobStatus.CANCELED.value,
+                        ),
+                        else_=status.value,
+                    ),
+                    manifest_target_error_code=case(
+                        (cancellation_requested, DownloadFailureCode.CANCELED.value),
+                        else_=error.value if error else None,
+                    ),
+                    error_code=case(
+                        (cancellation_requested, DownloadFailureCode.CANCELED.value),
+                        else_=error.value if error else None,
+                    ),
+                    error_summary=case(
+                        (cancellation_requested, DownloadFailureCode.CANCELED.value),
+                        else_=error.value if error else None,
+                    ),
+                    updated_at=datetime.now(UTC),
+                )
+                .returning(ImageAcquisitionJobRecord.id)
+            ).scalar_one_or_none()
+            session.commit()
+            return result is not None
+
+    def _repair_cancellation_requested(
+        self, job_id: UUID, worker: str, token: str, generation: int
+    ) -> bool:
+        with self.session_factory() as session:
+            return bool(
+                session.scalar(
+                    select(ImageAcquisitionJobRecord.cancellation_requested).where(
+                        ImageAcquisitionJobRecord.id == str(job_id),
+                        ImageAcquisitionJobRecord.status
+                        == ImageAcquisitionJobStatus.RUNNING.value,
+                        ImageAcquisitionJobRecord.worker_id == worker,
+                        ImageAcquisitionJobRecord.claim_token == token,
+                        ImageAcquisitionJobRecord.worker_generation == generation,
+                        ImageAcquisitionJobRecord.manifest_repair_state
+                        == ManifestRepairState.REPAIRING.value,
+                    )
+                )
+            )
 
     def _claim_manifest_repair_job(
         self, job_id: str, worker: str, token: str
@@ -5018,8 +5258,11 @@ class ImageAcquisitionDownloadService:
                         ImageAcquisitionJobRecord.id,
                         ImageAcquisitionJobRecord.project_id,
                         ImageAcquisitionJobRecord.manifest_relative_path,
+                        ImageAcquisitionJobRecord.manifest_target_status,
+                        ImageAcquisitionJobRecord.manifest_target_error_code,
                         ImageAcquisitionJobRecord.error_code,
                         ImageAcquisitionJobRecord.manifest_warning,
+                        ImageAcquisitionJobRecord.cancellation_requested,
                     )
                     .where(
                         ImageAcquisitionJobRecord.status
@@ -5046,29 +5289,56 @@ class ImageAcquisitionDownloadService:
             job_id,
             project_id,
             old_relative_path,
+            stored_target_status,
+            stored_target_error_code,
             stored_error_code,
             manifest_warning,
+            cancellation_requested,
         ) in candidates:
             job_uuid = UUID(str(job_id))
             worker = f"manifest-repair-{uuid4().hex[:12]}"
             token = uuid4().hex
-            target_status = self._manifest_repair_status_from_warning(manifest_warning)
-            target_error = self._download_failure_code_from_value(stored_error_code)
+            target_status = self._manifest_repair_status_from_value(
+                stored_target_status
+            )
+            target_error = self._download_failure_code_from_value(
+                stored_target_error_code
+            )
+            intent_requires_audit = False
+            if stored_target_status is not None and target_status is None:
+                intent_requires_audit = True
+            if stored_target_error_code is not None and target_error is None:
+                intent_requires_audit = True
+                target_error = DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR
+            if target_status is None:
+                target_status = self._manifest_repair_status_from_warning(
+                    manifest_warning
+                )
+                if target_status is None:
+                    intent_requires_audit = True
+                    target_status = ImageAcquisitionJobStatus.FAILED
+                    target_error = DownloadFailureCode.INCOMPLETE_ITEM_STATE
+                elif target_error is None:
+                    target_error = self._download_failure_code_from_value(
+                        stored_error_code
+                    )
+            if cancellation_requested:
+                target_status = ImageAcquisitionJobStatus.CANCELED
+                target_error = DownloadFailureCode.CANCELED
+            assert target_status is not None
             generation = self._claim_manifest_repair_job(str(job_id), worker, token)
             if generation is None:
                 continue
             try:
-                if target_status is None:
-                    target_status, derived_error = self._job_terminal_status(
-                        job_uuid,
-                        worker=worker,
-                        token=token,
-                        generation=generation,
-                    )
-                    target_error = target_error or derived_error
-                    if target_error is DownloadFailureCode.CANCELED:
-                        target_status = ImageAcquisitionJobStatus.CANCELED
-                assert target_status is not None
+                if not self._set_manifest_repair_target(
+                    job_uuid,
+                    worker,
+                    token,
+                    generation,
+                    target_status,
+                    target_error,
+                ):
+                    raise _ClaimLost()
 
                 with self.session_factory() as session:
                     items = session.scalars(
@@ -5076,6 +5346,20 @@ class ImageAcquisitionDownloadService:
                         .where(ImageAcquisitionJobItemRecord.job_id == str(job_id))
                         .order_by(ImageAcquisitionJobItemRecord.display_order)
                     ).all()
+                if self._repair_cancellation_requested(
+                    job_uuid, worker, token, generation
+                ):
+                    target_status = ImageAcquisitionJobStatus.CANCELED
+                    target_error = DownloadFailureCode.CANCELED
+                    if not self._set_manifest_repair_target(
+                        job_uuid,
+                        worker,
+                        token,
+                        generation,
+                        target_status,
+                        target_error,
+                    ):
+                        raise _ClaimLost()
                 terminal_item_statuses = {
                     ImageAcquisitionItemStatus.IMPORTED.value,
                     ImageAcquisitionItemStatus.LINKED_EXISTING.value,
@@ -5087,6 +5371,8 @@ class ImageAcquisitionDownloadService:
                     audit_code = (
                         target_error or DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR
                     )
+                    if intent_requires_audit and target_error is None:
+                        audit_code = DownloadFailureCode.INCOMPLETE_ITEM_STATE
                     self._fail_all_unfinished(
                         job_uuid,
                         worker,
@@ -5099,6 +5385,38 @@ class ImageAcquisitionDownloadService:
                             else ImageAcquisitionItemStatus.FAILED
                         ),
                     )
+                if self._repair_cancellation_requested(
+                    job_uuid, worker, token, generation
+                ):
+                    target_status = ImageAcquisitionJobStatus.CANCELED
+                    target_error = DownloadFailureCode.CANCELED
+                    if not self._set_manifest_repair_target(
+                        job_uuid,
+                        worker,
+                        token,
+                        generation,
+                        target_status,
+                        target_error,
+                    ):
+                        raise _ClaimLost()
+                    self._fail_all_unfinished(
+                        job_uuid,
+                        worker,
+                        token,
+                        generation,
+                        DownloadFailureCode.CANCELED,
+                        item_status=ImageAcquisitionItemStatus.CANCELED,
+                    )
+                if self._job_has_cleanup_pending_now(str(job_id)):
+                    self._defer_manifest_repair(
+                        job_uuid,
+                        worker,
+                        token,
+                        generation,
+                        target_status,
+                        target_error,
+                    )
+                    continue
                 counts = self._recompute_counts(job_uuid, worker, token, generation)
                 result = self._write_manifest(
                     job_uuid,
@@ -5106,6 +5424,7 @@ class ImageAcquisitionDownloadService:
                     token,
                     generation,
                     target_status,
+                    final_error=target_error,
                     counts=counts,
                 )
                 if result is _ManifestWriteResult.SUCCESS:
@@ -5130,6 +5449,15 @@ class ImageAcquisitionDownloadService:
                         target_error,
                     ):
                         repaired_count += 1
+                    else:
+                        self._defer_manifest_repair(
+                            job_uuid,
+                            worker,
+                            token,
+                            generation,
+                            target_status,
+                            target_error,
+                        )
                 elif result is not _ManifestWriteResult.CLAIM_LOST:
                     self._defer_manifest_repair(
                         job_uuid,
@@ -5292,8 +5620,11 @@ class ImageAcquisitionDownloadService:
         generation: int,
         final_status: ImageAcquisitionJobStatus,
         *,
+        final_error: DownloadFailureCode | None = None,
         counts: _AcquisitionCountsSnapshot | None = None,
     ) -> _ManifestWriteResult:
+        if final_status.value not in TERMINAL_JOB_STATUS_VALUES:
+            return _ManifestWriteResult.DATABASE_ERROR
         with self.session_factory() as session:
             job = session.scalar(
                 select(ImageAcquisitionJobRecord).where(
@@ -5307,6 +5638,9 @@ class ImageAcquisitionDownloadService:
             )
             if job is None:
                 return _ManifestWriteResult.CLAIM_LOST
+            if job.cancellation_requested:
+                final_status = ImageAcquisitionJobStatus.CANCELED
+                final_error = DownloadFailureCode.CANCELED
             items = session.scalars(
                 select(ImageAcquisitionJobItemRecord)
                 .where(ImageAcquisitionJobItemRecord.job_id == job.id)
@@ -5317,6 +5651,9 @@ class ImageAcquisitionDownloadService:
                 counts = current_counts
             elif counts != current_counts:
                 return _ManifestWriteResult.CLAIM_LOST
+            cleanup_pending = session.scalar(
+                select(self._job_has_cleanup_pending(job.id))
+            )
             completed_at = datetime.now(UTC)
             manifest = {
                 "schema_version": "phase8b-manifest-v1",
@@ -5373,6 +5710,20 @@ class ImageAcquisitionDownloadService:
             }
             project_id = job.project_id
             manifest_job_id = job.id
+
+        if cleanup_pending:
+            try:
+                self._record_manifest_warning(
+                    job_id,
+                    worker,
+                    token,
+                    generation,
+                    final_status,
+                    final_error,
+                )
+            except _ClaimLost:
+                return _ManifestWriteResult.CLAIM_LOST
+            return _ManifestWriteResult.REPAIR_PENDING
 
         temporary: Path | None = None
         final: Path | None = None
@@ -5468,7 +5819,14 @@ class ImageAcquisitionDownloadService:
                             final, directory_fd=directory.fd
                         )
                     try:
-                        self._record_manifest_warning(job_id, worker, token, generation)
+                        self._record_manifest_warning(
+                            job_id,
+                            worker,
+                            token,
+                            generation,
+                            final_status,
+                            final_error,
+                        )
                     except _ClaimLost:
                         return _ManifestWriteResult.CLAIM_LOST
                     logger.warning(
@@ -5535,7 +5893,14 @@ class ImageAcquisitionDownloadService:
                             final, directory_fd=directory.fd
                         )
                     try:
-                        self._record_manifest_warning(job_id, worker, token, generation)
+                        self._record_manifest_warning(
+                            job_id,
+                            worker,
+                            token,
+                            generation,
+                            final_status,
+                            final_error,
+                        )
                     except _ClaimLost:
                         return _ManifestWriteResult.CLAIM_LOST
                     return _ManifestWriteResult.DATABASE_ERROR
@@ -5572,7 +5937,14 @@ class ImageAcquisitionDownloadService:
                     if clear_result is _ManifestReferenceClearResult.DATABASE_ERROR:
                         return _ManifestWriteResult.DATABASE_ERROR
                     try:
-                        self._record_manifest_warning(job_id, worker, token, generation)
+                        self._record_manifest_warning(
+                            job_id,
+                            worker,
+                            token,
+                            generation,
+                            final_status,
+                            final_error,
+                        )
                     except _ClaimLost:
                         return _ManifestWriteResult.CLAIM_LOST
                     return _ManifestWriteResult.REPAIR_PENDING
@@ -5581,7 +5953,14 @@ class ImageAcquisitionDownloadService:
             return _ManifestWriteResult.CLAIM_LOST
         except (AcquisitionDownloadError, OSError, ValueError) as exc:
             try:
-                self._record_manifest_warning(job_id, worker, token, generation)
+                self._record_manifest_warning(
+                    job_id,
+                    worker,
+                    token,
+                    generation,
+                    final_status,
+                    final_error,
+                )
             except _ClaimLost:
                 return _ManifestWriteResult.CLAIM_LOST
             logger.warning(

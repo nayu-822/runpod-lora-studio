@@ -67,7 +67,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0035_phase8c_cleanup_repair_scheduler"
+            "0036_phase8c_manifest_repair_intent"
         )
 
 
@@ -366,6 +366,8 @@ def test_phase8b_part_cleanup_claims_downgrade_and_reupgrade(
         assert {
             "manifest_repair_state",
             "manifest_repair_attempted_at",
+            "manifest_target_status",
+            "manifest_target_error_code",
         }.issubset(upgraded_job_columns)
     finally:
         get_settings.cache_clear()
@@ -375,8 +377,74 @@ def test_phase8b_part_cleanup_claims_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0035_phase8c_cleanup_repair_scheduler"
+            "0036_phase8c_manifest_repair_intent"
         )
+
+
+def test_phase8c_manifest_repair_intent_backfills_existing_0035_rows(
+    test_workspace: Path,
+) -> None:
+    settings = migrate(test_workspace, "0035_phase8c_cleanup_repair_scheduler")
+    engine = create_engine_for_settings(settings)
+    connection = engine.connect()
+    connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+    connection.commit()
+    transaction = connection.begin()
+    try:
+        connection.execute(
+            text(
+                """
+                INSERT INTO image_acquisition_jobs (
+                    id, project_id, plan_id, plan_fingerprint, source_type, status,
+                    worker_generation, cancellation_requested, manifest_warning,
+                    manifest_repair_state, error_code, downloader_version,
+                    validator_version, importer_version, job_fingerprint,
+                    created_at, updated_at
+                ) VALUES (
+                    :id, :project_id, :plan_id, :plan_fingerprint, :source_type,
+                    :status, 0, :cancellation_requested, :manifest_warning,
+                    :manifest_repair_state, :error_code, :downloader_version,
+                    :validator_version, :importer_version, :job_fingerprint,
+                    :created_at, :updated_at
+                )
+                """
+            ),
+            {
+                "id": "legacy-repair-job",
+                "project_id": "missing-project",
+                "plan_id": "legacy-plan",
+                "plan_fingerprint": "legacy-fingerprint",
+                "source_type": "danbooru",
+                "status": "stale",
+                "cancellation_requested": 1,
+                "manifest_warning": "MANIFEST_REPAIR_PENDING:running",
+                "manifest_repair_state": "pending",
+                "error_code": "UNKNOWN_DOWNLOAD_ERROR",
+                "downloader_version": "legacy",
+                "validator_version": "legacy",
+                "importer_version": "legacy",
+                "job_fingerprint": "legacy-job-fingerprint",
+                "created_at": "2026-08-05T00:00:00+00:00",
+                "updated_at": "2026-08-05T00:00:00+00:00",
+            },
+        )
+        transaction.commit()
+    finally:
+        connection.close()
+
+    migrate(test_workspace)
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                """
+                SELECT manifest_target_status, manifest_target_error_code,
+                       manifest_warning
+                FROM image_acquisition_jobs
+                WHERE id = 'legacy-repair-job'
+                """
+            )
+        ).one()
+    assert row == ("canceled", "CANCELED", "MANIFEST_WRITE_FAILED")
 
 
 def test_phase8b_cleanup_retry_schedule_downgrade_and_reupgrade(
@@ -408,7 +476,7 @@ def test_phase8b_cleanup_retry_schedule_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0035_phase8c_cleanup_repair_scheduler"
+            "0036_phase8c_manifest_repair_intent"
         )
 
 
@@ -440,7 +508,7 @@ def test_phase8a_page_checkpoint_migration_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0035_phase8c_cleanup_repair_scheduler"
+            "0036_phase8c_manifest_repair_intent"
         )
 
 
@@ -497,7 +565,7 @@ def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0035_phase8c_cleanup_repair_scheduler"
+            "0036_phase8c_manifest_repair_intent"
         )
 
 
@@ -525,7 +593,7 @@ def test_phase4_downgrade_and_reupgrade_preserves_phase3_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0035_phase8c_cleanup_repair_scheduler"
+            "0036_phase8c_manifest_repair_intent"
         )
 
 
@@ -539,7 +607,7 @@ def test_phase5_upgrades_existing_0006_database_to_head(
         assert "managed_models" in tables
         assert "storage_transfer_jobs" in tables
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0035_phase8c_cleanup_repair_scheduler"
+            "0036_phase8c_manifest_repair_intent"
         )
 
 
@@ -560,7 +628,7 @@ def test_phase5_heartbeat_migration_upgrades_existing_0007_database(
             "current_file_transferred_bytes",
         }.issubset(columns)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0035_phase8c_cleanup_repair_scheduler"
+            "0036_phase8c_manifest_repair_intent"
         )
 
 
@@ -608,7 +676,7 @@ def test_phase5_progress_migration_upgrades_existing_0008_database(
         ).one()
         assert row == ("running", 0, 0)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0035_phase8c_cleanup_repair_scheduler"
+            "0036_phase8c_manifest_repair_intent"
         )
 
 
@@ -635,7 +703,7 @@ def test_phase5_progress_downgrade_and_reupgrade(test_workspace: Path) -> None:
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0035_phase8c_cleanup_repair_scheduler"
+            "0036_phase8c_manifest_repair_intent"
         )
 
 

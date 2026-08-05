@@ -2011,6 +2011,12 @@ class ImageAcquisitionJobRecord(Base):
     manifest_relative_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     manifest_warning: Mapped[str | None] = mapped_column(Text, nullable=True)
     manifest_repair_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    manifest_target_status: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    manifest_target_error_code: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     manifest_repair_attempted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
