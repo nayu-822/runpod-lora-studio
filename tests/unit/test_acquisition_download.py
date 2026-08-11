@@ -1666,7 +1666,9 @@ def test_old_worker_cannot_remove_new_manifest_for_any_terminal_status(
             datetime.now(UTC),
         )
         session.commit()
-    new_generation = service._claim_job(job_id, "new-worker", "new-token")
+    new_generation = service._claim_manifest_repair_job(
+        str(job_id), "new-worker", "new-token"
+    )
     assert new_generation is not None
     new_counts = service._recompute_counts(
         job_id, "new-worker", "new-token", new_generation
@@ -2912,6 +2914,201 @@ def test_manifest_warning_commit_preserves_intent_across_stale_recovery(
     assert repaired is not None
     assert repaired.status is ImageAcquisitionJobStatus.FAILED
     assert repaired.error_code == DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR.value
+
+
+def test_manifest_commit_before_finish_recovers_only_through_repair(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace, cleanup_retry_base=0.0)
+    post = _post("1351-finalization-boundary", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    worker = "finalization-boundary-worker"
+    token = "finalization-boundary-token"
+    generation = service._claim_job(job_id, worker, token)
+    assert generation is not None
+    with create_session_factory(settings)() as session:
+        item = session.scalar(select(ImageAcquisitionJobItemRecord))
+        assert item is not None
+        item.status = ImageAcquisitionItemStatus.IMPORTED.value
+        item.completed_at = datetime.now(UTC)
+        session.commit()
+
+    counts = service._recompute_counts(job_id, worker, token, generation)
+    assert (
+        service._write_manifest(
+            job_id,
+            worker,
+            token,
+            generation,
+            ImageAcquisitionJobStatus.COMPLETED,
+            counts=counts,
+        )
+        is acquisition_download_module._ManifestWriteResult.SUCCESS
+    )
+    with create_session_factory(settings)() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert job is not None
+        assert job.status == ImageAcquisitionJobStatus.RUNNING.value
+        assert job.manifest_repair_state == ManifestRepairState.PENDING.value
+        assert job.manifest_target_status == ImageAcquisitionJobStatus.COMPLETED.value
+        assert job.manifest_relative_path is not None
+        old_manifest = (
+            settings.projects_dir / job.project_id / job.manifest_relative_path
+        )
+        job.heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+        session.commit()
+
+    assert service.recover_stale_jobs() == 1
+    assert service._claim_job(job_id, "normal-queue-worker", "normal-token") is None
+    assert service.reconcile_manifest_repairs() == 1
+
+    repaired = service.get_job(job_id)
+    assert repaired is not None
+    assert repaired.status is ImageAcquisitionJobStatus.COMPLETED
+    with create_session_factory(settings)() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert job is not None and job.manifest_relative_path is not None
+        manifest = settings.projects_dir / job.project_id / job.manifest_relative_path
+    assert manifest.is_file()
+    assert not old_manifest.exists()
+    assert list(manifest.parent.glob("manifest-*.json")) == [manifest]
+    assert json.loads(manifest.read_text(encoding="utf-8"))["status"] == (
+        ImageAcquisitionJobStatus.COMPLETED.value
+    )
+
+
+def test_canceled_manifest_finalization_restarts_as_canceled_repair(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace, cleanup_retry_base=0.0)
+    post = _post("1351-finalization-canceled", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    worker = "finalization-canceled-worker"
+    token = "finalization-canceled-token"
+    generation = service._claim_job(job_id, worker, token)
+    assert generation is not None
+    with create_session_factory(settings)() as session:
+        item = session.scalar(select(ImageAcquisitionJobItemRecord))
+        assert item is not None
+        item.status = ImageAcquisitionItemStatus.IMPORTED.value
+        item.completed_at = datetime.now(UTC)
+        session.commit()
+
+    counts = service._recompute_counts(job_id, worker, token, generation)
+    assert (
+        service._write_manifest(
+            job_id,
+            worker,
+            token,
+            generation,
+            ImageAcquisitionJobStatus.COMPLETED,
+            counts=counts,
+        )
+        is acquisition_download_module._ManifestWriteResult.SUCCESS
+    )
+    service.cancel_job(job_id)
+    with create_session_factory(settings)() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert job is not None
+        assert job.cancellation_requested
+        assert job.manifest_repair_state == ManifestRepairState.PENDING.value
+        assert job.manifest_target_status == ImageAcquisitionJobStatus.CANCELED.value
+        assert job.manifest_target_error_code == DownloadFailureCode.CANCELED.value
+        job.heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+        session.commit()
+
+    assert service.recover_stale_jobs() == 1
+    assert service.reconcile_manifest_repairs() == 1
+    repaired = service.get_job(job_id)
+    assert repaired is not None
+    assert repaired.status is ImageAcquisitionJobStatus.CANCELED
+    assert repaired.error_code == DownloadFailureCode.CANCELED.value
+    assert service.list_items(job_id)[0].status is ImageAcquisitionItemStatus.IMPORTED
+    with create_session_factory(settings)() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert job is not None and job.manifest_relative_path is not None
+        manifest = settings.projects_dir / job.project_id / job.manifest_relative_path
+    manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+    assert manifest_data["status"] == ImageAcquisitionJobStatus.CANCELED.value
+    assert manifest_data["imported_count"] == 1
+
+
+def test_manifest_finalization_preserves_specific_error_code_after_recovery(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace, cleanup_retry_base=0.0)
+    post = _post("1351-finalization-error", _png_bytes())
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    worker = "finalization-error-worker"
+    token = "finalization-error-token"
+    generation = service._claim_job(job_id, worker, token)
+    assert generation is not None
+    with create_session_factory(settings)() as session:
+        item = session.scalar(select(ImageAcquisitionJobItemRecord))
+        assert item is not None
+        item.status = ImageAcquisitionItemStatus.FAILED.value
+        item.failure_code = DownloadFailureCode.SOURCE_POST_NOT_FOUND.value
+        item.failure_message = DownloadFailureCode.SOURCE_POST_NOT_FOUND.value
+        item.completed_at = datetime.now(UTC)
+        session.commit()
+
+    counts = service._recompute_counts(job_id, worker, token, generation)
+    assert (
+        service._write_manifest(
+            job_id,
+            worker,
+            token,
+            generation,
+            ImageAcquisitionJobStatus.FAILED,
+            final_error=DownloadFailureCode.SOURCE_POST_NOT_FOUND,
+            counts=counts,
+        )
+        is acquisition_download_module._ManifestWriteResult.SUCCESS
+    )
+    with create_session_factory(settings)() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert job is not None
+        job.heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+        session.commit()
+
+    assert service.recover_stale_jobs() == 1
+    assert service.reconcile_manifest_repairs() == 1
+    repaired = service.get_job(job_id)
+    assert repaired is not None
+    assert repaired.status is ImageAcquisitionJobStatus.FAILED
+    assert repaired.error_code == DownloadFailureCode.SOURCE_POST_NOT_FOUND.value
 
 
 def test_stale_manifest_repair_preserves_target_after_repair_worker_stops(

@@ -138,6 +138,12 @@ PART_CLEANUP_ITEM_STATUSES = frozenset(
 PART_CLEANUP_BATCH_SIZE = 32
 STALE_JOB_BATCH_SIZE = 32
 MANIFEST_REPAIR_INTENT_PREFIX = "MANIFEST_REPAIR_PENDING:"
+MANIFEST_FINALIZATION_STATES = frozenset(
+    {
+        ManifestRepairState.PENDING.value,
+        ManifestRepairState.REPAIRING.value,
+    }
+)
 TERMINAL_JOB_STATUS_VALUES = frozenset(
     {
         ImageAcquisitionJobStatus.PARTIALLY_COMPLETED.value,
@@ -4284,7 +4290,10 @@ class ImageAcquisitionDownloadService:
                     ImageAcquisitionJobRecord.worker_id == worker,
                     ImageAcquisitionJobRecord.claim_token == token,
                     ImageAcquisitionJobRecord.worker_generation == generation,
-                    ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
+                    ImageAcquisitionJobRecord.manifest_repair_state.in_(
+                        MANIFEST_FINALIZATION_STATES
+                    ),
+                    ImageAcquisitionJobRecord.manifest_relative_path.is_not(None),
                     ~self._job_has_cleanup_pending(str(job_id)),
                     (
                         ImageAcquisitionJobRecord.cancellation_requested == False  # noqa: E712
@@ -4301,6 +4310,7 @@ class ImageAcquisitionDownloadService:
                     claim_token=None,
                     current_item_id=None,
                     active_key=None,
+                    manifest_warning=None,
                     manifest_repair_state=None,
                     manifest_repair_attempted_at=None,
                     manifest_target_status=None,
@@ -4935,6 +4945,146 @@ class ImageAcquisitionDownloadService:
             logger.warning("acquisition_manifest_cleanup_failed error_type=OSError")
             return False
 
+    def _cleanup_unreferenced_manifest_artifacts(
+        self, directory: _ManifestDirectoryHandle, keep_name: str
+    ) -> bool:
+        artifact_pattern = re.compile(
+            r"(?:manifest-g[0-9]+-[0-9a-f]{12}\.json|"
+            r"\.manifest-g[0-9]+-[0-9a-f]{12}\.json\.tmp)"
+        )
+        if not re.fullmatch(r"manifest-g[0-9]+-[0-9a-f]{12}\.json", keep_name):
+            return False
+        try:
+            if not self._manifest_directory_identity_matches(directory):
+                return False
+            if directory.fd >= 0:
+                self._manifest_artifact_identity_fd(keep_name, directory.fd)
+                names = os.listdir(directory.fd)
+                for name in names:
+                    if name == keep_name or artifact_pattern.fullmatch(name) is None:
+                        continue
+                    try:
+                        metadata = os.stat(
+                            name,
+                            dir_fd=directory.fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(
+                        metadata.st_mode
+                    ):
+                        return False
+                    os.unlink(name, dir_fd=directory.fd)
+                self._fsync_manifest_directory(directory.manifest_dir, directory.fd)
+            else:
+                self._validate_manifest_directory(
+                    directory.project_root,
+                    directory.manifest_dir,
+                    create_missing=False,
+                )
+                self._validate_manifest_file(
+                    directory.manifest_dir / keep_name,
+                    regular=True,
+                )
+                for path in directory.manifest_dir.iterdir():
+                    if (
+                        path.name == keep_name
+                        or artifact_pattern.fullmatch(path.name) is None
+                    ):
+                        continue
+                    self._validate_manifest_file(path, regular=True)
+                    if not self._cleanup_manifest_artifact(path) and path.exists():
+                        return False
+                self._fsync_manifest_directory(directory.manifest_dir)
+            return self._manifest_directory_identity_matches(directory)
+        except (AcquisitionDownloadError, OSError, ValueError):
+            logger.warning("acquisition_manifest_cleanup_failed error_type=OSError")
+            return False
+
+    def _begin_manifest_finalization(
+        self,
+        job_id: UUID,
+        worker: str,
+        token: str,
+        generation: int,
+        target_status: ImageAcquisitionJobStatus,
+        target_error: DownloadFailureCode | None,
+    ) -> tuple[ImageAcquisitionJobStatus, DownloadFailureCode | None] | None:
+        if target_status.value not in TERMINAL_JOB_STATUS_VALUES:
+            return None
+        with self.session_factory() as session:
+            job = session.scalar(
+                select(ImageAcquisitionJobRecord).where(
+                    ImageAcquisitionJobRecord.id == str(job_id),
+                    ImageAcquisitionJobRecord.status
+                    == ImageAcquisitionJobStatus.RUNNING.value,
+                    ImageAcquisitionJobRecord.worker_id == worker,
+                    ImageAcquisitionJobRecord.claim_token == token,
+                    ImageAcquisitionJobRecord.worker_generation == generation,
+                )
+            )
+            if job is None or (
+                job.manifest_repair_state is not None
+                and job.manifest_repair_state not in MANIFEST_FINALIZATION_STATES
+            ):
+                return None
+
+            stored_status = self._manifest_repair_status_from_value(
+                job.manifest_target_status
+            )
+            stored_error = self._download_failure_code_from_value(
+                job.manifest_target_error_code
+            )
+            effective_status: ImageAcquisitionJobStatus
+            effective_error: DownloadFailureCode | None
+            if job.cancellation_requested:
+                effective_status = ImageAcquisitionJobStatus.CANCELED
+                effective_error = DownloadFailureCode.CANCELED
+            elif stored_status is not None:
+                effective_status = stored_status
+                effective_error = stored_error
+            else:
+                effective_status = target_status
+                effective_error = target_error
+
+            now = datetime.now(UTC)
+            job.manifest_warning = "MANIFEST_WRITE_FAILED"
+            if job.manifest_repair_state is None:
+                job.manifest_repair_state = ManifestRepairState.PENDING.value
+            job.manifest_repair_attempted_at = now
+            job.manifest_target_status = effective_status.value
+            job.manifest_target_error_code = (
+                effective_error.value if effective_error else None
+            )
+            job.error_code = effective_error.value if effective_error else None
+            job.error_summary = effective_error.value if effective_error else None
+            job.updated_at = now
+            try:
+                session.commit()
+            except BaseException:
+                session.rollback()
+                persisted_job = session.scalar(
+                    select(ImageAcquisitionJobRecord).where(
+                        ImageAcquisitionJobRecord.id == str(job_id),
+                        ImageAcquisitionJobRecord.status
+                        == ImageAcquisitionJobStatus.RUNNING.value,
+                        ImageAcquisitionJobRecord.worker_id == worker,
+                        ImageAcquisitionJobRecord.claim_token == token,
+                        ImageAcquisitionJobRecord.worker_generation == generation,
+                        ImageAcquisitionJobRecord.manifest_repair_state.in_(
+                            MANIFEST_FINALIZATION_STATES
+                        ),
+                        ImageAcquisitionJobRecord.manifest_target_status
+                        == effective_status.value,
+                        ImageAcquisitionJobRecord.manifest_target_error_code
+                        == (effective_error.value if effective_error else None),
+                    )
+                )
+                if persisted_job is None:
+                    raise
+            return effective_status, effective_error
+
     def _record_manifest_warning(
         self,
         job_id: UUID,
@@ -5256,8 +5406,6 @@ class ImageAcquisitionDownloadService:
                 candidates = session.execute(
                     select(
                         ImageAcquisitionJobRecord.id,
-                        ImageAcquisitionJobRecord.project_id,
-                        ImageAcquisitionJobRecord.manifest_relative_path,
                         ImageAcquisitionJobRecord.manifest_target_status,
                         ImageAcquisitionJobRecord.manifest_target_error_code,
                         ImageAcquisitionJobRecord.error_code,
@@ -5287,8 +5435,6 @@ class ImageAcquisitionDownloadService:
         repaired_count = 0
         for (
             job_id,
-            project_id,
-            old_relative_path,
             stored_target_status,
             stored_target_error_code,
             stored_error_code,
@@ -5309,7 +5455,7 @@ class ImageAcquisitionDownloadService:
                 intent_requires_audit = True
             if stored_target_error_code is not None and target_error is None:
                 intent_requires_audit = True
-                target_error = DownloadFailureCode.UNKNOWN_DOWNLOAD_ERROR
+                target_error = self._download_failure_code_from_value(stored_error_code)
             if target_status is None:
                 target_status = self._manifest_repair_status_from_warning(
                     manifest_warning
@@ -5428,18 +5574,6 @@ class ImageAcquisitionDownloadService:
                     counts=counts,
                 )
                 if result is _ManifestWriteResult.SUCCESS:
-                    if old_relative_path and not self._cleanup_previous_manifest(
-                        str(project_id), str(old_relative_path)
-                    ):
-                        self._defer_manifest_repair(
-                            job_uuid,
-                            worker,
-                            token,
-                            generation,
-                            target_status,
-                            target_error,
-                        )
-                        continue
                     if self._finish_job(
                         job_uuid,
                         worker,
@@ -5711,24 +5845,26 @@ class ImageAcquisitionDownloadService:
             project_id = job.project_id
             manifest_job_id = job.id
 
-        if cleanup_pending:
-            try:
-                self._record_manifest_warning(
-                    job_id,
-                    worker,
-                    token,
-                    generation,
-                    final_status,
-                    final_error,
-                )
-            except _ClaimLost:
-                return _ManifestWriteResult.CLAIM_LOST
-            return _ManifestWriteResult.REPAIR_PENDING
-
         temporary: Path | None = None
         final: Path | None = None
-        operation = "path"
+        operation = "intent"
         try:
+            intent = self._begin_manifest_finalization(
+                job_id,
+                worker,
+                token,
+                generation,
+                final_status,
+                final_error,
+            )
+            if intent is None:
+                return _ManifestWriteResult.CLAIM_LOST
+            final_status, final_error = intent
+            manifest["status"] = final_status.value
+            if cleanup_pending:
+                return _ManifestWriteResult.REPAIR_PENDING
+
+            operation = "path"
             project_root = self._manifest_project_root(project_id)
             _, temporary_candidate, final_candidate = self._manifest_paths(
                 project_id, manifest_job_id, generation
@@ -5858,9 +5994,6 @@ class ImageAcquisitionDownloadService:
                             )
                             .values(
                                 manifest_relative_path=relative_path,
-                                manifest_warning=None,
-                                manifest_repair_state=None,
-                                manifest_repair_attempted_at=None,
                                 updated_at=datetime.now(UTC),
                             )
                             .returning(ImageAcquisitionJobRecord.id)
@@ -5936,6 +6069,21 @@ class ImageAcquisitionDownloadService:
                     )
                     if clear_result is _ManifestReferenceClearResult.DATABASE_ERROR:
                         return _ManifestWriteResult.DATABASE_ERROR
+                    try:
+                        self._record_manifest_warning(
+                            job_id,
+                            worker,
+                            token,
+                            generation,
+                            final_status,
+                            final_error,
+                        )
+                    except _ClaimLost:
+                        return _ManifestWriteResult.CLAIM_LOST
+                    return _ManifestWriteResult.REPAIR_PENDING
+                if not self._cleanup_unreferenced_manifest_artifacts(
+                    directory, final.name
+                ):
                     try:
                         self._record_manifest_warning(
                             job_id,
