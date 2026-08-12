@@ -25,6 +25,9 @@ from runpod_lora_studio.services.similarity_detection_service import (
 )
 from runpod_lora_studio.services.storage_service import StorageService
 from runpod_lora_studio.services.tagging_service import TaggingService
+from runpod_lora_studio.services.training_completion_service import (
+    TrainingCompletionService,
+)
 from runpod_lora_studio.services.training_service import TrainingService
 from runpod_lora_studio.ui.acquisition import build_acquisition_tab
 from runpod_lora_studio.ui.dataset import build_dataset_tab
@@ -100,6 +103,11 @@ def create_app(
     datasets = DatasetSnapshotService(runtime_settings, projects)
     storage = StorageService(runtime_settings, datasets=datasets)
     training = TrainingService(runtime_settings)
+    completion = TrainingCompletionService(
+        runtime_settings,
+        storage_service=storage,
+        training_service=training,
+    )
     acquisition = ImageAcquisitionService(runtime_settings)
     acquisition_download = ImageAcquisitionDownloadService(
         runtime_settings, projects=projects
@@ -109,6 +117,8 @@ def create_app(
     storage.recover_stale_jobs()
     training.reconcile_stale_jobs()
     training.reconcile_progress()
+    completion.recover_stale()
+    completion.reconcile_remote(time_budget_seconds=5.0)
     acquisition_download.recover_stale_jobs()
     acquisition_download.recover_part_cleanup_jobs(
         max_batches=runtime_settings.image_download_cleanup_max_batches,
@@ -120,6 +130,7 @@ def create_app(
     )
     acquisition_download.start_cleanup_scheduler()
     atexit.register(acquisition_download.stop_cleanup_scheduler)
+    atexit.register(completion.close)
     path_rows = build_paths_dataframe(runtime_settings)
 
     with gr.Blocks(title=runtime_settings.app_title) as demo:
@@ -158,12 +169,13 @@ def create_app(
         with gr.Tab("モデル・Google Drive"):
             build_storage_tab(storage, selected_project)
         with gr.Tab("SDXL LoRA学習"):
-            build_training_tab(training, selected_project)
+            build_training_tab(training, selected_project, completion)
         gr.Markdown(
-            "Phase 5のモデル管理・Google Drive転送基盤まで実装済みです。"
-            "学習実行、学習成果物の最終同期、RunPod制御は後続Phaseの対象です。"
+            "Phase 9Aの学習成果物Google Drive確定同期と"
+            "completion manifestまで実装済みです。"
+            "同期失敗時はRunPod Podを停止・Terminateせず、"
+            "再試行可能な状態で保持します。"
         )
-
     return cast(gr.Blocks, demo)
 
 

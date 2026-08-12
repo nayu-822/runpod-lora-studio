@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from runpod_lora_studio.external.rclone import RcloneRunner
+from runpod_lora_studio.config.settings import AppSettings
+from runpod_lora_studio.domain.storage_models import StorageRemotePath
+from runpod_lora_studio.external.rclone import CopyOptions, RcloneAdapter, RcloneRunner
 
 
 def test_rclone_runner_uses_argument_array_and_config_without_shell(
@@ -30,3 +32,27 @@ def test_rclone_runner_uses_argument_array_and_config_without_shell(
         "gdrive:models",
     ]
     assert calls[0]["shell"] is False
+
+
+def test_rclone_dry_run_uses_copyto_for_a_local_file(
+    monkeypatch, test_workspace: Path
+) -> None:
+    source = test_workspace / "export.bin"
+    source.write_bytes(b"payload")
+    calls: list[list[str]] = []
+
+    def fake_run(arguments, timeout=10.0):
+        calls.append(arguments)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    settings = AppSettings(workspace_root=test_workspace)
+    adapter = RcloneAdapter(settings)
+    monkeypatch.setattr(adapter.runner, "run", fake_run)
+
+    adapter.dry_run_copy(
+        source,
+        StorageRemotePath("gdrive", "training/job/export.bin"),
+        CopyOptions(),
+    )
+
+    assert "copyto" in calls[0]

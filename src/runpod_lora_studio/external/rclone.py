@@ -68,6 +68,10 @@ class CancelToken:
         return self._event.is_set()
 
 
+class RemotePathNotFoundError(RuntimeError):
+    """The remote directory does not exist yet."""
+
+
 ProgressCallback = Callable[[TransferProgress], None]
 ProcessCallback = Callable[[int | None], None]
 
@@ -310,6 +314,17 @@ class RcloneAdapter:
             args, timeout=self.settings.rclone_transfer_timeout_seconds
         )
         if result.returncode != 0:
+            message = result.stderr.casefold()
+            if any(
+                marker in message
+                for marker in (
+                    "directory not found",
+                    "object not found",
+                    "path not found",
+                    "doesn't exist",
+                )
+            ):
+                raise RemotePathNotFoundError(remote_path.rclone_value)
             raise RuntimeError("Google Driveの一覧を取得できません")
         entries: list[StorageEntry] = []
         raw_entries: list[object]
@@ -374,7 +389,9 @@ class RcloneAdapter:
         result = self.runner.run(
             [
                 *self._common_args(timeout=options.timeout),
-                "copyto" if isinstance(destination, Path) else "copy",
+                "copyto"
+                if _is_file_source(source) or isinstance(destination, Path)
+                else "copy",
                 source_value,
                 destination_value,
                 "--dry-run",

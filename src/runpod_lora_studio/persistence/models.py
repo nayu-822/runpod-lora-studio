@@ -754,6 +754,82 @@ class StorageTransferJobRecord(Base):
     )
 
 
+class TrainingCompletionExportRecord(Base):
+    __tablename__ = "training_completion_exports"
+    __table_args__ = (
+        UniqueConstraint(
+            "training_job_id", name="uq_training_completion_exports_training_job"
+        ),
+        Index(
+            "ix_training_completion_exports_status_heartbeat",
+            "status",
+            "heartbeat_at",
+            "updated_at",
+            "id",
+        ),
+        Index(
+            "ix_training_completion_exports_project_status",
+            "project_id",
+            "status",
+            "updated_at",
+        ),
+        Index("ix_training_completion_exports_storage_job", "storage_transfer_job_id"),
+    )
+
+    internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    training_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("training_jobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    storage_transfer_job_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    current_stage: Mapped[str] = mapped_column(String(64), nullable=False)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    claim_token: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    worker_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancel_requested: Mapped[bool] = mapped_column(Integer, nullable=False, default=0)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    source_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    preview_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    export_relative_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    export_manifest_relative_path: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    export_manifest_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    export_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    remote_relative_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    remote_completion_manifest_relative_path: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    completion_manifest_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 class TransferItemRecord(Base):
     __tablename__ = "storage_transfer_items"
     __table_args__ = (

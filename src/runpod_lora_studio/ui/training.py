@@ -32,6 +32,10 @@ from runpod_lora_studio.services.recommendation_calibration_service import (
 from runpod_lora_studio.services.recommendation_persistence_service import (
     RecommendationPersistenceService,
 )
+from runpod_lora_studio.services.training_completion_service import (
+    CompletionFailure,
+    TrainingCompletionService,
+)
 from runpod_lora_studio.services.training_recommendation_engine import (
     RuleBasedRecommendationEngine,
 )
@@ -90,7 +94,11 @@ def _format_exclusion_reasons(reasons: tuple[str, ...]) -> str:
     )
 
 
-def build_training_tab(service: TrainingService, selected_project: gr.State) -> None:
+def build_training_tab(
+    service: TrainingService,
+    selected_project: gr.State,
+    completion_service: TrainingCompletionService | None = None,
+) -> None:
     controller = TrainingController(service)
     compute_diagnostics = ComputeEnvironmentService(service.settings)
     training_diagnostics = TrainingEnvironmentService(service.settings)
@@ -892,3 +900,170 @@ def build_training_tab(service: TrainingService, selected_project: gr.State) -> 
         outputs=[resume_job_id, message],
     )
     resume_start.click(resume_start_action, inputs=[resume_job_id], outputs=[message])
+
+    gr.Markdown("### Phase 9A 蟄ｦ鄙呈・譫懃黄縺ｮGoogle Drive遒ｺ螳壼酔譛滉ｼ・")
+    with gr.Row():
+        completion_training_job_id = gr.Textbox(
+            label="succeeded training job ID",
+            placeholder="training job UUID",
+        )
+        completion_preview = gr.Button("Drive同期プレビュー")
+        completion_start = gr.Button("確定同期を開始", variant="primary")
+        completion_refresh = gr.Button("完了同期一覧を更新")
+    completion_preview_token = gr.State(value="")
+    completion_preview_view = gr.Markdown()
+    with gr.Row():
+        completion_export_id = gr.Textbox(
+            label="completion export ID", interactive=False
+        )
+        completion_cancel_id = gr.Textbox(label="cancel/retry export ID")
+        completion_cancel = gr.Button("同期をキャンセル")
+        completion_retry = gr.Button("同期を再試行")
+    completion_message = gr.Markdown()
+    completion_table = gr.Dataframe(
+        headers=[
+            "export ID",
+            "training job ID",
+            "status",
+            "stage",
+            "storage job ID",
+            "remote path",
+            "export manifest SHA-256",
+            "completion manifest SHA-256",
+            "error code",
+            "error",
+            "completed at",
+        ],
+        datatype=["str"] * 11,
+        interactive=False,
+        value=[],
+    )
+
+    def _completion_project_id(value: str | None) -> UUID | None:
+        if not value:
+            return None
+        return UUID(str(value))
+
+    def completion_preview_action(job_value: str | None) -> tuple[str, str]:
+        if completion_service is None:
+            return "Phase 9A service is unavailable", ""
+        if not job_value:
+            return "training job IDを入力してください", ""
+        try:
+            preview = completion_service.preview(UUID(job_value.strip()))
+        except (CompletionFailure, UserFacingError, ValueError) as exc:
+            return f"エラー: {exc}", ""
+        file_lines = [
+            f"  - `{item.relative_path}` ({item.size_bytes} bytes, `{item.sha256}`)"
+            for item in preview.files
+        ]
+        return (
+            "\n".join(
+                [
+                    "#### 確定同期プレビュー",
+                    f"- training job: `{preview.training_job_id}`",
+                    f"- final LoRA: `{preview.final_lora_filename}`",
+                    f"- final LoRA SHA-256: `{preview.final_lora_sha256}`",
+                    f"- local export: `{preview.local_export_relative_path}`",
+                    f"- remote destination: `{preview.remote_relative_path}`",
+                    f"- dataset transfer job: "
+                    f"`{preview.dataset_remote_transfer_job_id}`",
+                    f"- dataset remote manifest SHA-256: "
+                    f"`{preview.dataset_remote_manifest_sha256}`",
+                    f"- overwrite policy: `{preview.overwrite_policy}`",
+                    f"- verification policy: `{preview.verification_policy}`",
+                    "- files:",
+                    *file_lines,
+                    f"- preview token: `{preview.token}`",
+                ]
+            ),
+            preview.token,
+        )
+
+    def completion_start_action(
+        job_value: str | None, token: str, project_value: str | None
+    ) -> tuple[str, str, list[list[str]]]:
+        if completion_service is None:
+            return "", "Phase 9A service is unavailable", []
+        if not job_value:
+            return "", "training job IDを入力してください", []
+        try:
+            export_id = completion_service.start(
+                UUID(job_value.strip()), preview_token=token or None
+            )
+            return (
+                str(export_id),
+                f"確定同期を開始しました: `{export_id}`",
+                completion_service.status_rows(_completion_project_id(project_value)),
+            )
+        except (CompletionFailure, UserFacingError, ValueError) as exc:
+            return "", f"エラー: {exc}", []
+
+    def completion_refresh_action(project_value: str | None) -> list[list[str]]:
+        if completion_service is None:
+            return []
+        try:
+            return completion_service.status_rows(_completion_project_id(project_value))
+        except ValueError:
+            return []
+
+    def completion_cancel_action(
+        export_value: str | None, project_value: str | None
+    ) -> tuple[str, list[list[str]]]:
+        if completion_service is None:
+            return "Phase 9A service is unavailable", []
+        if not export_value:
+            return "export IDを入力してください", []
+        try:
+            export_id = UUID(export_value.strip())
+            completion_service.cancel(export_id)
+            return "キャンセル要求を保存しました", completion_service.status_rows(
+                _completion_project_id(project_value)
+            )
+        except (UserFacingError, ValueError) as exc:
+            return f"エラー: {exc}", []
+
+    def completion_retry_action(
+        export_value: str | None, token: str, project_value: str | None
+    ) -> tuple[str, str, list[list[str]]]:
+        if completion_service is None:
+            return "", "Phase 9A service is unavailable", []
+        if not export_value:
+            return "", "export IDを入力してください", []
+        try:
+            export_id = completion_service.retry(
+                UUID(export_value.strip()), preview_token=token or None
+            )
+            return (
+                str(export_id),
+                f"再試行を開始しました: `{export_id}`",
+                completion_service.status_rows(_completion_project_id(project_value)),
+            )
+        except (CompletionFailure, UserFacingError, ValueError) as exc:
+            return "", f"エラー: {exc}", []
+
+    completion_preview.click(
+        completion_preview_action,
+        inputs=[completion_training_job_id],
+        outputs=[completion_preview_view, completion_preview_token],
+    )
+    completion_start.click(
+        completion_start_action,
+        inputs=[completion_training_job_id, completion_preview_token, selected_project],
+        outputs=[completion_export_id, completion_message, completion_table],
+    )
+    completion_refresh.click(
+        completion_refresh_action,
+        inputs=[selected_project],
+        outputs=[completion_table],
+    )
+    completion_cancel.click(
+        completion_cancel_action,
+        inputs=[completion_cancel_id, selected_project],
+        outputs=[completion_message, completion_table],
+    )
+    completion_retry.click(
+        completion_retry_action,
+        inputs=[completion_cancel_id, completion_preview_token, selected_project],
+        outputs=[completion_export_id, completion_message, completion_table],
+    )

@@ -588,6 +588,15 @@ Google Drive同期と完了manifestはPhase 9で実装する。Phase 6全体は�
 - 候補のexternal postとsearch resultはDBの一意制約付きupsertで冪等に保存する。取得計画にはsource type + external post IDのreservationを作成し、別planとの同時確定をDBレベルで防止する。
 - 取得計画のpreview fingerprintには検索fingerprint、adapter version、plan状態、選択件数、候補メタデータを含める。confirm時にDBを再検証し、確定済みplanは不変・冪等で、画像ダウンロードは行わない。UIは外部画像を表示せず、ratingと除外理由を日本語で表示する。
 - Phase 8Bの画像取得、ファイル検証、ImageRecord登録、サムネイル、外部post provenance、停止再開は実装済みである。ZIP、他source、tagger／dataset／Drive連携は未実装であり、成果物のDrive同期とPod終了はPhase 9の対象である。
+
+## Phase 9A実装状況: 学習成果物のGoogle Drive確定同期
+
+Phase 9Aでは、exit code 0で終了した学習jobについて、入力・最終LoRA・dataset snapshot・base modelを再検証し、ローカルexportを作成してからGoogle Driveへ確定同期する。同期は`rclone copy`を使用し、artifact本体、転送manifest、remote検証、completion manifestの順序を固定する。completion manifestはremote artifact検証後に最後にコピーし、remote側の再検証とDBのcompleted確定が完了条件である。
+
+- 最終LoRAは`output/{output_name}.safetensors`だけを採用し、checkpoint代用、symlink、変化中ファイル、safetensors検証失敗を拒否する。
+- exportと同期はSQLiteのworker claim、generation、heartbeat、cancel intent、stale復旧、再起動後のremote reconcileを持つ。既存のartifact transfer jobと同一fingerprintのremote markerは検証して冪等完了とする。
+- completion manifestにはdataset remote provenance、model hash、config fingerprint、resume provenance、artifact hashes、transfer job IDを保存し、秘密情報、絶対パス、raw exception、RunPod API responseは含めない。
+- UIにはpreview、開始、一覧更新、cancel、retryを追加した。同期失敗時はPodを停止・Terminateせず、Phase 9BのRunPod lifecycle制御は未実装である。
 - source metadataの`get_post()`はitem attempt単位の単発requestとし、cancelで呼出元が先に戻る場合もクライアント単位の上限1 executorが実transportを保持する。limiterのleaseと`after_request`は実transport終了後にだけ解放・実行し、cancel直後のrequest再利用、thread無制限増加、429／Retry-After、callback／transport／claim喪失時のrelease監査を回帰テストで確認する。URL、Authorization、API key、raw responseはログへ出さない。
 - manifestはworker generationとランダムUUID断片による固有temporary／final fileへ書き込み、JSONのfsync中にSQLite write transactionを保持しない。`project_root`から`manifests`までの各親componentを`lstat`してsymlink、path traversal、projects root外を拒否し、不足ディレクトリは検証しながら作成する。fd対応環境ではproject、acquisition、jobs、job、manifestsのdevice／inode identityを保持し、DB更新前の再トラバースとcommit後のDB相対path／file inode検証を行う。temporaryは`O_CREAT|O_EXCL`（対応環境では`O_NOFOLLOW`／directory fd）で作成し、file fsync、claim再確認、atomic replace、manifest directory fsync、親とfinalの再検証、claim条件付きUPDATE、commit後の参照確認を順序どおり実行する。参照解除の結果は明示的なstatusへ分類し、DBが自workerのpathをまだ参照する場合や状態不明時はfileを保持する。old workerのclaim喪失やDB更新失敗時は自worker作成fileだけをcleanupし、解除確認後のunlinkではmanifest directoryをfsyncする。DBが参照するmanifestはprojects root内のregular fileとして確定する。
 - plan検証の恒久エラー時は、`PENDING`、`DOWNLOADING`、`DOWNLOADED`、`VALIDATION_PENDING`、`VALIDATING`、`VALIDATED`、`IMPORTING`の全非終端itemとrunning attemptを同一failure codeでFAILED・非retryableに終端化し、安全な`.part`をcleanupしてからcounterを再計算し、`pending_count=0`、`downloading_count=0`を含むmanifestを生成する。cleanup不能・不審pathはitemの`part_cleanup_warning`、manifest、`AcquisitionItemView`へ固定コードで保存する。`IMPORTED`、`LINKED_EXISTING`、`SKIPPED`を含むすべての終端化経路でitem／attempt更新と`PART_CLEANUP_PENDING`をcommitし、claim再確認後に安全なcleanupを行う。絶対パスやraw exceptionは保存しない。

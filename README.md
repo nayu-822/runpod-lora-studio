@@ -380,3 +380,11 @@ Phase 7Bは、完了した学習jobから速度、VRAM使用量、終了理由�
 - メモリ校正はtarget peak、2点以上のサンプル、identity検証、正のcoverage、他プロセス影響50%以下を必須とします。OOMのbatch低下はGPU/VRAMクラス、解像度、batch、gradient accumulation、optimizer、precision、cache/checkpointing、LoRA module/dimが一致するmedium以上の履歴だけで提案し、異なるdimやbatchの履歴では増加も低下も行いません。
 - summary内容fingerprintと校正状態fingerprintを分離し、include/exclude、理由、再分類、force recollect、メモリ集約更新は関連snapshotだけをstaleにします。適用直前にもsnapshotのstaleと推奨設定・現在GPUの互換性を再検証します。校正の再構築や再収集だけで学習を開始することはありません。UIから履歴の更新、performance再収集、校正再構築を実行できます。
 - `failed`、`canceled`、`stale`のいずれでもPID、process group、process identity、worker情報、heartbeatを確認し、終了を確証できないjobは再開しません。プロセスのkillは行いません。
+
+## Phase 9A: 学習成果物のGoogle Drive確定同期
+
+学習jobがexit code 0で終了した後、dataset snapshot、remote snapshot provenance、base model、最終LoRAを再検証し、`projects/{project_id}/training/exports/{training_job_id}`へローカルexportを作成します。成果物は`rclone copy`で転送し、artifact本体、転送manifest、remote検証、`completion-manifest.json`の順に確定します。completion manifestをremoteで再検証してから、SQLiteのcompletion exportを`completed`へ更新します。
+
+最終LoRAは`output/{output_name}.safetensors`だけを対象とし、checkpoint代用、symlink、変化中ファイル、safetensors検証失敗を拒否します。worker claim、generation fencing、heartbeat、cancel intent、stale復旧、再起動後のremote reconcile、同一markerの冪等再開、remote衝突のfail-closedを実装しています。manifestにはdataset remote provenance、model hash、config fingerprint、resume情報、artifact hashes、transfer job IDを含め、秘密情報や絶対パスは含めません。
+
+学習タブからpreview、確定同期開始、一覧更新、cancel、retryを操作できます。同期失敗時はPodを稼働したまま保持し、RunPodのStop／Terminate制御（Phase 9B）は実装していません。

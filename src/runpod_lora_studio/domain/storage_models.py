@@ -304,3 +304,21 @@ class TransferManifest:
     status: TransferStatus
     items: tuple[dict[str, Any], ...]
     error_summary: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StorageArtifactFile:
+    relative_path: str
+    source_path: Path
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteSnapshotProvenance:
+    snapshot_id: UUID
+    remote_relative_path: str
+    storage_transfer_job_id: UUID
+    remote_manifest_sha256: str
+    content_sha256: str
+    verification_level: str

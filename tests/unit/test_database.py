@@ -78,8 +78,67 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0039_phase8c_manifest_orphan_scan"
+            "0040_phase9a_training_completion_export"
         )
+
+
+def test_phase9a_completion_export_schema_survives_downgrade_and_reupgrade(
+    test_workspace: Path,
+) -> None:
+    settings = migrate(test_workspace)
+    engine = create_engine_for_settings(settings)
+    inspector = inspect(engine)
+    assert "training_completion_exports" in inspector.get_table_names()
+    columns = {
+        column["name"]
+        for column in inspector.get_columns("training_completion_exports")
+    }
+    assert {
+        "training_job_id",
+        "worker_generation",
+        "heartbeat_at",
+        "cancel_requested",
+        "source_fingerprint",
+        "preview_fingerprint",
+        "export_manifest_sha256",
+        "completion_manifest_sha256",
+    }.issubset(columns)
+    unique_constraints = {
+        constraint["name"]
+        for constraint in inspector.get_unique_constraints(
+            "training_completion_exports"
+        )
+    }
+    assert "uq_training_completion_exports_training_job" in unique_constraints
+
+    project = ProjectService(settings).create(ProjectInput("phase9a-preserved"))
+    with engine.connect() as connection:
+        before = connection.scalar(
+            text("SELECT COUNT(*) FROM projects WHERE id = :project_id"),
+            {"project_id": str(project.id)},
+        )
+    assert before == 1
+
+    config = Config(str(Path("alembic.ini").resolve()))
+    old_path = os.environ.get("RUNPOD_LORA_STUDIO_DATABASE_PATH")
+    os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = str(settings.database_path)
+    get_settings.cache_clear()
+    try:
+        command.downgrade(config, "0039_phase8c_manifest_orphan_scan")
+        assert "training_completion_exports" not in inspect(engine).get_table_names()
+        command.upgrade(config, "head")
+    finally:
+        get_settings.cache_clear()
+        if old_path is None:
+            os.environ.pop("RUNPOD_LORA_STUDIO_DATABASE_PATH", None)
+        else:
+            os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
+    with engine.connect() as connection:
+        after = connection.scalar(
+            text("SELECT COUNT(*) FROM projects WHERE id = :project_id"),
+            {"project_id": str(project.id)},
+        )
+    assert after == 1
 
 
 def test_phase6b_tables_have_job_scoped_constraints(test_workspace: Path) -> None:
@@ -388,7 +447,7 @@ def test_phase8b_part_cleanup_claims_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0039_phase8c_manifest_orphan_scan"
+            "0040_phase9a_training_completion_export"
         )
 
 
@@ -441,7 +500,7 @@ def test_phase8c_manifest_orphan_scan_migration_downgrade_and_reupgrade(
 
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0039_phase8c_manifest_orphan_scan"
+            "0040_phase9a_training_completion_export"
         )
 
 
@@ -920,7 +979,7 @@ def test_phase8b_cleanup_retry_schedule_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0039_phase8c_manifest_orphan_scan"
+            "0040_phase9a_training_completion_export"
         )
 
 
@@ -952,7 +1011,7 @@ def test_phase8a_page_checkpoint_migration_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0039_phase8c_manifest_orphan_scan"
+            "0040_phase9a_training_completion_export"
         )
 
 
@@ -1009,7 +1068,7 @@ def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0039_phase8c_manifest_orphan_scan"
+            "0040_phase9a_training_completion_export"
         )
 
 
@@ -1037,7 +1096,7 @@ def test_phase4_downgrade_and_reupgrade_preserves_phase3_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0039_phase8c_manifest_orphan_scan"
+            "0040_phase9a_training_completion_export"
         )
 
 
@@ -1051,7 +1110,7 @@ def test_phase5_upgrades_existing_0006_database_to_head(
         assert "managed_models" in tables
         assert "storage_transfer_jobs" in tables
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0039_phase8c_manifest_orphan_scan"
+            "0040_phase9a_training_completion_export"
         )
 
 
@@ -1072,7 +1131,7 @@ def test_phase5_heartbeat_migration_upgrades_existing_0007_database(
             "current_file_transferred_bytes",
         }.issubset(columns)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0039_phase8c_manifest_orphan_scan"
+            "0040_phase9a_training_completion_export"
         )
 
 
@@ -1120,7 +1179,7 @@ def test_phase5_progress_migration_upgrades_existing_0008_database(
         ).one()
         assert row == ("running", 0, 0)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0039_phase8c_manifest_orphan_scan"
+            "0040_phase9a_training_completion_export"
         )
 
 
@@ -1147,7 +1206,7 @@ def test_phase5_progress_downgrade_and_reupgrade(test_workspace: Path) -> None:
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0039_phase8c_manifest_orphan_scan"
+            "0040_phase9a_training_completion_export"
         )
 
 

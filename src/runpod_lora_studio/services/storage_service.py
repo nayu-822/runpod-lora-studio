@@ -28,6 +28,8 @@ from runpod_lora_studio.domain.storage_models import (
     ModelType,
     OverwritePolicy,
     ProjectStorageSettings,
+    RemoteSnapshotProvenance,
+    StorageArtifactFile,
     StorageEntry,
     StorageKind,
     StorageRemote,
@@ -45,9 +47,11 @@ from runpod_lora_studio.domain.storage_models import (
 )
 from runpod_lora_studio.external.rclone import (
     CancelToken,
+    CommandResult,
     CopyOptions,
     ListOptions,
     RcloneAdapter,
+    RemotePathNotFoundError,
     StorageTransferAdapter,
 )
 from runpod_lora_studio.persistence.database import create_session_factory
@@ -758,6 +762,409 @@ class StorageService:
         self._futures[job_id] = future
         return job_id
 
+    def training_remote_path(
+        self, project_id: UUID, training_run_id: UUID
+    ) -> StorageRemotePath:
+        """Return the deterministic remote root used by Phase 9A exports."""
+        project_settings = self.get_project_storage_settings(project_id)
+        root = StorageRemotePath(
+            self.settings.storage_remote_name, project_settings.training_remote_root
+        )
+        return root.child(str(project_id), str(training_run_id))
+
+    def verify_remote_snapshot(self, snapshot_id: UUID) -> RemoteSnapshotProvenance:
+        """Revalidate the canonical Phase 5 snapshot without copying it again."""
+        record, root = self._validated_snapshot(snapshot_id)
+        project_id = UUID(record.project_id)
+        project_settings = self.get_project_storage_settings(project_id)
+        target = self._snapshot_remote_path(project_id, snapshot_id, project_settings)
+        files = self._snapshot_files(root)
+        statuses = self._verify_remote_snapshot(
+            target,
+            files,
+            str(record.content_sha256),
+            project_settings.verification_policy,
+        )
+        if any(
+            value in {"not_verified", "verification_failed"}
+            for value in statuses.values()
+        ):
+            raise UserFacingError("remote dataset snapshotが検証済みではありません")
+        with self.session_factory() as session:
+            transfer = session.scalar(
+                select(StorageTransferJobRecord)
+                .where(
+                    StorageTransferJobRecord.snapshot_id == str(snapshot_id),
+                    StorageTransferJobRecord.transfer_type
+                    == StorageTransferType.SNAPSHOT_UPLOAD.value,
+                    StorageTransferJobRecord.status == TransferStatus.COMPLETED.value,
+                )
+                .order_by(StorageTransferJobRecord.completed_at.desc())
+            )
+            if transfer is None:
+                raise UserFacingError("remote dataset snapshotの転送履歴がありません")
+            entries = self._remote_entries(target)
+            manifest_entry = entries.get("transfer-manifest.json")
+            if manifest_entry is None:
+                raise UserFacingError("remote dataset snapshot manifestがありません")
+            try:
+                manifest_sha256 = hashlib.sha256(
+                    self.adapter.read_remote_file(
+                        target.child("transfer-manifest.json")
+                    )
+                ).hexdigest()
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise UserFacingError(
+                    "remote dataset snapshot manifestを読めません"
+                ) from exc
+            return RemoteSnapshotProvenance(
+                snapshot_id=snapshot_id,
+                remote_relative_path=target.relative_path,
+                storage_transfer_job_id=UUID(transfer.id),
+                remote_manifest_sha256=manifest_sha256,
+                content_sha256=str(record.content_sha256),
+                verification_level=_manifest_verification_level(
+                    [{"verification_status": value} for value in statuses.values()],
+                    project_settings.verification_policy,
+                ).__str__(),
+            )
+
+    def dry_run_artifact_upload(
+        self,
+        files: tuple[StorageArtifactFile, ...],
+        target: StorageRemotePath,
+        *,
+        overwrite_policy: OverwritePolicy | None = None,
+    ) -> TransferPlan:
+        """Build a deterministic copy plan for an export package."""
+        policy = overwrite_policy or self.settings.storage_overwrite_policy
+        remote_entries = self._remote_entries(target, allow_missing=True)
+        items: list[TransferItemPlan] = []
+        dry_run_errors: list[str] = []
+        for file in files:
+            self._validate_artifact_relative_path(file.relative_path)
+            remote = remote_entries.get(file.relative_path)
+            action = "copy"
+            reason = ""
+            if remote is not None:
+                identical = _remote_file_identical(remote, file.source_path)
+                if policy is OverwritePolicy.FAIL_IF_EXISTS:
+                    action, reason = "conflict", "remoteに同名ファイルがあります"
+                elif identical:
+                    action, reason = "skip", "サイズとハッシュ一致"
+                elif policy is OverwritePolicy.COPY_MISSING:
+                    action, reason = "conflict", "remoteに同名ファイルがあります"
+                elif policy is OverwritePolicy.OVERWRITE_CHANGED:
+                    action, reason = "copy", "変更されたremoteを明示的に上書き"
+                else:
+                    action, reason = "conflict", "remote内容を同一と確認できません"
+            items.append(
+                TransferItemPlan(file.relative_path, file.size_bytes, action, reason)
+            )
+            if action == "copy":
+                try:
+                    adapter_plan = self.adapter.dry_run_copy(
+                        file.source_path,
+                        target.child(file.relative_path),
+                        CopyOptions(
+                            overwrite_policy=policy,
+                            dry_run=True,
+                            checksum=self.settings.storage_use_checksum,
+                        ),
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    dry_run_errors.append(
+                        f"dry-run failed for {file.relative_path}: {exc}"
+                    )
+                else:
+                    dry_run_errors.extend(adapter_plan.errors)
+        token = _stable_hash(
+            {
+                "target": target.rclone_value,
+                "overwrite_policy": policy.value,
+                "files": [
+                    {
+                        "relative_path": file.relative_path,
+                        "size": file.size_bytes,
+                        "sha256": file.sha256,
+                    }
+                    for file in files
+                ],
+                "remote": [
+                    {
+                        "relative_path": relative,
+                        "size": entry.size_bytes,
+                        "hash_type": entry.hash_type,
+                        "hash": entry.hash_value,
+                        "modified_at": entry.modified_at.isoformat()
+                        if entry.modified_at
+                        else None,
+                    }
+                    for relative, entry in sorted(remote_entries.items())
+                ],
+            }
+        )
+        return TransferPlan(
+            token=token,
+            source="local-export",
+            destination=target.rclone_value,
+            items=tuple(items),
+            total_bytes=sum(item.size_bytes for item in items if item.action == "copy"),
+            available_bytes=shutil.disk_usage(self.transfer_root).free
+            if self.transfer_root.exists()
+            else None,
+            errors=(
+                *(
+                    ("remoteに衝突するファイルがあります",)
+                    if any(item.action == "conflict" for item in items)
+                    else ()
+                ),
+                *dry_run_errors,
+            ),
+        )
+
+    def upload_artifact_files(
+        self,
+        *,
+        project_id: UUID,
+        training_run_id: UUID,
+        files: tuple[StorageArtifactFile, ...],
+        target: StorageRemotePath,
+        plan_token: str | None = None,
+        overwrite_policy: OverwritePolicy | None = None,
+        verification_policy: VerificationPolicy | None = None,
+        cancel_token: CancelToken | None = None,
+        _job_id: UUID | None = None,
+    ) -> UUID:
+        """Upload non-marker export files through the existing transfer engine."""
+        plan = self.dry_run_artifact_upload(
+            files, target, overwrite_policy=overwrite_policy
+        )
+        if plan_token is not None and plan.token != plan_token:
+            raise UserFacingError("成果物のプレビュー内容が変更されています")
+        if plan.errors:
+            raise UserFacingError("成果物remoteに衝突があります")
+        policy = overwrite_policy or self.settings.storage_overwrite_policy
+        verify_policy = verification_policy or self.settings.storage_verification_policy
+        self.transfer_root.mkdir(parents=True, exist_ok=True)
+        with self.session_factory() as session:
+            repository = StorageRepository(session)
+            job = None
+            if _job_id is None:
+                job = repository.create_job(
+                    project_id=project_id,
+                    snapshot_id=None,
+                    training_run_id=training_run_id,
+                    transfer_type=StorageTransferType.ARTIFACT_UPLOAD,
+                    source_kind=StorageKind.LOCAL,
+                    destination_kind=StorageKind.REMOTE,
+                    item_count=len(files),
+                    total_bytes=plan.total_bytes,
+                )
+            session.commit()
+            job_id = _job_id or UUID(job.id)  # type: ignore[union-attr]
+        token = cancel_token or CancelToken()
+        self._cancel_tokens[job_id] = token
+        manifest_items: list[dict[str, Any]] = []
+        try:
+            self._set_job_running(job_id)
+            for index, file in enumerate(files, start=1):
+                self._raise_if_canceled(job_id, token)
+                action = next(
+                    item.action
+                    for item in plan.items
+                    if item.relative_path == file.relative_path
+                )
+                with self.session_factory() as session:
+                    item_record = StorageRepository(session).add_item_if_missing(
+                        job_id=job_id,
+                        relative_path=file.relative_path,
+                        item_type="training_export_file",
+                        direction=TransferDirection.UPLOAD,
+                        expected_size=file.size_bytes,
+                        source_sha256=file.sha256,
+                    )
+                    if action == "skip":
+                        item_record.status = TransferStatus.COMPLETED.value
+                        item_record.verification_status = "remote_hash_and_size"
+                        item_record.transferred_size = file.size_bytes
+                        session.commit()
+                        manifest_items.append(
+                            self._artifact_manifest_item(
+                                file, "skipped", "remote_hash_and_size"
+                            )
+                        )
+                        self._update_job(
+                            job_id, index, succeeded=0, skipped=1, transferred=0
+                        )
+                        continue
+                self._set_current_file(job_id, file.size_bytes)
+                result = self._copy_artifact_with_retry(
+                    job_id,
+                    file,
+                    target,
+                    policy,
+                    token,
+                )
+                if result.returncode != 0:
+                    self._update_transfer_item(
+                        job_id,
+                        file.relative_path,
+                        file.size_bytes,
+                        TransferStatus.FAILED.value,
+                        "not_verified",
+                    )
+                    manifest_items.append(
+                        self._artifact_manifest_item(
+                            file, TransferStatus.FAILED.value, "not_verified"
+                        )
+                    )
+                    self._update_job(
+                        job_id,
+                        index,
+                        succeeded=0,
+                        failed=1,
+                        skipped=0,
+                        transferred=0,
+                    )
+                    raise UserFacingError("学習成果物の転送に失敗しました")
+                self._update_transfer_item(
+                    job_id,
+                    file.relative_path,
+                    file.size_bytes,
+                    TransferStatus.COMPLETED.value,
+                    "not_verified",
+                )
+                manifest_items.append(
+                    self._artifact_manifest_item(file, "completed", "not_verified")
+                )
+                self._complete_current_file(job_id, file.size_bytes)
+                self._update_job(job_id, index, succeeded=1, skipped=0, transferred=0)
+            self._verify_remote_artifact_files(
+                target, files, verify_policy, require_manifest=False
+            )
+            verified_entries = self._remote_entries(target)
+            for item in manifest_items:
+                entry = verified_entries.get(str(item["relative_path"]))
+                item["verification_status"] = self._artifact_verification_status(
+                    verify_policy, entry
+                )
+                if entry is not None:
+                    item["remote_hash_type"] = entry.hash_type
+                    item["remote_hash"] = entry.hash_value
+                    item["remote_size"] = entry.size_bytes
+                    item["remote_modified_at"] = (
+                        entry.modified_at.isoformat()
+                        if entry.modified_at is not None
+                        else None
+                    )
+                self._update_transfer_item(
+                    job_id,
+                    str(item["relative_path"]),
+                    int(item["size"]),
+                    str(item["transfer_status"]),
+                    str(item["verification_status"]),
+                )
+            manifest = self._write_artifact_transfer_manifest(
+                job_id, project_id, training_run_id, target, manifest_items
+            )
+            manifest_result = self.adapter.copy(
+                manifest,
+                target.child("transfer-manifest.json"),
+                CopyOptions(overwrite_policy=policy, checksum=True),
+                cancel_token=token,
+                process_callback=lambda pid: self._set_rclone_pid(job_id, pid),
+            )
+            if manifest_result.returncode != 0:
+                raise UserFacingError("成果物転送マニフェストの保存に失敗しました")
+            if verify_policy is VerificationPolicy.SIZE_AND_MANIFEST or (
+                verify_policy is VerificationPolicy.REMOTE_HASH_AND_SIZE
+                and self.settings.storage_remote_hash_fallback == "size_and_manifest"
+            ):
+                self._verify_remote_artifact_manifest(target, files)
+            self._finish_job(job_id, TransferStatus.COMPLETED, manifest)
+            return job_id
+        except Exception as exc:
+            status = (
+                TransferStatus.CANCELED if token.cancelled else TransferStatus.FAILED
+            )
+            manifest = None
+            if manifest_items:
+                manifest = self._write_artifact_transfer_manifest(
+                    job_id, project_id, training_run_id, target, manifest_items, status
+                )
+            self._finish_job(job_id, status, manifest, "成果物転送に失敗しました")
+            if isinstance(exc, UserFacingError):
+                raise
+            raise UserFacingError("成果物転送に失敗しました") from exc
+        finally:
+            self._cancel_tokens.pop(job_id, None)
+
+    def verify_remote_artifact_files(
+        self,
+        target: StorageRemotePath,
+        files: tuple[StorageArtifactFile, ...],
+        verification_policy: VerificationPolicy | None = None,
+    ) -> None:
+        self._verify_remote_artifact_files(
+            target,
+            files,
+            verification_policy or self.settings.storage_verification_policy,
+        )
+
+    def _copy_artifact_with_retry(
+        self,
+        job_id: UUID,
+        file: StorageArtifactFile,
+        target: StorageRemotePath,
+        policy: OverwritePolicy,
+        token: CancelToken,
+    ) -> CommandResult:
+        attempts = max(1, self.settings.rclone_retries + 1)
+        result = CommandResult(1, "", "artifact transfer did not run")
+        for attempt in range(1, attempts + 1):
+            self._raise_if_canceled(job_id, token)
+            self._update_artifact_retry(
+                job_id, file.relative_path, attempt, None, 0.0, None
+            )
+            result = self.adapter.copy(
+                file.source_path,
+                target.child(file.relative_path),
+                CopyOptions(
+                    overwrite_policy=policy,
+                    checksum=self.settings.storage_use_checksum,
+                ),
+                progress_callback=lambda progress: self._progress_job(job_id, progress),
+                cancel_token=token,
+                process_callback=lambda pid: self._set_rclone_pid(job_id, pid),
+            )
+            if result.returncode == 0:
+                self._update_artifact_retry(
+                    job_id, file.relative_path, attempt, None, 0.0, result.returncode
+                )
+                return result
+            classification = _error_classification(
+                result.stderr, timed_out=result.timed_out
+            )
+            delay = min(
+                self.settings.storage_retry_max_backoff_seconds,
+                self.settings.rclone_retry_interval_seconds * (2 ** (attempt - 1)),
+            )
+            self._update_artifact_retry(
+                job_id,
+                file.relative_path,
+                attempt,
+                classification,
+                delay if attempt < attempts else 0.0,
+                result.returncode,
+            )
+            if attempt == attempts or not _retryable(
+                result.stderr, timed_out=result.timed_out
+            ):
+                return result
+            self._sleep_before_retry(delay, token)
+        return result
+
     def list_jobs(self, project_id: UUID | None = None) -> list[StorageTransferJob]:
         with self.session_factory() as session:
             return StorageRepository(session).list_jobs(project_id)
@@ -1077,7 +1484,9 @@ class StorageService:
             raise UserFacingError("スナップショットに転送対象ファイルがありません")
         return files
 
-    def _remote_entries(self, target: StorageRemotePath) -> dict[str, StorageEntry]:
+    def _remote_entries(
+        self, target: StorageRemotePath, *, allow_missing: bool = False
+    ) -> dict[str, StorageEntry]:
         try:
             return {
                 entry.remote_path.relative_path[len(target.relative_path) :].strip(
@@ -1087,6 +1496,10 @@ class StorageService:
                     target, ListOptions(recursive=True, page_size=10000)
                 )
             }
+        except RemotePathNotFoundError:
+            if allow_missing:
+                return {}
+            raise UserFacingError("remoteのファイル一覧を取得できません") from None
         except (OSError, RuntimeError, ValueError) as exc:
             raise UserFacingError("remoteのファイル一覧を取得できません") from exc
 
@@ -1745,6 +2158,43 @@ class StorageService:
                 item.verification_status = verification
                 session.commit()
 
+    def _update_artifact_retry(
+        self,
+        job_id: UUID,
+        relative: str,
+        attempt: int,
+        classification: str | None,
+        backoff_seconds: float,
+        exit_code: int | None,
+    ) -> None:
+        with self.session_factory() as session:
+            item = session.scalar(
+                select(TransferItemRecord).where(
+                    TransferItemRecord.transfer_job_id == str(job_id),
+                    TransferItemRecord.relative_path == relative,
+                )
+            )
+            if item is not None:
+                item.retry_count = max(0, attempt - 1)
+                if classification:
+                    item.error_summary = (
+                        f"attempt={attempt}; classification={classification}; "
+                        f"backoff_seconds={backoff_seconds:.3f}; "
+                        f"exit_code={exit_code if exit_code is not None else 'none'}"
+                    )
+                else:
+                    item.error_summary = None
+            job = StorageRepository(session).get_job(job_id)
+            if job is not None:
+                job.current_step = (
+                    f"artifact retry attempt={attempt} "
+                    f"classification={classification or 'none'} "
+                    f"backoff={backoff_seconds:.3f}"
+                )
+                job.heartbeat_at = datetime.now(UTC)
+                job.updated_at = datetime.now(UTC)
+            session.commit()
+
     def _finish_job(
         self,
         job_id: UUID,
@@ -1847,6 +2297,167 @@ class StorageService:
         )
         return path
 
+    def _write_artifact_transfer_manifest(
+        self,
+        job_id: UUID,
+        project_id: UUID,
+        training_run_id: UUID,
+        target: StorageRemotePath,
+        items: list[dict[str, Any]],
+        status: TransferStatus = TransferStatus.COMPLETED,
+    ) -> Path:
+        path = self.transfer_root / "manifests" / f"{job_id}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": "phase9a-artifact-transfer-v1",
+            "transfer_job_id": str(job_id),
+            "transfer_type": StorageTransferType.ARTIFACT_UPLOAD.value,
+            "project_id": str(project_id),
+            "training_run_id": str(training_run_id),
+            "destination": target.rclone_value,
+            "status": status.value,
+            "item_count": len(items),
+            "success_count": sum(
+                item.get("transfer_status") == "completed" for item in items
+            ),
+            "failure_count": sum(
+                item.get("transfer_status") == "failed" for item in items
+            ),
+            "skipped_count": sum(
+                item.get("transfer_status") == "skipped" for item in items
+            ),
+            "items": items,
+        }
+        _write_json_durable(path, payload)
+        return path
+
+    @staticmethod
+    def _artifact_manifest_item(
+        file: StorageArtifactFile, status: str, verification: str
+    ) -> dict[str, Any]:
+        return {
+            "relative_path": file.relative_path,
+            "size": file.size_bytes,
+            "local_sha256": file.sha256,
+            "transfer_status": status,
+            "verification_status": verification,
+            "remote_hash_type": None,
+            "remote_hash": None,
+            "remote_size": None,
+            "remote_modified_at": None,
+        }
+
+    def _validate_artifact_relative_path(self, relative_path: str) -> None:
+        normalized = relative_path.replace("\\", "/")
+        if (
+            not normalized
+            or normalized.startswith("/")
+            or Path(normalized).is_absolute()
+            or any(part in {"", ".", ".."} for part in normalized.split("/"))
+            or any(ord(char) < 32 for char in normalized)
+        ):
+            raise UserFacingError("成果物相対パスが不正です")
+
+    def _verify_remote_artifact_files(
+        self,
+        target: StorageRemotePath,
+        files: tuple[StorageArtifactFile, ...],
+        verification_policy: VerificationPolicy,
+        *,
+        require_manifest: bool = True,
+    ) -> None:
+        entries = self._remote_entries(target)
+        for file in files:
+            entry = entries.get(file.relative_path)
+            if entry is None or entry.size_bytes != file.size_bytes:
+                raise UserFacingError("remote成果物のサイズ検証に失敗しました")
+            if verification_policy is VerificationPolicy.EXISTENCE_ONLY:
+                continue
+            if verification_policy is VerificationPolicy.SIZE_AND_MANIFEST:
+                continue
+            if entry.hash_type and entry.hash_value:
+                if verification_policy is VerificationPolicy.FULL_CHECKSUM:
+                    if _hash_algorithm(entry.hash_type) != "sha256":
+                        raise UserFacingError("remote SHA-256を取得できません")
+                    if not _hash_matches(
+                        file.source_path, entry.hash_type, entry.hash_value
+                    ):
+                        raise UserFacingError("remote成果物のSHA-256検証に失敗しました")
+                elif not _remote_file_identical(entry, file.source_path):
+                    raise UserFacingError("remote成果物のハッシュ検証に失敗しました")
+                continue
+            if self.settings.storage_remote_hash_fallback == "size_and_manifest":
+                continue
+            if self.settings.storage_remote_hash_fallback == "existence_only":
+                continue
+            raise UserFacingError("remote成果物のハッシュを取得できません")
+        if require_manifest and (
+            verification_policy is VerificationPolicy.SIZE_AND_MANIFEST
+            or (
+                verification_policy is VerificationPolicy.REMOTE_HASH_AND_SIZE
+                and self.settings.storage_remote_hash_fallback == "size_and_manifest"
+            )
+        ):
+            self._verify_remote_artifact_manifest(target, files)
+
+    @staticmethod
+    def _artifact_verification_status(
+        policy: VerificationPolicy, entry: StorageEntry | None
+    ) -> str:
+        if policy is VerificationPolicy.EXISTENCE_ONLY:
+            return "existence_only"
+        if policy is VerificationPolicy.SIZE_AND_MANIFEST:
+            return "manifest_metadata_and_size"
+        if policy is VerificationPolicy.FULL_CHECKSUM:
+            return "full_checksum"
+        if entry is not None and entry.hash_type and entry.hash_value:
+            return "remote_hash_and_size"
+        return "manifest_metadata_and_size"
+
+    def _verify_remote_artifact_manifest(
+        self,
+        target: StorageRemotePath,
+        files: tuple[StorageArtifactFile, ...],
+    ) -> None:
+        try:
+            entries = self._remote_entries(target)
+            manifest_entry = entries.get("transfer-manifest.json")
+            if manifest_entry is None:
+                raise ValueError("artifact transfer manifest is missing")
+            raw = self.adapter.read_remote_file(target.child("transfer-manifest.json"))
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError("artifact transfer manifest is invalid")
+            if payload.get("schema_version") != "phase9a-artifact-transfer-v1":
+                raise ValueError("artifact transfer manifest schema is invalid")
+            expected = {
+                file.relative_path: {
+                    "size": file.size_bytes,
+                    "local_sha256": file.sha256,
+                }
+                for file in files
+            }
+            actual = {
+                str(item["relative_path"]): item
+                for item in payload.get("items", [])
+                if isinstance(item, dict) and item.get("relative_path")
+            }
+            if set(actual) != set(expected):
+                raise ValueError("artifact transfer manifest item set is invalid")
+            for relative, expected_item in expected.items():
+                item = actual[relative]
+                if (
+                    item.get("size") != expected_item["size"]
+                    or item.get("local_sha256") != expected_item["local_sha256"]
+                    or item.get("transfer_status") not in {"completed", "skipped"}
+                    or item.get("verification_status") != "manifest_metadata_and_size"
+                ):
+                    raise ValueError("artifact transfer manifest item is invalid")
+            if manifest_entry.size_bytes != len(raw):
+                raise ValueError("artifact transfer manifest size is invalid")
+        except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+            raise UserFacingError("成果物転送マニフェストを検証できません") from None
+
     @staticmethod
     def _manifest_item(
         relative: str, size: int, digest: str, status: str, verification: str
@@ -1868,6 +2479,30 @@ class StorageService:
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _write_json_durable(path: Path, value: object) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        encoded = (
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except (AttributeError, OSError):
+            return
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _manifest_dict(manifest: TransferManifest) -> dict[str, Any]:
