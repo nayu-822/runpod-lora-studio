@@ -138,6 +138,12 @@ PART_CLEANUP_ITEM_STATUSES = frozenset(
 PART_CLEANUP_BATCH_SIZE = 32
 STALE_JOB_BATCH_SIZE = 32
 MANIFEST_REPAIR_INTENT_PREFIX = "MANIFEST_REPAIR_PENDING:"
+MANIFEST_FINAL_NAME_RE = re.compile(r"manifest-g[0-9]+-[0-9a-f]{12}\.json")
+MANIFEST_ARTIFACT_NAME_RE = re.compile(
+    r"(?:manifest-g[0-9]+-[0-9a-f]{12}\.json|"
+    r"\.manifest-g[0-9]+-[0-9a-f]{12}\.json\.tmp)"
+)
+MANIFEST_ORPHAN_CLEANUP_WARNING = "MANIFEST_ORPHAN_CLEANUP_FAILED"
 MANIFEST_FINALIZATION_STATES = frozenset(
     {
         ManifestRepairState.PENDING.value,
@@ -288,6 +294,13 @@ class _ManifestDirectoryHandle:
 
 
 @dataclass(frozen=True, slots=True)
+class _TerminalManifestOrphanJob:
+    job_id: str
+    project_id: str
+    manifest_relative_path: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class _AcquisitionCountsSnapshot:
     item_count: int
     pending_count: int
@@ -408,6 +421,9 @@ class ImageAcquisitionDownloadService:
                     include_pending=True,
                 )
                 self.reconcile_manifest_repairs()
+                self.reconcile_terminal_manifest_orphans(
+                    time_budget_seconds=self.settings.image_download_cleanup_time_budget_seconds,
+                )
             except Exception:
                 logger.exception("acquisition_cleanup_scheduler_failed")
 
@@ -4948,11 +4964,7 @@ class ImageAcquisitionDownloadService:
     def _cleanup_unreferenced_manifest_artifacts(
         self, directory: _ManifestDirectoryHandle, keep_name: str
     ) -> bool:
-        artifact_pattern = re.compile(
-            r"(?:manifest-g[0-9]+-[0-9a-f]{12}\.json|"
-            r"\.manifest-g[0-9]+-[0-9a-f]{12}\.json\.tmp)"
-        )
-        if not re.fullmatch(r"manifest-g[0-9]+-[0-9a-f]{12}\.json", keep_name):
+        if MANIFEST_FINAL_NAME_RE.fullmatch(keep_name) is None:
             return False
         try:
             if not self._manifest_directory_identity_matches(directory):
@@ -4961,7 +4973,10 @@ class ImageAcquisitionDownloadService:
                 self._manifest_artifact_identity_fd(keep_name, directory.fd)
                 names = os.listdir(directory.fd)
                 for name in names:
-                    if name == keep_name or artifact_pattern.fullmatch(name) is None:
+                    if (
+                        name == keep_name
+                        or MANIFEST_ARTIFACT_NAME_RE.fullmatch(name) is None
+                    ):
                         continue
                     try:
                         metadata = os.stat(
@@ -4990,7 +5005,7 @@ class ImageAcquisitionDownloadService:
                 for path in directory.manifest_dir.iterdir():
                     if (
                         path.name == keep_name
-                        or artifact_pattern.fullmatch(path.name) is None
+                        or MANIFEST_ARTIFACT_NAME_RE.fullmatch(path.name) is None
                     ):
                         continue
                     self._validate_manifest_file(path, regular=True)
@@ -5001,6 +5016,342 @@ class ImageAcquisitionDownloadService:
         except (AcquisitionDownloadError, OSError, ValueError):
             logger.warning("acquisition_manifest_cleanup_failed error_type=OSError")
             return False
+
+    @staticmethod
+    def _manifest_reference_name(job_id: str, relative_path: str | None) -> str | None:
+        if relative_path is None:
+            return None
+        relative = Path(relative_path)
+        parts = relative.parts
+        if (
+            relative.is_absolute()
+            or relative_path != "/".join(parts)
+            or len(parts) != 5
+            or any(part in {"", ".", ".."} for part in parts)
+            or parts[:2] != ("acquisition", "jobs")
+            or parts[2] != job_id
+            or parts[3] != "manifests"
+            or MANIFEST_FINAL_NAME_RE.fullmatch(parts[4]) is None
+        ):
+            raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
+        return parts[4]
+
+    def _load_terminal_manifest_orphan_job(
+        self, job_id: str
+    ) -> _TerminalManifestOrphanJob | None:
+        try:
+            with self.session_factory() as session:
+                row = (
+                    session.execute(
+                        select(
+                            ImageAcquisitionJobRecord.id,
+                            ImageAcquisitionJobRecord.project_id,
+                            ImageAcquisitionJobRecord.status,
+                            ImageAcquisitionJobRecord.completed_at,
+                            ImageAcquisitionJobRecord.manifest_relative_path,
+                            ImageAcquisitionJobRecord.manifest_repair_state,
+                            ImageAcquisitionJobRecord.worker_id,
+                            ImageAcquisitionJobRecord.claim_token,
+                            ImageAcquisitionJobRecord.current_item_id,
+                            ImageAcquisitionJobRecord.active_key,
+                        ).where(ImageAcquisitionJobRecord.id == job_id)
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+        except SQLAlchemyError:
+            logger.warning("acquisition_manifest_orphan_database_error")
+            return None
+        if row is None:
+            return None
+        if (
+            row["status"] not in TERMINAL_JOB_STATUS_VALUES
+            or row["completed_at"] is None
+            or row["manifest_repair_state"] is not None
+            or row["worker_id"] is not None
+            or row["claim_token"] is not None
+            or row["current_item_id"] is not None
+            or row["active_key"] is not None
+        ):
+            return None
+        project_id = str(row["project_id"])
+        try:
+            if str(UUID(job_id)) != job_id or str(UUID(project_id)) != project_id:
+                return None
+        except ValueError:
+            return None
+        return _TerminalManifestOrphanJob(
+            job_id=job_id,
+            project_id=project_id,
+            manifest_relative_path=(
+                str(row["manifest_relative_path"])
+                if row["manifest_relative_path"] is not None
+                else None
+            ),
+        )
+
+    def _set_manifest_orphan_warning(self, job_id: str) -> None:
+        try:
+            with self.session_factory() as session:
+                session.execute(
+                    update(ImageAcquisitionJobRecord)
+                    .where(
+                        ImageAcquisitionJobRecord.id == job_id,
+                        ImageAcquisitionJobRecord.status.in_(
+                            TERMINAL_JOB_STATUS_VALUES
+                        ),
+                        ImageAcquisitionJobRecord.completed_at.is_not(None),
+                        ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
+                        ImageAcquisitionJobRecord.worker_id.is_(None),
+                        ImageAcquisitionJobRecord.claim_token.is_(None),
+                        ImageAcquisitionJobRecord.current_item_id.is_(None),
+                        ImageAcquisitionJobRecord.active_key.is_(None),
+                    )
+                    .values(
+                        manifest_warning=MANIFEST_ORPHAN_CLEANUP_WARNING,
+                        updated_at=datetime.now(UTC),
+                    )
+                )
+                session.commit()
+        except SQLAlchemyError:
+            logger.warning("acquisition_manifest_orphan_warning_persist_failed")
+
+    def _clear_manifest_orphan_warning(self, job_id: str) -> None:
+        try:
+            with self.session_factory() as session:
+                session.execute(
+                    update(ImageAcquisitionJobRecord)
+                    .where(
+                        ImageAcquisitionJobRecord.id == job_id,
+                        ImageAcquisitionJobRecord.status.in_(
+                            TERMINAL_JOB_STATUS_VALUES
+                        ),
+                        ImageAcquisitionJobRecord.completed_at.is_not(None),
+                        ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
+                        ImageAcquisitionJobRecord.worker_id.is_(None),
+                        ImageAcquisitionJobRecord.claim_token.is_(None),
+                        ImageAcquisitionJobRecord.current_item_id.is_(None),
+                        ImageAcquisitionJobRecord.active_key.is_(None),
+                        ImageAcquisitionJobRecord.manifest_warning
+                        == MANIFEST_ORPHAN_CLEANUP_WARNING,
+                    )
+                    .values(
+                        manifest_warning=None,
+                        updated_at=datetime.now(UTC),
+                    )
+                )
+                session.commit()
+        except SQLAlchemyError:
+            logger.warning("acquisition_manifest_orphan_warning_clear_failed")
+
+    def _cleanup_terminal_manifest_orphan_job(
+        self, job: _TerminalManifestOrphanJob
+    ) -> tuple[int, bool]:
+        try:
+            keep_name = self._manifest_reference_name(
+                job.job_id, job.manifest_relative_path
+            )
+            project_root = self._manifest_project_root(job.project_id)
+            manifest_dir = (
+                project_root / "acquisition" / "jobs" / job.job_id / "manifests"
+            )
+            self._validate_manifest_directory(
+                project_root,
+                manifest_dir,
+                create_missing=False,
+                allow_missing=True,
+            )
+            try:
+                manifest_mode = os.lstat(manifest_dir).st_mode
+            except FileNotFoundError:
+                return 0, True
+            if stat.S_ISLNK(manifest_mode) or not stat.S_ISDIR(manifest_mode):
+                raise AcquisitionDownloadError(DownloadFailureCode.STAGING_PATH_INVALID)
+
+            with self._open_manifest_directory(
+                job.project_id, job.job_id, create_missing=False
+            ) as directory:
+                if not self._manifest_directory_identity_matches(directory):
+                    return 0, False
+                if directory.fd >= 0:
+                    names = os.listdir(directory.fd)
+                    candidates = [
+                        name
+                        for name in names
+                        if name != keep_name
+                        and MANIFEST_ARTIFACT_NAME_RE.fullmatch(name) is not None
+                    ]
+                    for name in candidates:
+                        try:
+                            metadata = os.stat(
+                                name,
+                                dir_fd=directory.fd,
+                                follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            continue
+                        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(
+                            metadata.st_mode
+                        ):
+                            return 0, False
+                    removed_count = 0
+                    for name in candidates:
+                        current = self._load_terminal_manifest_orphan_job(job.job_id)
+                        if current is None or current.project_id != job.project_id:
+                            return removed_count, False
+                        try:
+                            current_keep_name = self._manifest_reference_name(
+                                current.job_id, current.manifest_relative_path
+                            )
+                        except AcquisitionDownloadError:
+                            return removed_count, False
+                        if current_keep_name == name:
+                            continue
+                        if not self._manifest_directory_identity_matches(directory):
+                            return removed_count, False
+                        try:
+                            metadata = os.stat(
+                                name,
+                                dir_fd=directory.fd,
+                                follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            continue
+                        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(
+                            metadata.st_mode
+                        ):
+                            return removed_count, False
+                        try:
+                            os.unlink(name, dir_fd=directory.fd)
+                        except FileNotFoundError:
+                            continue
+                        removed_count += 1
+                    if removed_count:
+                        self._fsync_manifest_directory(
+                            directory.manifest_dir, directory.fd
+                        )
+                    return (
+                        removed_count,
+                        self._manifest_directory_identity_matches(directory),
+                    )
+
+                names = [path.name for path in directory.manifest_dir.iterdir()]
+                candidates = [
+                    name
+                    for name in names
+                    if name != keep_name
+                    and MANIFEST_ARTIFACT_NAME_RE.fullmatch(name) is not None
+                ]
+                for name in candidates:
+                    path = directory.manifest_dir / name
+                    try:
+                        self._validate_manifest_file(path, regular=True)
+                    except OSError:
+                        if not path.exists():
+                            continue
+                        return 0, False
+                    if path.is_symlink():
+                        return 0, False
+                removed_count = 0
+                for name in candidates:
+                    current = self._load_terminal_manifest_orphan_job(job.job_id)
+                    if current is None or current.project_id != job.project_id:
+                        return removed_count, False
+                    try:
+                        current_keep_name = self._manifest_reference_name(
+                            current.job_id, current.manifest_relative_path
+                        )
+                    except AcquisitionDownloadError:
+                        return removed_count, False
+                    if current_keep_name == name:
+                        continue
+                    self._validate_manifest_directory(
+                        directory.project_root,
+                        directory.manifest_dir,
+                        create_missing=False,
+                    )
+                    path = directory.manifest_dir / name
+                    try:
+                        self._validate_manifest_file(path, regular=True)
+                    except OSError:
+                        if not path.exists():
+                            continue
+                        return removed_count, False
+                    if path.is_symlink():
+                        return removed_count, False
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        continue
+                    removed_count += 1
+                if removed_count:
+                    self._fsync_manifest_directory(directory.manifest_dir)
+                return removed_count, True
+        except (AcquisitionDownloadError, OSError, ValueError) as exc:
+            logger.warning(
+                "acquisition_manifest_orphan_reconciliation_failed error_type=%s",
+                type(exc).__name__,
+            )
+            return 0, False
+
+    def reconcile_terminal_manifest_orphans(
+        self,
+        *,
+        limit: int = STALE_JOB_BATCH_SIZE,
+        time_budget_seconds: float | None = None,
+    ) -> int:
+        if limit <= 0 or (time_budget_seconds is not None and time_budget_seconds <= 0):
+            return 0
+        started_at = self.clock()
+        try:
+            with self.session_factory() as session:
+                job_ids = session.scalars(
+                    select(ImageAcquisitionJobRecord.id)
+                    .where(
+                        ImageAcquisitionJobRecord.status.in_(
+                            TERMINAL_JOB_STATUS_VALUES
+                        ),
+                        ImageAcquisitionJobRecord.completed_at.is_not(None),
+                        ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
+                        ImageAcquisitionJobRecord.worker_id.is_(None),
+                        ImageAcquisitionJobRecord.claim_token.is_(None),
+                        ImageAcquisitionJobRecord.current_item_id.is_(None),
+                        ImageAcquisitionJobRecord.active_key.is_(None),
+                    )
+                    .order_by(
+                        ImageAcquisitionJobRecord.updated_at,
+                        ImageAcquisitionJobRecord.id,
+                    )
+                    .limit(limit)
+                ).all()
+        except OperationalError as exc:
+            if "no such table: image_acquisition_jobs" not in str(exc):
+                raise
+            logger.warning("acquisition_manifest_orphan_table_not_migrated")
+            return 0
+
+        removed_count = 0
+        for raw_job_id in job_ids:
+            if (
+                time_budget_seconds is not None
+                and self.clock() - started_at >= time_budget_seconds
+            ):
+                break
+            job = self._load_terminal_manifest_orphan_job(str(raw_job_id))
+            if job is None:
+                continue
+            try:
+                self._manifest_reference_name(job.job_id, job.manifest_relative_path)
+            except AcquisitionDownloadError:
+                self._set_manifest_orphan_warning(job.job_id)
+                continue
+            removed, success = self._cleanup_terminal_manifest_orphan_job(job)
+            if success:
+                self._clear_manifest_orphan_warning(job.job_id)
+                removed_count += removed
+            else:
+                self._set_manifest_orphan_warning(job.job_id)
+        return removed_count
 
     def _begin_manifest_finalization(
         self,

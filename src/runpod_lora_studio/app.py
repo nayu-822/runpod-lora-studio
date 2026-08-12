@@ -115,6 +115,9 @@ def create_app(
         time_budget_seconds=runtime_settings.image_download_cleanup_time_budget_seconds,
     )
     acquisition_download.reconcile_manifest_repairs()
+    acquisition_download.reconcile_terminal_manifest_orphans(
+        time_budget_seconds=runtime_settings.image_download_cleanup_time_budget_seconds,
+    )
     acquisition_download.start_cleanup_scheduler()
     atexit.register(acquisition_download.stop_cleanup_scheduler)
     path_rows = build_paths_dataframe(runtime_settings)

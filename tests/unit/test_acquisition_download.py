@@ -1717,6 +1717,237 @@ def test_old_worker_cannot_remove_new_manifest_for_any_terminal_status(
     assert not list(manifest_dir.glob(".*.tmp"))
 
 
+def test_terminal_manifest_orphan_reconciliation_keeps_db_reference(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1342-orphan", _png_bytes((80, 30, 190)))
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    job_id = service.start_job(plan_id, auto_start=False)
+    service.run_job_sync(job_id)
+
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None and stored_job.manifest_relative_path is not None
+        project_root = settings.projects_dir / stored_job.project_id
+        manifest = project_root / stored_job.manifest_relative_path
+    manifest_dir = manifest.parent
+    orphan_final = manifest_dir / "manifest-g999-deadbeefdead.json"
+    orphan_temp = manifest_dir / ".manifest-g998-cafebabecafe.json.tmp"
+    orphan_final.write_text("{}", encoding="utf-8")
+    orphan_temp.write_text("{}", encoding="utf-8")
+
+    assert (
+        service.reconcile_terminal_manifest_orphans(limit=1, time_budget_seconds=5.0)
+        == 2
+    )
+    assert manifest.is_file()
+    assert not orphan_final.exists()
+    assert not orphan_temp.exists()
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert stored_job.manifest_relative_path is not None
+        assert stored_job.manifest_warning is None
+        valid_relative_path = stored_job.manifest_relative_path
+        stored_job.manifest_relative_path = "../outside/manifest-g1-invalid.json"
+        session.commit()
+
+    assert (
+        service.reconcile_terminal_manifest_orphans(limit=1, time_budget_seconds=5.0)
+        == 0
+    )
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None
+        assert (
+            stored_job.manifest_warning
+            == acquisition_download_module.MANIFEST_ORPHAN_CLEANUP_WARNING
+        )
+        assert str(test_workspace) not in stored_job.manifest_warning
+        stored_job.manifest_relative_path = valid_relative_path
+        session.commit()
+    assert (
+        service.reconcile_terminal_manifest_orphans(limit=1, time_budget_seconds=5.0)
+        == 0
+    )
+    with create_session_factory(settings)() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None and stored_job.manifest_warning is None
+
+
+def test_terminal_manifest_orphan_reconciliation_handles_old_worker_rename_race(
+    test_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1343-orphan-race", _png_bytes((100, 50, 170)))
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    # Exercise the path-based fallback with the same snapshot/recheck protocol
+    # used on platforms without openat-style directory descriptors.
+    monkeypatch.setattr(service, "_manifest_fd_traversal_supported", lambda: False)
+    job_id = service.start_job(plan_id, auto_start=False)
+    old_generation = service._claim_job(job_id, "old-worker", "old-token")
+    assert old_generation is not None
+    session_factory = create_session_factory(settings)
+    with session_factory() as session:
+        job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        item = session.scalar(
+            select(ImageAcquisitionJobItemRecord).where(
+                ImageAcquisitionJobItemRecord.job_id == str(job_id)
+            )
+        )
+        assert job is not None and item is not None
+        project_id = job.project_id
+        item.status = ImageAcquisitionItemStatus.IMPORTED.value
+        job.heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+        session.commit()
+
+    old_claim_passed = threading.Event()
+    cleanup_listing_started = threading.Event()
+    old_error: list[BaseException] = []
+    old_paths: list[Path] = []
+
+    def old_worker() -> None:
+        try:
+            assert service._manifest_claim_exists(
+                job_id, "old-worker", "old-token", old_generation
+            )
+            old_claim_passed.set()
+            assert cleanup_listing_started.wait(5.0)
+            manifest_dir, temporary, final = service._manifest_paths(
+                project_id, str(job_id), old_generation
+            )
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            with service._open_manifest_temporary(temporary) as handle:
+                handle.write("{}")
+                handle.flush()
+                os.fsync(handle.fileno())
+            # The worker crashes after rename and before its DB update, so the
+            # old-generation final file survives until the next reconciliation.
+            service._atomic_replace_manifest(temporary, final)
+            leftover_temp = manifest_dir / ".manifest-g1-deadbeefcafe.json.tmp"
+            leftover_temp.write_text("{}", encoding="utf-8")
+            old_paths.extend((temporary, final, leftover_temp))
+        except BaseException as exc:
+            old_error.append(exc)
+
+    old_thread = threading.Thread(target=old_worker)
+    old_thread.start()
+    assert old_claim_passed.wait(1.0)
+
+    assert service._defer_manifest_repair(
+        job_id,
+        "old-worker",
+        "old-token",
+        old_generation,
+        ImageAcquisitionJobStatus.COMPLETED,
+        None,
+    )
+    new_generation = service._claim_manifest_repair_job(
+        str(job_id), "new-worker", "new-token"
+    )
+    assert new_generation is not None
+    new_counts = service._recompute_counts(
+        job_id, "new-worker", "new-token", new_generation
+    )
+    assert (
+        service._write_manifest(
+            job_id,
+            "new-worker",
+            "new-token",
+            new_generation,
+            ImageAcquisitionJobStatus.COMPLETED,
+            counts=new_counts,
+        )
+        is acquisition_download_module._ManifestWriteResult.SUCCESS
+    )
+    assert service._finish_job(
+        job_id,
+        "new-worker",
+        "new-token",
+        new_generation,
+        ImageAcquisitionJobStatus.COMPLETED,
+        None,
+    )
+
+    with session_factory() as session:
+        stored_job = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(job_id)
+            )
+        )
+        assert stored_job is not None and stored_job.manifest_relative_path is not None
+        new_manifest = (
+            settings.projects_dir
+            / stored_job.project_id
+            / stored_job.manifest_relative_path
+        )
+    assert new_manifest.is_file()
+
+    original_iterdir = Path.iterdir
+
+    def snapshot_iterdir(path: Path) -> object:
+        entries = list(original_iterdir(path))
+        if path == new_manifest.parent and not cleanup_listing_started.is_set():
+            cleanup_listing_started.set()
+        return iter(entries)
+
+    monkeypatch.setattr(Path, "iterdir", snapshot_iterdir)
+    assert (
+        service.reconcile_terminal_manifest_orphans(limit=1, time_budget_seconds=5.0)
+        == 0
+    )
+    old_thread.join(5.0)
+    assert not old_thread.is_alive()
+    assert not old_error
+    assert cleanup_listing_started.is_set()
+    assert old_paths and old_paths[1].is_file() and old_paths[2].is_file()
+
+    assert not service._finish_job(
+        job_id,
+        "old-worker",
+        "old-token",
+        old_generation,
+        ImageAcquisitionJobStatus.COMPLETED,
+        None,
+    )
+
+    assert (
+        service.reconcile_terminal_manifest_orphans(limit=1, time_budget_seconds=5.0)
+        == 2
+    )
+    assert new_manifest.is_file()
+    assert not old_paths[1].exists()
+    assert not old_paths[2].exists()
+
+
 @pytest.mark.parametrize(
     "unfinished_status",
     [

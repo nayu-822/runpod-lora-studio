@@ -94,9 +94,10 @@ pytest
 - Windowsのローカル開発環境ではfdトラバーサル非対応のため既存の安全なパス検証フォールバックを使用します。本番のRunPod Linuxではfd方式が必須です。
 - POSIXのfdトラバーサル中にディレクトリが消えた場合はartifact absentとして扱い、絶対pathのunlinkへフォールバックしません。対象ファイルが既に無い場合も保持中のparts directoryをfsyncし、fsync失敗は固定warningとして再試行します。
 - 通常・cancel・予期せぬworker例外の終端化はmanifest完了処理を経由し、監査またはcounter再計算が安全に完了できない場合はclaim条件付きで`STALE`／`manifest_repair_state=pending`へ退避します。
-- manifest warningを記録する最初のDB transactionで、修復後のterminal statusと固定error codeを`manifest_target_status`／`manifest_target_error_code`へ保存します。0036 migrationは既存の0035 repair recordからこのintentを復元します。
+- manifest warningを記録する最初のDB transactionで、修復後のterminal statusと固定error codeを`manifest_target_status`／`manifest_target_error_code`へ保存します。0036 migrationは既存の0035 repair recordからこのintentを復元し、0037 migrationはitem状態から曖昧なlegacy targetを再分類します。0038 migrationは、旧アプリがFAILED manifestをDB確定済みのまま残した安全なケースだけを`STALE`／`PENDING` repairへ戻し、filesystemには触れません。
 - `PENDING`／`REPAIRING`のmanifest repairはstale復旧後も通常取得queueへ戻さず、repair workerだけが処理します。queued、stale、repair中のcancelも同じmanifest完了処理で`CANCELED`を確定します。
 - 必須`.part` cleanupのwarning、claim token、retry scheduleが残っている間はmanifest生成とjobのterminal化を行いません。
+- terminal jobのmanifest orphanは、DBの`manifest_relative_path`を唯一の保持対象として起動時とschedulerでboundedに再確認します。実行中・repair中・worker/token残存中は対象外とし、generation basename、regular file、project root、symlink、Linux fd identityを検証してからtemp/finalを削除します。DB更新transactionをfilesystem操作中に保持せず、失敗時は固定warningを保存して次回再試行します。
 
 ## 現時点で未実装の内容
 
@@ -321,7 +322,9 @@ manifestはworker generationとランダムUUID断片によるworker固有のtem
 
 今回の実装では、manifest参照解除をrowcountと別sessionの参照再確認で`CLEARED`、`ALREADY_NOT_REFERENCED`、`STILL_REFERENCED`、`OWNERSHIP_CHANGED`、`COMMIT_AMBIGUOUS`、`DATABASE_ERROR`へ分類し、解除を確認できた場合だけ旧artifactを削除してmanifest directoryをfsyncします。終端化時の`.part`削除はitem／attemptと同じtransactionで`PART_CLEANUP_PENDING`を保存してcommitし、専用cleanup claimのPhase Aをcommitしてsessionを閉じた後、Phase Bで別sessionの再確認とファイル操作を行い、Phase Cで結果を保存します。ファイル操作中にSQLite write transactionを保持しません。`FAILED retryable=true`と`CANCELED`の`.part`は`get_job()`やresume準備で削除せず、失敗cleanupはretry backoff付きのbounded drainで再試行します。起動時は最大4 batch・最大5秒のdrainを行い、同一drainの重複再試行を除外します。stale recoveryもjob／item更新をcommitしてから対象item IDをcleanupへ渡します。保存先はAlembic `0032_phase8b_part_cleanup_warnings`、`0033_phase8b_part_cleanup_claims`を変更せず、その子migration `0034_phase8b_cleanup_retry_schedule`でretry時刻とschedule indexを追加します。
 
-最新HEADでは`ruff format --check .`、`ruff check .`、`mypy src`がすべて成功し、`pytest -q`は379 passed、44 skipped、85 warningsでした。skipはWindows環境で利用できないLinux固有のfd／symlink raceテストです。
+manifestの参照commit後も`PENDING`／`REPAIRING` intentをterminal commitまで保持し、旧workerの遅延renameは次回のterminal orphan reconciliationで回収します。0037／0038のmigrationと、起動時・schedulerの最大32件／設定時間内のreconciliationで、DB参照中のmanifestを削除せず、旧generationのfinal／tempだけを安全に整理します。
+
+最新HEADでは`ruff format --check .`、`ruff check .`、`mypy src`、`pytest`が成功し、`pytest`は386 passed、44 skipped、92 warningsでした。skipはWindows環境で利用できないLinux固有のfd／symlink raceテストです。
 ## Phase 6A: SDXL LoRA学習ジョブ基盤
 
 Phase 6Aでは、完成済みデータセットスナップショットと検証済みローカルモデルを入力に、学習設定・ジョブをSQLiteへ保存し、安全な引数配列で `sdxl_train_network.py` を起動します。ジョブはPID、worker heartbeat、stdout/stderrログ、終了コードを記録し、キャンセル、stale復旧、boundedなログ末尾取得に対応します。

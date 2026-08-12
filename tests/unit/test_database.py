@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -77,7 +78,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0037_phase8c_manifest_repair_backfill"
+            "0038_phase8c_legacy_manifest_recovery"
         )
 
 
@@ -387,7 +388,7 @@ def test_phase8b_part_cleanup_claims_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0037_phase8c_manifest_repair_backfill"
+            "0038_phase8c_legacy_manifest_recovery"
         )
 
 
@@ -634,6 +635,209 @@ def test_phase8c_manifest_repair_backfill_reclassifies_legacy_item_states(
     assert repaired.status is ImageAcquisitionJobStatus.COMPLETED
 
 
+def test_phase8c_legacy_terminal_manifest_recovery_repairs_only_proven_jobs(
+    test_workspace: Path,
+) -> None:
+    settings = migrate(test_workspace, "0035_phase8c_cleanup_repair_scheduler")
+    engine = create_engine_for_settings(settings)
+    project = ProjectService(settings).create(ProjectInput(name="legacy-terminal"))
+    job_ids = {label: str(uuid4()) for label in ("completed", "mixed", "all-failed")}
+    item_statuses = {
+        "completed": ["imported", "linked_existing", "skipped"],
+        "mixed": ["imported", "failed", "canceled"],
+        "all-failed": ["failed", "canceled"],
+    }
+    manifest_names = {
+        "completed": "manifest-g1-aaaaaaaaaaaa.json",
+        "mixed": "manifest-g1-bbbbbbbbbbbb.json",
+        "all-failed": "manifest-g1-cccccccccccc.json",
+    }
+    relative_paths = {
+        label: f"acquisition/jobs/{job_id}/manifests/{manifest_names[label]}"
+        for label, job_id in job_ids.items()
+    }
+
+    # The 0036 app had already written a FAILED manifest and then committed the
+    # terminal job row, clearing its repair intent. Migration 0038 must use DB
+    # state only and must not inspect or mutate these files.
+    for _label, relative_path in relative_paths.items():
+        manifest_path = settings.projects_dir / str(project.id) / relative_path
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text('{"status":"failed"}', encoding="utf-8")
+
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.commit()
+        transaction = connection.begin()
+        try:
+            for label, job_id in job_ids.items():
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO image_acquisition_jobs (
+                            id, project_id, plan_id, plan_fingerprint, source_type,
+                            status, active_key, worker_id, worker_generation,
+                            claim_token, cancellation_requested, completed_at,
+                            error_code, error_summary, manifest_relative_path,
+                            manifest_warning, manifest_repair_state,
+                            manifest_repair_attempted_at, downloader_version,
+                            validator_version, importer_version, job_fingerprint,
+                            created_at, updated_at
+                        ) VALUES (
+                            :id, :project_id, :plan_id, 'legacy-plan-fingerprint',
+                            'danbooru', 'stale', NULL, NULL, 1, NULL, 0, NULL,
+                            'INCOMPLETE_ITEM_STATE', 'INCOMPLETE_ITEM_STATE',
+                            :manifest_relative_path,
+                            'MANIFEST_REPAIR_PENDING:failed', 'pending', NULL,
+                            'legacy', 'legacy', 'legacy', 'legacy-job-fingerprint',
+                            '2026-08-05T00:00:00+00:00',
+                            '2026-08-05T00:00:00+00:00'
+                        )
+                        """
+                    ),
+                    {
+                        "id": job_id,
+                        "project_id": str(project.id),
+                        "plan_id": str(uuid4()),
+                        "manifest_relative_path": relative_paths[label],
+                    },
+                )
+                for display_order, status in enumerate(item_statuses[label]):
+                    connection.execute(
+                        text(
+                            """
+                            INSERT INTO image_acquisition_job_items (
+                                id, job_id, plan_item_id, source_type,
+                                external_post_id, display_order, status,
+                                expected_metadata_fingerprint, part_relative_path,
+                                created_at, updated_at
+                            ) VALUES (
+                                :id, :job_id, :plan_item_id, 'danbooru',
+                                :external_post_id, :display_order, :status,
+                                'legacy-item-fingerprint', :part_relative_path,
+                                '2026-08-05T00:00:00+00:00',
+                                '2026-08-05T00:00:00+00:00'
+                            )
+                            """
+                        ),
+                        {
+                            "id": str(uuid4()),
+                            "job_id": job_id,
+                            "plan_item_id": str(uuid4()),
+                            "external_post_id": str(display_order),
+                            "display_order": display_order,
+                            "status": status,
+                            "part_relative_path": (
+                                f"acquisition/jobs/{job_id}/parts/{display_order}.part"
+                            ),
+                        },
+                    )
+            transaction.commit()
+        finally:
+            if transaction.is_active:
+                transaction.rollback()
+
+    migrate(test_workspace, "0036_phase8c_manifest_repair_intent")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                UPDATE image_acquisition_jobs
+                SET status = 'failed', completed_at = '2026-08-05T00:01:00+00:00',
+                    manifest_warning = NULL, manifest_repair_state = NULL,
+                    manifest_repair_attempted_at = NULL,
+                    manifest_target_status = NULL,
+                    manifest_target_error_code = NULL,
+                    active_key = NULL, worker_id = NULL, claim_token = NULL,
+                    current_item_id = NULL, heartbeat_at = NULL,
+                    error_code = 'INCOMPLETE_ITEM_STATE',
+                    error_summary = 'INCOMPLETE_ITEM_STATE'
+                WHERE id IN (:completed_id, :mixed_id, :all_failed_id)
+                """
+            ),
+            {
+                "completed_id": job_ids["completed"],
+                "mixed_id": job_ids["mixed"],
+                "all_failed_id": job_ids["all-failed"],
+            },
+        )
+
+    before_migration = {
+        label: settings.projects_dir / str(project.id) / relative_path
+        for label, relative_path in relative_paths.items()
+    }
+    assert all(path.exists() for path in before_migration.values())
+
+    migrate(test_workspace, "head")
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT id, status, completed_at, manifest_repair_state,
+                       manifest_target_status, manifest_target_error_code,
+                       worker_id, claim_token, current_item_id
+                FROM image_acquisition_jobs
+                ORDER BY id
+                """
+            )
+        ).all()
+    migrated = {row[0]: row[1:] for row in rows}
+    assert migrated[job_ids["completed"]][0:2] == ("stale", None)
+    assert migrated[job_ids["completed"]][2:5] == (
+        "pending",
+        "completed",
+        None,
+    )
+    assert migrated[job_ids["mixed"]][0:2] == ("stale", None)
+    assert migrated[job_ids["mixed"]][2:5] == (
+        "pending",
+        "partially_completed",
+        "INCOMPLETE_ITEM_STATE",
+    )
+    assert migrated[job_ids["all-failed"]][0] == "failed"
+    assert migrated[job_ids["all-failed"]][1] is not None
+    assert migrated[job_ids["all-failed"]][2:5] == (None, None, None)
+    assert all(value is None for value in migrated[job_ids["completed"]][5:8])
+    assert all(value is None for value in migrated[job_ids["mixed"]][5:8])
+    assert all(path.exists() for path in before_migration.values())
+
+    service = ImageAcquisitionDownloadService(settings, auto_start=False)
+    assert service.reconcile_manifest_repairs(limit=3) == 2
+    for label, job_id in job_ids.items():
+        job = service.get_job(UUID(job_id))
+        assert job is not None
+        if label == "completed":
+            assert job.status is ImageAcquisitionJobStatus.COMPLETED
+        elif label == "mixed":
+            assert job.status is ImageAcquisitionJobStatus.PARTIALLY_COMPLETED
+        else:
+            assert job.status is ImageAcquisitionJobStatus.FAILED
+        if label != "all-failed":
+            assert not before_migration[label].exists()
+            with engine.connect() as connection:
+                repaired_relative_path = connection.scalar(
+                    text(
+                        """
+                        SELECT manifest_relative_path
+                        FROM image_acquisition_jobs
+                        WHERE id = :job_id
+                        """
+                    ),
+                    {"job_id": job_id},
+                )
+            assert repaired_relative_path is not None
+            repaired_path = (
+                settings.projects_dir / str(project.id) / repaired_relative_path
+            )
+            assert repaired_path.exists()
+            assert (
+                json.loads(repaired_path.read_text(encoding="utf-8"))["status"]
+                == job.status.value
+            )
+        else:
+            assert before_migration[label].exists()
+
+
 def test_phase8b_cleanup_retry_schedule_downgrade_and_reupgrade(
     test_workspace: Path,
 ) -> None:
@@ -663,7 +867,7 @@ def test_phase8b_cleanup_retry_schedule_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0037_phase8c_manifest_repair_backfill"
+            "0038_phase8c_legacy_manifest_recovery"
         )
 
 
@@ -695,7 +899,7 @@ def test_phase8a_page_checkpoint_migration_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0037_phase8c_manifest_repair_backfill"
+            "0038_phase8c_legacy_manifest_recovery"
         )
 
 
@@ -752,7 +956,7 @@ def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0037_phase8c_manifest_repair_backfill"
+            "0038_phase8c_legacy_manifest_recovery"
         )
 
 
@@ -780,7 +984,7 @@ def test_phase4_downgrade_and_reupgrade_preserves_phase3_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0037_phase8c_manifest_repair_backfill"
+            "0038_phase8c_legacy_manifest_recovery"
         )
 
 
@@ -794,7 +998,7 @@ def test_phase5_upgrades_existing_0006_database_to_head(
         assert "managed_models" in tables
         assert "storage_transfer_jobs" in tables
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0037_phase8c_manifest_repair_backfill"
+            "0038_phase8c_legacy_manifest_recovery"
         )
 
 
@@ -815,7 +1019,7 @@ def test_phase5_heartbeat_migration_upgrades_existing_0007_database(
             "current_file_transferred_bytes",
         }.issubset(columns)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0037_phase8c_manifest_repair_backfill"
+            "0038_phase8c_legacy_manifest_recovery"
         )
 
 
@@ -863,7 +1067,7 @@ def test_phase5_progress_migration_upgrades_existing_0008_database(
         ).one()
         assert row == ("running", 0, 0)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0037_phase8c_manifest_repair_backfill"
+            "0038_phase8c_legacy_manifest_recovery"
         )
 
 
@@ -890,7 +1094,7 @@ def test_phase5_progress_downgrade_and_reupgrade(test_workspace: Path) -> None:
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0037_phase8c_manifest_repair_backfill"
+            "0038_phase8c_legacy_manifest_recovery"
         )
 
 
