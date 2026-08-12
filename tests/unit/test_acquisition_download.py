@@ -2446,6 +2446,10 @@ def test_plan_validation_cleanup_result_is_audited(
                 del dir_fd
                 raise OSError("intentional test failure")
 
+            # Replacing os.unlink also removes the replacement callable from
+            # os.supports_dir_fd. Keep the fixture on the real POSIX fd route
+            # so the injected failure reaches dir_fd-based cleanup.
+            monkeypatch.setattr(service, "_part_fd_traversal_supported", lambda: True)
             monkeypatch.setattr(acquisition_download_module.os, "unlink", fail_unlink)
     elif cleanup_kind == "symlink":
         part.parent.mkdir(parents=True, exist_ok=True)
