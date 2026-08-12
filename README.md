@@ -324,7 +324,7 @@ manifestはworker generationとランダムUUID断片によるworker固有のtem
 
 manifestの参照commit後も`PENDING`／`REPAIRING` intentをterminal commitまで保持し、旧workerの遅延renameは次回のterminal orphan reconciliationで回収します。0037／0038／0039のmigrationと、起動時・schedulerの最大32件／設定時間内のreconciliationで、DB参照中のmanifestを削除せず、旧generationのfinal／tempだけを安全に整理します。走査は各terminal jobの永続時刻を使ったNULL先行・最古順のラウンドロビンです。
 
-Windows環境での直近の検証では`ruff format --check .`、`ruff check .`、`mypy src`、`pytest`が成功し、`pytest`は388 passed、44 skipped、96 warningsでした。skipはWindows環境で利用できないLinux固有のfd／symlink raceテストです。Linux側はpush後のGitHub Actions結果を別途確認します。
+Windows環境での直近の検証では`ruff format --check .`、`ruff check .`、`mypy src`、`pytest`が成功し、`pytest`は388 passed、44 skipped、96 warningsでした。skipはWindows環境で利用できないLinux固有のfd／symlink raceテストです。GitHub Actions `ci #67`（Ubuntu Linux、commit `ad078e7`）では`mypy`が成功し、`pytest`は432 passed、92 warningsでした。
 ## Phase 6A: SDXL LoRA学習ジョブ基盤
 
 Phase 6Aでは、完成済みデータセットスナップショットと検証済みローカルモデルを入力に、学習設定・ジョブをSQLiteへ保存し、安全な引数配列で `sdxl_train_network.py` を起動します。ジョブはPID、worker heartbeat、stdout/stderrログ、終了コードを記録し、キャンセル、stale復旧、boundedなログ末尾取得に対応します。
