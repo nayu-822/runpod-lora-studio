@@ -4331,6 +4331,7 @@ class ImageAcquisitionDownloadService:
                     manifest_repair_attempted_at=None,
                     manifest_target_status=None,
                     manifest_target_error_code=None,
+                    manifest_orphan_checked_at=None,
                     updated_at=completed_at,
                 )
                 .returning(ImageAcquisitionJobRecord.id)
@@ -5090,59 +5091,43 @@ class ImageAcquisitionDownloadService:
             ),
         )
 
-    def _set_manifest_orphan_warning(self, job_id: str) -> None:
+    def _record_manifest_orphan_scan(
+        self, job_id: str, *, cleanup_succeeded: bool
+    ) -> None:
+        conditions: list[Any] = [
+            ImageAcquisitionJobRecord.id == job_id,
+            ImageAcquisitionJobRecord.status.in_(TERMINAL_JOB_STATUS_VALUES),
+            ImageAcquisitionJobRecord.completed_at.is_not(None),
+            ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
+            ImageAcquisitionJobRecord.worker_id.is_(None),
+            ImageAcquisitionJobRecord.claim_token.is_(None),
+            ImageAcquisitionJobRecord.current_item_id.is_(None),
+            ImageAcquisitionJobRecord.active_key.is_(None),
+        ]
+        values: dict[str, Any] = {
+            "manifest_orphan_checked_at": datetime.now(UTC),
+        }
+        if cleanup_succeeded:
+            values["manifest_warning"] = case(
+                (
+                    ImageAcquisitionJobRecord.manifest_warning
+                    == MANIFEST_ORPHAN_CLEANUP_WARNING,
+                    None,
+                ),
+                else_=ImageAcquisitionJobRecord.manifest_warning,
+            )
+        else:
+            values["manifest_warning"] = MANIFEST_ORPHAN_CLEANUP_WARNING
         try:
             with self.session_factory() as session:
                 session.execute(
                     update(ImageAcquisitionJobRecord)
-                    .where(
-                        ImageAcquisitionJobRecord.id == job_id,
-                        ImageAcquisitionJobRecord.status.in_(
-                            TERMINAL_JOB_STATUS_VALUES
-                        ),
-                        ImageAcquisitionJobRecord.completed_at.is_not(None),
-                        ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
-                        ImageAcquisitionJobRecord.worker_id.is_(None),
-                        ImageAcquisitionJobRecord.claim_token.is_(None),
-                        ImageAcquisitionJobRecord.current_item_id.is_(None),
-                        ImageAcquisitionJobRecord.active_key.is_(None),
-                    )
-                    .values(
-                        manifest_warning=MANIFEST_ORPHAN_CLEANUP_WARNING,
-                        updated_at=datetime.now(UTC),
-                    )
+                    .where(*conditions)
+                    .values(**values)
                 )
                 session.commit()
         except SQLAlchemyError:
-            logger.warning("acquisition_manifest_orphan_warning_persist_failed")
-
-    def _clear_manifest_orphan_warning(self, job_id: str) -> None:
-        try:
-            with self.session_factory() as session:
-                session.execute(
-                    update(ImageAcquisitionJobRecord)
-                    .where(
-                        ImageAcquisitionJobRecord.id == job_id,
-                        ImageAcquisitionJobRecord.status.in_(
-                            TERMINAL_JOB_STATUS_VALUES
-                        ),
-                        ImageAcquisitionJobRecord.completed_at.is_not(None),
-                        ImageAcquisitionJobRecord.manifest_repair_state.is_(None),
-                        ImageAcquisitionJobRecord.worker_id.is_(None),
-                        ImageAcquisitionJobRecord.claim_token.is_(None),
-                        ImageAcquisitionJobRecord.current_item_id.is_(None),
-                        ImageAcquisitionJobRecord.active_key.is_(None),
-                        ImageAcquisitionJobRecord.manifest_warning
-                        == MANIFEST_ORPHAN_CLEANUP_WARNING,
-                    )
-                    .values(
-                        manifest_warning=None,
-                        updated_at=datetime.now(UTC),
-                    )
-                )
-                session.commit()
-        except SQLAlchemyError:
-            logger.warning("acquisition_manifest_orphan_warning_clear_failed")
+            logger.warning("acquisition_manifest_orphan_scan_progress_failed")
 
     def _cleanup_terminal_manifest_orphan_job(
         self, job: _TerminalManifestOrphanJob
@@ -5319,13 +5304,21 @@ class ImageAcquisitionDownloadService:
                         ImageAcquisitionJobRecord.active_key.is_(None),
                     )
                     .order_by(
+                        ImageAcquisitionJobRecord.manifest_orphan_checked_at.asc().nulls_first(),
                         ImageAcquisitionJobRecord.updated_at,
                         ImageAcquisitionJobRecord.id,
                     )
                     .limit(limit)
                 ).all()
         except OperationalError as exc:
-            if "no such table: image_acquisition_jobs" not in str(exc):
+            error_text = str(exc)
+            if not (
+                "no such table: image_acquisition_jobs" in error_text
+                or (
+                    "no such column" in error_text
+                    and "manifest_orphan_checked_at" in error_text
+                )
+            ):
                 raise
             logger.warning("acquisition_manifest_orphan_table_not_migrated")
             return 0
@@ -5343,14 +5336,12 @@ class ImageAcquisitionDownloadService:
             try:
                 self._manifest_reference_name(job.job_id, job.manifest_relative_path)
             except AcquisitionDownloadError:
-                self._set_manifest_orphan_warning(job.job_id)
+                self._record_manifest_orphan_scan(job.job_id, cleanup_succeeded=False)
                 continue
             removed, success = self._cleanup_terminal_manifest_orphan_job(job)
+            self._record_manifest_orphan_scan(job.job_id, cleanup_succeeded=success)
             if success:
-                self._clear_manifest_orphan_warning(job.job_id)
                 removed_count += removed
-            else:
-                self._set_manifest_orphan_warning(job.job_id)
         return removed_count
 
     def _begin_manifest_finalization(

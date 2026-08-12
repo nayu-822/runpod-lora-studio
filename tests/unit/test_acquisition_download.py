@@ -1795,6 +1795,291 @@ def test_terminal_manifest_orphan_reconciliation_keeps_db_reference(
         assert stored_job is not None and stored_job.manifest_warning is None
 
 
+def test_terminal_manifest_orphan_reconciliation_persists_fair_scan_progress(
+    test_workspace: Path,
+) -> None:
+    settings = _settings(test_workspace)
+    post = _post("1342-fair-scan", _png_bytes((80, 130, 190)))
+    plan_id, adapter = _make_plan(settings, (post,))
+    service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    base_job_id = service.start_job(plan_id, auto_start=False)
+    base_generation = service._claim_job(base_job_id, "base-worker", "base-token")
+    assert base_generation is not None
+    base_counts = service._recompute_counts(
+        base_job_id, "base-worker", "base-token", base_generation
+    )
+    assert (
+        service._write_manifest(
+            base_job_id,
+            "base-worker",
+            "base-token",
+            base_generation,
+            ImageAcquisitionJobStatus.COMPLETED,
+            counts=base_counts,
+        )
+        is acquisition_download_module._ManifestWriteResult.SUCCESS
+    )
+    assert service._finish_job(
+        base_job_id,
+        "base-worker",
+        "base-token",
+        base_generation,
+        ImageAcquisitionJobStatus.COMPLETED,
+        None,
+    )
+
+    session_factory = create_session_factory(settings)
+    with session_factory() as session:
+        template = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(base_job_id)
+            )
+        )
+        assert template is not None
+        project_id = template.project_id
+        plan_fingerprint = template.plan_fingerprint
+        source_type = template.source_type
+        base_time = datetime(2026, 8, 1, tzinfo=UTC)
+
+    project_root = settings.projects_dir / project_id
+    normal_relative_paths: list[str] = []
+    protected_relative_paths: list[str] = []
+    synthetic_jobs: list[ImageAcquisitionJobRecord] = []
+
+    def add_synthetic_job(
+        *,
+        index: int,
+        updated_at: datetime,
+        manifest_relative_path: str,
+        status: str = ImageAcquisitionJobStatus.COMPLETED.value,
+        active_key: str | None = None,
+        worker_id: str | None = None,
+        claim_token: str | None = None,
+        current_item_id: str | None = None,
+        manifest_repair_state: str | None = None,
+        manifest_warning: str | None = None,
+    ) -> str:
+        job_id = str(UUID(int=0x20000000000000000000000000000000 + index))
+        synthetic_jobs.append(
+            ImageAcquisitionJobRecord(
+                id=job_id,
+                project_id=project_id,
+                plan_id=template.plan_id,
+                plan_fingerprint=plan_fingerprint,
+                source_type=source_type,
+                status=status,
+                active_key=active_key,
+                worker_id=worker_id,
+                worker_generation=1,
+                claim_token=claim_token,
+                cancellation_requested=False,
+                requested_count=0,
+                pending_count=0,
+                downloading_count=0,
+                downloaded_count=0,
+                validated_count=0,
+                imported_count=0,
+                linked_existing_count=0,
+                skipped_count=0,
+                failed_count=0,
+                received_bytes=0,
+                expected_bytes=None,
+                current_item_id=current_item_id,
+                heartbeat_at=None,
+                started_at=updated_at,
+                completed_at=updated_at,
+                error_code=None,
+                error_summary=None,
+                manifest_relative_path=manifest_relative_path,
+                manifest_warning=manifest_warning,
+                manifest_repair_state=manifest_repair_state,
+                manifest_target_status=None,
+                manifest_target_error_code=None,
+                manifest_repair_attempted_at=None,
+                downloader_version=template.downloader_version,
+                validator_version=template.validator_version,
+                importer_version=template.importer_version,
+                job_fingerprint=f"fair-scan-{index}",
+                created_at=updated_at,
+                updated_at=updated_at,
+                manifest_orphan_checked_at=None,
+            )
+        )
+        return job_id
+
+    # One hundred eligible terminal rows prove that a fixed first page does
+    # not starve later rows. The first row is temporarily invalid so the
+    # warning path must also make progress and become retryable.
+    for index in range(99):
+        job_id = str(UUID(int=0x20000000000000000000000000000000 + index))
+        manifest_name = f"manifest-g1-{index:012x}.json"
+        valid_relative_path = f"acquisition/jobs/{job_id}/manifests/{manifest_name}"
+        relative_path = (
+            "../invalid-manifest.json" if index == 0 else valid_relative_path
+        )
+        normal_relative_paths.append(valid_relative_path)
+        add_synthetic_job(
+            index=index,
+            updated_at=base_time + timedelta(seconds=index),
+            manifest_relative_path=relative_path,
+        )
+
+    target_index = 99
+    target_job_id = add_synthetic_job(
+        index=target_index,
+        updated_at=base_time + timedelta(seconds=target_index),
+        manifest_relative_path=(
+            "acquisition/jobs/"
+            f"{UUID(int=0x20000000000000000000000000000000 + target_index)}"
+            "/manifests/manifest-g1-000000000063.json"
+        ),
+    )
+    target_relative_path = synthetic_jobs[-1].manifest_relative_path
+    assert target_relative_path is not None
+
+    protected_jobs = (
+        (
+            "active",
+            dict(active_key="protected-active"),
+        ),
+        (
+            "repair",
+            dict(manifest_repair_state=ManifestRepairState.PENDING.value),
+        ),
+        (
+            "claimed",
+            dict(worker_id="protected-worker", claim_token="protected-token"),
+        ),
+    )
+    for offset, (_label, options) in enumerate(protected_jobs, start=100):
+        job_id = str(UUID(int=0x20000000000000000000000000000000 + offset))
+        manifest_name = f"manifest-g1-{offset:012x}.json"
+        relative_path = f"acquisition/jobs/{job_id}/manifests/{manifest_name}"
+        protected_relative_paths.append(relative_path)
+        add_synthetic_job(
+            index=offset,
+            updated_at=base_time + timedelta(seconds=offset),
+            manifest_relative_path=relative_path,
+            **options,
+        )
+
+    with session_factory() as session:
+        session.add_all(synthetic_jobs)
+        persisted_base = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == str(base_job_id)
+            )
+        )
+        assert persisted_base is not None
+        persisted_base.manifest_orphan_checked_at = datetime.now(UTC) + timedelta(
+            days=365
+        )
+        session.commit()
+
+    all_relative_paths = [
+        *normal_relative_paths,
+        target_relative_path,
+        *protected_relative_paths,
+    ]
+    for relative_path in all_relative_paths:
+        manifest_path = project_root / relative_path
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text("{}", encoding="utf-8")
+    target_manifest = project_root / target_relative_path
+    orphan_manifest = target_manifest.with_name("manifest-g1-ffffffffffff.json")
+    orphan_manifest.write_text("{}", encoding="utf-8")
+
+    assert (
+        service.reconcile_terminal_manifest_orphans(limit=32, time_budget_seconds=5.0)
+        == 0
+    )
+    with session_factory() as session:
+        first_batch = session.scalars(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id.in_(
+                    [
+                        str(UUID(int=0x20000000000000000000000000000000 + index))
+                        for index in range(32)
+                    ]
+                )
+            )
+        ).all()
+        assert all(job.manifest_orphan_checked_at is not None for job in first_batch)
+        target_row = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id == target_job_id
+            )
+        )
+        assert target_row is not None and target_row.manifest_orphan_checked_at is None
+        target_row = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id
+                == str(UUID(int=0x20000000000000000000000000000000))
+            )
+        )
+        assert target_row is not None
+        target_row.manifest_relative_path = normal_relative_paths[0]
+        session.commit()
+
+    restarted_service = ImageAcquisitionDownloadService(
+        settings, adapter=adapter, auto_start=False
+    )
+    assert (
+        restarted_service.reconcile_terminal_manifest_orphans(
+            limit=32, time_budget_seconds=5.0
+        )
+        == 0
+    )
+    assert (
+        restarted_service.reconcile_terminal_manifest_orphans(
+            limit=32, time_budget_seconds=5.0
+        )
+        == 0
+    )
+    assert (
+        restarted_service.reconcile_terminal_manifest_orphans(
+            limit=32, time_budget_seconds=5.0
+        )
+        == 1
+    )
+    assert target_manifest.is_file()
+    assert not orphan_manifest.exists()
+
+    # The invalid first row was checked in the first batch, then repaired in
+    # the database. Round-robin ordering must eventually retry and clear only
+    # the orphan warning without touching the authoritative reference.
+    assert (
+        restarted_service.reconcile_terminal_manifest_orphans(
+            limit=32, time_budget_seconds=5.0
+        )
+        == 0
+    )
+    with session_factory() as session:
+        retried = session.scalar(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id
+                == str(UUID(int=0x20000000000000000000000000000000))
+            )
+        )
+        assert retried is not None
+        assert retried.manifest_warning is None
+        assert retried.manifest_relative_path == normal_relative_paths[0]
+        protected = session.scalars(
+            select(ImageAcquisitionJobRecord).where(
+                ImageAcquisitionJobRecord.id.in_(
+                    [
+                        str(UUID(int=0x20000000000000000000000000000000 + offset))
+                        for offset in range(100, 103)
+                    ]
+                )
+            )
+        ).all()
+        assert all(job.manifest_orphan_checked_at is None for job in protected)
+    assert all((project_root / path).exists() for path in protected_relative_paths)
+
+
 def test_terminal_manifest_orphan_reconciliation_handles_old_worker_rename_race(
     test_workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1805,9 +2090,8 @@ def test_terminal_manifest_orphan_reconciliation_handles_old_worker_rename_race(
     service = ImageAcquisitionDownloadService(
         settings, adapter=adapter, auto_start=False
     )
-    # Exercise the path-based fallback with the same snapshot/recheck protocol
-    # used on platforms without openat-style directory descriptors.
-    monkeypatch.setattr(service, "_manifest_fd_traversal_supported", lambda: False)
+    if os.name != "nt":
+        assert service._manifest_fd_traversal_supported()
     job_id = service.start_job(plan_id, auto_start=False)
     old_generation = service._claim_job(job_id, "old-worker", "old-token")
     assert old_generation is not None
@@ -1911,15 +2195,26 @@ def test_terminal_manifest_orphan_reconciliation_handles_old_worker_rename_race(
         )
     assert new_manifest.is_file()
 
-    original_iterdir = Path.iterdir
+    if os.name == "nt":
+        original_iterdir = Path.iterdir
 
-    def snapshot_iterdir(path: Path) -> object:
-        entries = list(original_iterdir(path))
-        if path == new_manifest.parent and not cleanup_listing_started.is_set():
-            cleanup_listing_started.set()
-        return iter(entries)
+        def snapshot_iterdir(path: Path) -> object:
+            entries = list(original_iterdir(path))
+            if path == new_manifest.parent and not cleanup_listing_started.is_set():
+                cleanup_listing_started.set()
+            return iter(entries)
 
-    monkeypatch.setattr(Path, "iterdir", snapshot_iterdir)
+        monkeypatch.setattr(Path, "iterdir", snapshot_iterdir)
+    else:
+        original_listdir = acquisition_download_module.os.listdir
+
+        def snapshot_listdir(path: object) -> list[str]:
+            entries = original_listdir(path)  # type: ignore[arg-type]
+            if isinstance(path, int) and not cleanup_listing_started.is_set():
+                cleanup_listing_started.set()
+            return entries
+
+        monkeypatch.setattr(acquisition_download_module.os, "listdir", snapshot_listdir)
     assert (
         service.reconcile_terminal_manifest_orphans(limit=1, time_budget_seconds=5.0)
         == 0
@@ -2113,7 +2408,7 @@ def test_plan_validation_cleanup_result_is_audited(
         if cleanup_kind == "invalid":
             item.part_relative_path = "../outside-part.part"
         elif cleanup_kind == "directory":
-            item.part_relative_path = f"acquisition/jobs/{job_id}/{item.id}.part"
+            item.part_relative_path = f"acquisition/jobs/{job_id}/parts/{item.id}.part"
         part = settings.projects_dir / job.project_id / item.part_relative_path
         now = datetime.now(UTC)
         session.add(
@@ -2136,11 +2431,22 @@ def test_plan_validation_cleanup_result_is_audited(
         part.parent.mkdir(parents=True, exist_ok=True)
         part.write_bytes(b"x")
 
-        def fail_unlink(_: Path, *, missing_ok: bool = False) -> None:
-            del missing_ok
-            raise OSError("intentional test failure")
+        if os.name == "nt":
 
-        monkeypatch.setattr(Path, "unlink", fail_unlink)
+            def fail_unlink(_: Path, *, missing_ok: bool = False) -> None:
+                del missing_ok
+                raise OSError("intentional test failure")
+
+            monkeypatch.setattr(Path, "unlink", fail_unlink)
+        else:
+
+            def fail_unlink(
+                _: str | bytes | Path, *, dir_fd: int | None = None
+            ) -> None:
+                del dir_fd
+                raise OSError("intentional test failure")
+
+            monkeypatch.setattr(acquisition_download_module.os, "unlink", fail_unlink)
     elif cleanup_kind == "symlink":
         part.parent.mkdir(parents=True, exist_ok=True)
         target = test_workspace / "outside-part-target"
@@ -2797,6 +3103,10 @@ def test_part_cleanup_missing_parent_does_not_fallback_to_path_unlink(
     project_root = settings.projects_dir / project_id
     acquisition_dir = project_root / "acquisition"
     acquisition_dir.mkdir(parents=True, exist_ok=True)
+    jobs_dir = acquisition_dir / "jobs"
+    jobs_backup = acquisition_dir / "jobs-fixture-backup"
+    if jobs_dir.exists():
+        jobs_dir.rename(jobs_backup)
     outside_root = test_workspace / "outside-part-root"
     outside_part = outside_root / str(job_id) / "parts" / f"{item_id}.part"
     outside_part.parent.mkdir(parents=True)
@@ -2815,9 +3125,15 @@ def test_part_cleanup_missing_parent_does_not_fallback_to_path_unlink(
     assert inspection.parts_fd == -1
     assert inspection.artifact_absent
 
-    (acquisition_dir / "jobs").symlink_to(outside_root, target_is_directory=True)
-    assert service._cleanup_part_artifact(inspection) is None
-    assert outside_part.exists()
+    try:
+        jobs_dir.symlink_to(outside_root, target_is_directory=True)
+        assert service._cleanup_part_artifact(inspection) is None
+        assert outside_part.exists()
+    finally:
+        if jobs_dir.is_symlink():
+            jobs_dir.unlink()
+        if jobs_backup.exists():
+            jobs_backup.rename(jobs_dir)
 
 
 @pytest.mark.skipif(
@@ -4022,7 +4338,7 @@ def test_manifest_fd_operations_reject_directory_swap_races(
                     create_missing=create_missing,
                     allow_missing=allow_missing,
                 )
-                if not create_missing:
+                if not create_missing and not allow_missing:
                     swap_manifest_path()
 
             monkeypatch.setattr(service, "_validate_manifest_directory", validate)
@@ -4157,6 +4473,7 @@ def test_manifest_operations_sync_directory_before_db_update(
         job_id, "order-worker", "order-token", generation
     )
     events: list[str] = []
+    temporary_fds: set[int] = set()
     original_open = service._open_manifest_temporary
     original_fsync = acquisition_download_module.os.fsync
     original_replace = service._atomic_replace_manifest
@@ -4164,10 +4481,13 @@ def test_manifest_operations_sync_directory_before_db_update(
 
     def open_temporary(path: Path, *, directory_fd: int | None = None) -> object:
         events.append("temporary_write")
-        return original_open(path, directory_fd=directory_fd)
+        handle = original_open(path, directory_fd=directory_fd)
+        temporary_fds.add(handle.fileno())  # type: ignore[attr-defined]
+        return handle
 
     def fsync(descriptor: int) -> None:
-        events.append("file_fsync")
+        if descriptor in temporary_fds:
+            events.append("file_fsync")
         original_fsync(descriptor)
 
     def replace(

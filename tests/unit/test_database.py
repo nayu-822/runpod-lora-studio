@@ -78,7 +78,7 @@ def test_empty_database_and_existing_0001_upgrade_to_head(test_workspace: Path) 
     migrate(test_workspace, "head")
     with engine.connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0038_phase8c_legacy_manifest_recovery"
+            "0039_phase8c_manifest_orphan_scan"
         )
 
 
@@ -388,7 +388,60 @@ def test_phase8b_part_cleanup_claims_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0038_phase8c_legacy_manifest_recovery"
+            "0039_phase8c_manifest_orphan_scan"
+        )
+
+
+def test_phase8c_manifest_orphan_scan_migration_downgrade_and_reupgrade(
+    test_workspace: Path,
+) -> None:
+    settings = migrate(test_workspace, "0038_phase8c_legacy_manifest_recovery")
+    engine = create_engine_for_settings(settings)
+    before_inspector = inspect(engine)
+    before_columns = {
+        column["name"]
+        for column in before_inspector.get_columns("image_acquisition_jobs")
+    }
+    before_indexes = {
+        index["name"]
+        for index in before_inspector.get_indexes("image_acquisition_jobs")
+    }
+    assert "manifest_orphan_checked_at" not in before_columns
+    assert "ix_image_acquisition_jobs_manifest_orphan_scan" not in before_indexes
+
+    migrate(test_workspace, "head")
+    upgraded_inspector = inspect(engine)
+    assert "manifest_orphan_checked_at" in {
+        column["name"]
+        for column in upgraded_inspector.get_columns("image_acquisition_jobs")
+    }
+    assert "ix_image_acquisition_jobs_manifest_orphan_scan" in {
+        index["name"]
+        for index in upgraded_inspector.get_indexes("image_acquisition_jobs")
+    }
+
+    config = Config(str(Path("alembic.ini").resolve()))
+    old_path = os.environ.get("RUNPOD_LORA_STUDIO_DATABASE_PATH")
+    os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = str(settings.database_path)
+    get_settings.cache_clear()
+    try:
+        command.downgrade(config, "0038_phase8c_legacy_manifest_recovery")
+        downgraded_inspector = inspect(engine)
+        assert "manifest_orphan_checked_at" not in {
+            column["name"]
+            for column in downgraded_inspector.get_columns("image_acquisition_jobs")
+        }
+        command.upgrade(config, "head")
+    finally:
+        get_settings.cache_clear()
+        if old_path is None:
+            os.environ.pop("RUNPOD_LORA_STUDIO_DATABASE_PATH", None)
+        else:
+            os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
+
+    with engine.connect() as connection:
+        assert MigrationContext.configure(connection).get_current_revision() == (
+            "0039_phase8c_manifest_orphan_scan"
         )
 
 
@@ -867,7 +920,7 @@ def test_phase8b_cleanup_retry_schedule_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0038_phase8c_legacy_manifest_recovery"
+            "0039_phase8c_manifest_orphan_scan"
         )
 
 
@@ -899,7 +952,7 @@ def test_phase8a_page_checkpoint_migration_downgrade_and_reupgrade(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0038_phase8c_legacy_manifest_recovery"
+            "0039_phase8c_manifest_orphan_scan"
         )
 
 
@@ -956,7 +1009,7 @@ def test_phase3_downgrade_and_reupgrade_preserves_phase2_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0038_phase8c_legacy_manifest_recovery"
+            "0039_phase8c_manifest_orphan_scan"
         )
 
 
@@ -984,7 +1037,7 @@ def test_phase4_downgrade_and_reupgrade_preserves_phase3_tables(
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0038_phase8c_legacy_manifest_recovery"
+            "0039_phase8c_manifest_orphan_scan"
         )
 
 
@@ -998,7 +1051,7 @@ def test_phase5_upgrades_existing_0006_database_to_head(
         assert "managed_models" in tables
         assert "storage_transfer_jobs" in tables
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0038_phase8c_legacy_manifest_recovery"
+            "0039_phase8c_manifest_orphan_scan"
         )
 
 
@@ -1019,7 +1072,7 @@ def test_phase5_heartbeat_migration_upgrades_existing_0007_database(
             "current_file_transferred_bytes",
         }.issubset(columns)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0038_phase8c_legacy_manifest_recovery"
+            "0039_phase8c_manifest_orphan_scan"
         )
 
 
@@ -1067,7 +1120,7 @@ def test_phase5_progress_migration_upgrades_existing_0008_database(
         ).one()
         assert row == ("running", 0, 0)
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0038_phase8c_legacy_manifest_recovery"
+            "0039_phase8c_manifest_orphan_scan"
         )
 
 
@@ -1094,7 +1147,7 @@ def test_phase5_progress_downgrade_and_reupgrade(test_workspace: Path) -> None:
             os.environ["RUNPOD_LORA_STUDIO_DATABASE_PATH"] = old_path
     with create_engine_for_settings(settings).connect() as connection:
         assert MigrationContext.configure(connection).get_current_revision() == (
-            "0038_phase8c_legacy_manifest_recovery"
+            "0039_phase8c_manifest_orphan_scan"
         )
 
 

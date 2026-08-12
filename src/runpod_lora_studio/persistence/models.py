@@ -1961,6 +1961,12 @@ class ImageAcquisitionJobRecord(Base):
         UniqueConstraint("active_key", name="uq_image_acquisition_job_active_key"),
         Index("ix_image_acquisition_jobs_project", "project_id", "created_at"),
         Index("ix_image_acquisition_jobs_plan", "plan_id", "created_at"),
+        Index(
+            "ix_image_acquisition_jobs_manifest_orphan_scan",
+            "manifest_orphan_checked_at",
+            "updated_at",
+            "id",
+        ),
     )
 
     internal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -2011,6 +2017,9 @@ class ImageAcquisitionJobRecord(Base):
     manifest_relative_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     manifest_warning: Mapped[str | None] = mapped_column(Text, nullable=True)
     manifest_repair_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    manifest_orphan_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     manifest_target_status: Mapped[str | None] = mapped_column(
         String(32), nullable=True
     )
