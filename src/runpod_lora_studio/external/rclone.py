@@ -88,6 +88,7 @@ class StorageTransferAdapter(Protocol):
     def read_remote_file(
         self,
         remote_path: StorageRemotePath,
+        max_bytes: int | None = None,
     ) -> bytes: ...
 
     def dry_run_copy(
@@ -586,7 +587,9 @@ class RcloneAdapter:
             True, policy, expected_size, actual_size, expected_hash, actual_hash
         )
 
-    def read_remote_file(self, remote_path: StorageRemotePath) -> bytes:
+    def read_remote_file(
+        self, remote_path: StorageRemotePath, max_bytes: int | None = None
+    ) -> bytes:
         temp_root = (
             self.settings.transfer_temp_dir or self.settings.temp_dir / "transfers"
         )
@@ -603,6 +606,8 @@ class RcloneAdapter:
             )
             if result.returncode != 0:
                 raise RuntimeError("remoteファイルを読み取れません")
+            if max_bytes is not None and path.stat().st_size > max_bytes:
+                raise ValueError("remote file exceeds maximum size")
             return path.read_bytes()
         finally:
             path.unlink(missing_ok=True)

@@ -97,6 +97,84 @@ class MissingFinalManifestAdapter(FakeStorageTransferAdapter):
         return result
 
 
+def test_fake_storage_enforces_overwrite_and_failure_injections(
+    test_workspace: Path,
+) -> None:
+    source = test_workspace / "source.bin"
+    source.write_bytes(b"new")
+    destination = StorageRemotePath("gdrive", "fake/file.bin")
+
+    adapter = FakeStorageTransferAdapter(entries={"fake/file.bin": b"old"})
+    result = adapter.copy(
+        source,
+        destination,
+        CopyOptions(overwrite_policy=OverwritePolicy.FAIL_IF_EXISTS),
+    )
+    assert result.returncode != 0
+    assert adapter.files["fake/file.bin"] == b"old"
+
+    source.write_bytes(b"old")
+    result = adapter.copy(
+        source,
+        destination,
+        CopyOptions(overwrite_policy=OverwritePolicy.SKIP_IDENTICAL),
+    )
+    assert result.returncode == 0
+    source.write_bytes(b"new")
+    result = adapter.copy(
+        source,
+        destination,
+        CopyOptions(overwrite_policy=OverwritePolicy.SKIP_IDENTICAL),
+    )
+    assert result.returncode != 0
+    assert adapter.files["fake/file.bin"] == b"old"
+
+    result = adapter.copy(
+        source,
+        destination,
+        CopyOptions(overwrite_policy=OverwritePolicy.OVERWRITE_CHANGED),
+    )
+    assert result.returncode == 0
+    assert adapter.files["fake/file.bin"] == b"new"
+
+    failed = FakeStorageTransferAdapter(fail_on_copy_number=1)
+    assert (
+        failed.copy(
+            source,
+            destination,
+            CopyOptions(overwrite_policy=OverwritePolicy.OVERWRITE_CHANGED),
+        ).returncode
+        != 0
+    )
+    raised = FakeStorageTransferAdapter(raise_on_copy_number=1)
+    with pytest.raises(RuntimeError, match="fake injected copy exception"):
+        raised.copy(
+            source,
+            destination,
+            CopyOptions(overwrite_policy=OverwritePolicy.OVERWRITE_CHANGED),
+        )
+    crashed = FakeStorageTransferAdapter(crash_after_copy_number=1)
+    with pytest.raises(RuntimeError, match="fake injected crash"):
+        crashed.copy(
+            source,
+            destination,
+            CopyOptions(overwrite_policy=OverwritePolicy.OVERWRITE_CHANGED),
+        )
+    assert crashed.files["fake/file.bin"] == b"new"
+    canceled = FakeStorageTransferAdapter()
+    canceled.cancel_after_bytes = 1
+    token = CancelToken()
+    result = canceled.copy(
+        source,
+        destination,
+        CopyOptions(overwrite_policy=OverwritePolicy.OVERWRITE_CHANGED),
+        cancel_token=token,
+    )
+    assert result.returncode != 0
+    assert token.cancelled
+    assert "fake/file.bin" not in canceled.files
+
+
 def _settings(test_workspace: Path) -> AppSettings:
     runtime = test_workspace / "runtime"
     settings = AppSettings(

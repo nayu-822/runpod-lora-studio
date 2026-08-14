@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+import threading
+import time
+from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -19,6 +22,7 @@ from runpod_lora_studio.domain.training_completion_models import (
 )
 from runpod_lora_studio.domain.training_models import TrainingConfigInput
 from runpod_lora_studio.external.fake_storage import FakeStorageTransferAdapter
+from runpod_lora_studio.external.rclone import CancelToken
 from runpod_lora_studio.external.training_process import FakeTrainingProcessAdapter
 from runpod_lora_studio.persistence.database import create_engine_for_settings
 from runpod_lora_studio.persistence.models import (
@@ -26,6 +30,7 @@ from runpod_lora_studio.persistence.models import (
     DatasetSnapshotRecord,
     ManagedModelRecord,
     ModelTransferRecord,
+    TrainingCompletionExportRecord,
     TrainingJobRecord,
 )
 from runpod_lora_studio.persistence.training_completion_repository import (
@@ -216,6 +221,23 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _mark_stale_for_restart(settings: AppSettings, export_id: UUID) -> None:
+    with Session(create_engine_for_settings(settings)) as session:
+        record = session.scalar(
+            select(TrainingCompletionExportRecord).where(
+                TrainingCompletionExportRecord.id == str(export_id)
+            )
+        )
+        assert record is not None
+        record.status = TrainingCompletionStatus.STALE.value
+        record.current_stage = TrainingCompletionStatus.STALE.value
+        record.worker_id = None
+        record.claim_token = None
+        record.heartbeat_at = None
+        record.completed_at = None
+        session.commit()
+
+
 def _completion_fixture(
     test_workspace: Path,
 ) -> tuple[
@@ -284,6 +306,10 @@ def test_completion_uploads_artifacts_verifies_and_writes_marker_last(
         target = storage.training_remote_path(project_id, job_id)
         marker_key = f"{target.relative_path}/completion-manifest.json"
         assert marker_key in storage.adapter.files
+        assert (
+            export.completion_manifest_sha256
+            == hashlib.sha256(storage.adapter.files[marker_key]).hexdigest()
+        )
         assert storage.adapter.copy_calls[-1][1].endswith("completion-manifest.json")
         assert all(
             "dataset.toml" not in destination
@@ -297,6 +323,17 @@ def test_completion_uploads_artifacts_verifies_and_writes_marker_last(
         )
         assert len(storage.adapter.copy_calls) == copy_count
         assert service.status_rows(project_id)[0][2] == "completed"
+
+        _mark_stale_for_restart(service.settings, export_id)
+        service._run_export(export_id)
+        assert (
+            service.get_export(export_id).status is TrainingCompletionStatus.COMPLETED
+        )
+        assert len(storage.adapter.copy_calls) == copy_count
+        service.cancel(export_id)
+        assert (
+            service.get_export(export_id).status is TrainingCompletionStatus.COMPLETED
+        )
     finally:
         service.close()
         training.close()
@@ -325,8 +362,9 @@ def test_completion_requires_exact_final_lora_and_never_uses_checkpoint(
         training.close()
 
 
+@pytest.mark.parametrize("status,exit_code", [("failed", 1), ("canceled", 130)])
 def test_completion_rejects_training_job_that_is_not_succeeded(
-    test_workspace: Path,
+    test_workspace: Path, status: str, exit_code: int
 ) -> None:
     service, _storage, training, _project_id, job_id = _completion_fixture(
         test_workspace
@@ -337,8 +375,8 @@ def test_completion_rejects_training_job_that_is_not_succeeded(
                 select(TrainingJobRecord).where(TrainingJobRecord.id == str(job_id))
             )
             assert record is not None
-            record.status = "failed"
-            record.exit_code = 1
+            record.status = status
+            record.exit_code = exit_code
             session.commit()
         with pytest.raises(CompletionFailure) as raised:
             service.preview(job_id)
@@ -387,6 +425,339 @@ def test_completion_claim_fencing_blocks_old_worker(
                 values={"current_stage": "old-worker-update"},
             )
             session.rollback()
+    finally:
+        service.close()
+        training.close()
+
+
+def test_stale_transition_requires_the_complete_claim_snapshot(
+    test_workspace: Path,
+) -> None:
+    service, _storage, training, project_id, job_id = _completion_fixture(
+        test_workspace
+    )
+    engine = create_engine_for_settings(service.settings)
+    now = datetime.now(UTC)
+    try:
+        with Session(engine) as session:
+            repository = TrainingCompletionRepository(session)
+            record = repository.create(job_id, project_id, "a" * 64, "b" * 64)
+            session.commit()
+            export_id = UUID(record.id)
+            assert repository.claim(
+                export_id,
+                worker_id="worker-a",
+                claim_token="claim-a",
+                now=now,
+                stale_after_seconds=120,
+            )
+            session.commit()
+            snapshot = repository.get(export_id)
+            assert snapshot is not None
+            expected_status = snapshot.status
+            expected_worker_id = snapshot.worker_id
+            expected_claim_token = snapshot.claim_token
+            expected_generation = snapshot.worker_generation
+
+        with Session(engine) as live_session:
+            live_repository = TrainingCompletionRepository(live_session)
+            assert live_repository.update_claimed(
+                export_id,
+                worker_id="worker-a",
+                claim_token="claim-a",
+                worker_generation=expected_generation,
+                values={"heartbeat_at": now + timedelta(seconds=30)},
+            )
+            live_session.commit()
+
+        with Session(engine) as stale_session:
+            stale_repository = TrainingCompletionRepository(stale_session)
+            assert not stale_repository.mark_stale_if_unchanged(
+                export_id,
+                expected_status=expected_status,
+                expected_worker_id=expected_worker_id,
+                expected_claim_token=expected_claim_token,
+                expected_worker_generation=expected_generation,
+                heartbeat_cutoff=now + timedelta(seconds=1),
+                now=now + timedelta(seconds=121),
+            )
+            stale_session.commit()
+
+        with Session(engine) as live_session:
+            live_repository = TrainingCompletionRepository(live_session)
+            assert not live_repository.claim(
+                export_id,
+                worker_id="worker-b",
+                claim_token="claim-b",
+                now=now + timedelta(seconds=31),
+                stale_after_seconds=120,
+            )
+            live_session.rollback()
+
+        with Session(engine) as session:
+            record = TrainingCompletionRepository(session).get(export_id)
+            assert record is not None
+            assert record.status == TrainingCompletionStatus.PREPARING.value
+            assert record.worker_id == "worker-a"
+            assert record.claim_token == "claim-a"
+            assert record.worker_generation == expected_generation
+    finally:
+        service.close()
+        training.close()
+
+
+def test_reconcile_remote_only_enqueues_while_copy_is_blocked(
+    test_workspace: Path,
+) -> None:
+    service, storage, training, project_id, job_id = _completion_fixture(test_workspace)
+    try:
+        preview = service.preview(job_id)
+        with Session(create_engine_for_settings(service.settings)) as session:
+            repository = TrainingCompletionRepository(session)
+            record = repository.create(
+                job_id, project_id, preview.source_fingerprint, preview.token
+            )
+            record.status = TrainingCompletionStatus.STALE.value
+            record.current_stage = TrainingCompletionStatus.STALE.value
+            session.commit()
+            export_id = UUID(record.id)
+
+        blocker = threading.Event()
+        storage.adapter.copy_blocker = blocker
+        started_at = time.monotonic()
+        assert service.reconcile_remote(time_budget_seconds=0.25) == 1
+        assert time.monotonic() - started_at < 0.75
+        assert storage.adapter.copy_started.wait(timeout=5)
+        future = service._futures[export_id]
+        assert not future.done()
+        blocker.set()
+        future.result(timeout=30)
+        assert (
+            service.get_export(export_id).status is TrainingCompletionStatus.COMPLETED
+        )
+    finally:
+        if storage.adapter.copy_blocker is not None:
+            storage.adapter.copy_blocker.set()
+        service.close()
+        training.close()
+
+
+def test_cleanup_does_not_remove_an_in_process_active_export(
+    test_workspace: Path,
+) -> None:
+    service, _storage, training, project_id, job_id = _completion_fixture(
+        test_workspace
+    )
+    future: Future[None] = Future()
+    try:
+        with Session(create_engine_for_settings(service.settings)) as session:
+            repository = TrainingCompletionRepository(session)
+            record = repository.create(job_id, project_id, "a" * 64, "b" * 64)
+            record.status = TrainingCompletionStatus.PREPARING.value
+            record.current_stage = TrainingCompletionStatus.PREPARING.value
+            record.worker_id = "active-worker"
+            record.claim_token = "active-claim"
+            record.heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+            session.commit()
+            export_id = UUID(record.id)
+        assert future.set_running_or_notify_cancel()
+        service._futures[export_id] = future
+        temporary = (
+            service.settings.projects_dir
+            / str(project_id)
+            / "training"
+            / "exports"
+            / ".creating-active"
+        )
+        temporary.mkdir(parents=True)
+        (temporary / "owned.txt").write_text("active", encoding="utf-8")
+
+        assert service._cleanup_temporary_exports(max_items=1) == 0
+        assert temporary.exists()
+    finally:
+        future.cancel()
+        service._futures.clear()
+        service.close()
+        training.close()
+
+
+def test_cancel_during_local_export_cleans_only_its_temporary_directory(
+    test_workspace: Path,
+) -> None:
+    service, _storage, training, _project_id, job_id = _completion_fixture(
+        test_workspace
+    )
+    try:
+        context = service._build_context(job_id)
+        token = CancelToken()
+        token.cancel()
+        with pytest.raises(CompletionFailure) as raised:
+            service._build_local_export(context, token)
+        assert raised.value.code == TrainingCompletionErrorCode.CANCELED.value
+        exports = (
+            service.settings.projects_dir
+            / str(context.job.project_id)
+            / "training"
+            / "exports"
+        )
+        assert not any(path.name.startswith(".creating-") for path in exports.iterdir())
+    finally:
+        service.close()
+        training.close()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "size", "hash"])
+def test_restart_rejects_remote_artifact_mutation(
+    test_workspace: Path, mutation: str
+) -> None:
+    service, storage, training, _project_id, job_id = _completion_fixture(
+        test_workspace
+    )
+    try:
+        export_id = service.synchronize_sync(
+            job_id, preview_token=service.preview(job_id).token
+        )
+        preview = service.preview(job_id)
+        target = storage.training_remote_path(preview.project_id, job_id)
+        marker_key = f"{target.relative_path}/completion-manifest.json"
+        marker = json.loads(storage.adapter.files[marker_key])
+        relative = next(
+            item["relative_path"]
+            for item in marker["export_files"]
+            if item["relative_path"].startswith("artifacts/")
+        )
+        artifact_key = f"{target.relative_path}/{relative}"
+        if mutation == "missing":
+            storage.adapter.set_remote_bytes(artifact_key, None)
+        elif mutation == "size":
+            storage.adapter.set_remote_bytes(artifact_key, b"bad")
+        else:
+            storage.adapter.set_remote_hash(artifact_key, "md5", "0" * 32)
+        _mark_stale_for_restart(service.settings, export_id)
+
+        service._run_export(export_id)
+        export = service.get_export(export_id)
+        assert export.status is TrainingCompletionStatus.FAILED
+        assert export.error_code in {
+            TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT.value,
+            TrainingCompletionErrorCode.REMOTE_VERIFICATION_FAILED.value,
+        }
+    finally:
+        service.close()
+        training.close()
+
+
+@pytest.mark.parametrize("mutation", ["zero", "invalid", "symlink"])
+def test_final_lora_validation_rejects_unsafe_or_invalid_output(
+    test_workspace: Path, mutation: str
+) -> None:
+    service, _storage, training, _project_id, job_id = _completion_fixture(
+        test_workspace
+    )
+    try:
+        context = service._build_context(job_id)
+        output = Path(context.job.runtime_directory or "") / "output"
+        final_lora = output / "test-lora.safetensors"
+        if mutation == "zero":
+            final_lora.write_bytes(b"")
+        elif mutation == "invalid":
+            final_lora.write_bytes(b"not a safetensors file")
+        else:
+            target = output / "not-a-lora.txt"
+            target.write_text("not a lora", encoding="utf-8")
+            final_lora.unlink()
+            try:
+                final_lora.symlink_to(target)
+            except (OSError, NotImplementedError):
+                pytest.skip("symlink creation is unavailable")
+        with pytest.raises(CompletionFailure) as raised:
+            service.preview(job_id)
+        assert raised.value.code in {
+            TrainingCompletionErrorCode.FINAL_LORA_INVALID.value,
+            TrainingCompletionErrorCode.FINAL_LORA_CHANGING.value,
+        }
+    finally:
+        service.close()
+        training.close()
+
+
+def test_restart_rejects_completion_marker_with_changed_remote_bytes(
+    test_workspace: Path,
+) -> None:
+    service, storage, training, _project_id, job_id = _completion_fixture(
+        test_workspace
+    )
+    try:
+        export_id = service.synchronize_sync(
+            job_id, preview_token=service.preview(job_id).token
+        )
+        preview = service.preview(job_id)
+        target = storage.training_remote_path(preview.project_id, job_id)
+        marker_key = f"{target.relative_path}/completion-manifest.json"
+        original = storage.adapter.files[marker_key]
+        storage.adapter.files[marker_key] = original + b" "
+        _mark_stale_for_restart(service.settings, export_id)
+
+        service._run_export(export_id)
+        export = service.get_export(export_id)
+        assert export.status is TrainingCompletionStatus.FAILED
+        assert (
+            export.error_code
+            == TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT.value
+        )
+    finally:
+        service.close()
+        training.close()
+
+
+@pytest.mark.parametrize("mutation", ["extra_file", "missing_file", "wrong_job"])
+def test_restart_rejects_completion_marker_without_exact_transfer_provenance(
+    test_workspace: Path, mutation: str
+) -> None:
+    service, storage, training, _project_id, job_id = _completion_fixture(
+        test_workspace
+    )
+    try:
+        export_id = service.synchronize_sync(
+            job_id, preview_token=service.preview(job_id).token
+        )
+        preview = service.preview(job_id)
+        target = storage.training_remote_path(preview.project_id, job_id)
+        marker_key = f"{target.relative_path}/completion-manifest.json"
+        payload = json.loads(storage.adapter.files[marker_key])
+        if mutation == "extra_file":
+            payload["export_files"].append(
+                {"relative_path": "unexpected.txt", "size": 0, "sha256": "0" * 64}
+            )
+        elif mutation == "missing_file":
+            payload["export_files"].pop()
+        else:
+            payload["storage_transfer_job_id"] = str(uuid4())
+        encoded = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":")
+        ).encode()
+        storage.adapter.set_remote_bytes(
+            marker_key,
+            encoded,
+        )
+        _mark_stale_for_restart(service.settings, export_id)
+        with Session(create_engine_for_settings(service.settings)) as session:
+            record = session.scalar(
+                select(TrainingCompletionExportRecord).where(
+                    TrainingCompletionExportRecord.id == str(export_id)
+                )
+            )
+            assert record is not None
+            record.completion_manifest_sha256 = hashlib.sha256(encoded).hexdigest()
+            session.commit()
+
+        service._run_export(export_id)
+        export = service.get_export(export_id)
+        assert export.status is TrainingCompletionStatus.FAILED
+        assert (
+            export.error_code
+            == TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT.value
+        )
     finally:
         service.close()
         training.close()

@@ -633,7 +633,10 @@ class StorageService:
             manifest_result = self.adapter.copy(
                 manifest,
                 target.child("transfer-manifest.json"),
-                CopyOptions(overwrite_policy=policy, checksum=True),
+                CopyOptions(
+                    overwrite_policy=OverwritePolicy.OVERWRITE_CHANGED,
+                    checksum=True,
+                ),
                 cancel_token=token,
                 process_callback=lambda pid: self._set_rclone_pid(job_id, pid),
             )
@@ -674,7 +677,10 @@ class StorageService:
                 final_manifest_result = self.adapter.copy(
                     manifest,
                     target.child("transfer-manifest.json"),
-                    CopyOptions(overwrite_policy=policy, checksum=True),
+                    CopyOptions(
+                        overwrite_policy=OverwritePolicy.OVERWRITE_CHANGED,
+                        checksum=True,
+                    ),
                     cancel_token=token,
                     process_callback=lambda pid: self._set_rclone_pid(job_id, pid),
                 )
@@ -1071,7 +1077,10 @@ class StorageService:
             manifest_result = self.adapter.copy(
                 manifest,
                 target.child("transfer-manifest.json"),
-                CopyOptions(overwrite_policy=policy, checksum=True),
+                CopyOptions(
+                    overwrite_policy=OverwritePolicy.OVERWRITE_CHANGED,
+                    checksum=True,
+                ),
                 cancel_token=token,
                 process_callback=lambda pid: self._set_rclone_pid(job_id, pid),
             )

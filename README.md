@@ -387,4 +387,10 @@ Phase 7Bは、完了した学習jobから速度、VRAM使用量、終了理由�
 
 最終LoRAは`output/{output_name}.safetensors`だけを対象とし、checkpoint代用、symlink、変化中ファイル、safetensors検証失敗を拒否します。worker claim、generation fencing、heartbeat、cancel intent、stale復旧、再起動後のremote reconcile、同一markerの冪等再開、remote衝突のfail-closedを実装しています。manifestにはdataset remote provenance、model hash、config fingerprint、resume情報、artifact hashes、transfer job IDを含め、秘密情報や絶対パスは含めません。
 
+起動時のrecoveryはDB状態のboundedな列挙とworker enqueueだけを行い、`create_app`の同期経路からhash、ファイルコピー、rclone、remote marker読み取りを実行しません。`reconcile_remote(time_budget_seconds=...)`は最大256件のrecovery候補を時間予算内でexecutorへ渡し、blockingなremote処理はworkerが担当します。stale化はstatus、worker ID、claim token、generation、heartbeat cutoffを含む条件付き更新で行い、heartbeatが生きたworkerを回収しません。
+
+ローカルexportはRunPod Linuxでは`O_DIRECTORY|O_NOFOLLOW`付きのheld directory fd、device／inode identity、`O_EXCL`一時ファイル、sourceの前後安定性確認、親identity確認、file／directory fsync、atomic rename後の再トラバースを使用します。Windowsではsymlink・regular file・identityを検証するfallbackを使用し、cleanupは所有権を確認できる`.creating-*`だけに限定します。
+
+completion manifestは1 MiBを上限とし、artifact本体と転送manifestの検証後に最後にコピーします。コピー後は同じremote bytesを再読してSHA-256を計算し、DBに保存したhashと比較したうえで、dataset／model／config／resume provenance、transfer job、完全な`export_files`集合、remote artifact実体を検証してから`completed`へ遷移します。Fake storageにはoverwrite、cancel、block、失敗、例外、remote hash改変の注入点があります。
+
 学習タブからpreview、確定同期開始、一覧更新、cancel、retryを操作できます。同期失敗時はPodを稼働したまま保持し、RunPodのStop／Terminate制御（Phase 9B）は実装していません。

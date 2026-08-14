@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import Select, select, update
 from sqlalchemy.orm import Session
 
 from runpod_lora_studio.domain.training_completion_models import (
@@ -104,22 +104,25 @@ class TrainingCompletionRepository:
         ).all()
         return [export_from_record(record) for record in records]
 
-    def list_recovery_records(self) -> list[TrainingCompletionExportRecord]:
-        return list(
-            self.session.scalars(
-                select(TrainingCompletionExportRecord).where(
-                    TrainingCompletionExportRecord.status.in_(
-                        [
-                            TrainingCompletionStatus.PREPARING.value,
-                            TrainingCompletionStatus.READY.value,
-                            TrainingCompletionStatus.UPLOADING.value,
-                            TrainingCompletionStatus.VERIFYING.value,
-                            TrainingCompletionStatus.STALE.value,
-                        ]
-                    )
-                )
-            ).all()
+    def list_recovery_records(
+        self, *, limit: int | None = None
+    ) -> list[TrainingCompletionExportRecord]:
+        query: Select[tuple[TrainingCompletionExportRecord]] = select(
+            TrainingCompletionExportRecord
+        ).where(
+            TrainingCompletionExportRecord.status.in_(
+                [
+                    TrainingCompletionStatus.PREPARING.value,
+                    TrainingCompletionStatus.READY.value,
+                    TrainingCompletionStatus.UPLOADING.value,
+                    TrainingCompletionStatus.VERIFYING.value,
+                    TrainingCompletionStatus.STALE.value,
+                ]
+            )
         )
+        if limit is not None:
+            query = query.limit(max(0, limit))
+        return list(self.session.scalars(query).all())
 
     def create(
         self,
@@ -184,9 +187,7 @@ class TrainingCompletionRepository:
         record = self.get(export_id)
         if record is None:
             return False
-        owner_available = record.worker_id is None or record.heartbeat_at is None
         heartbeat = _utc(record.heartbeat_at)
-        owner_stale = heartbeat is None or heartbeat < cutoff
         result = self.session.execute(
             update(TrainingCompletionExportRecord)
             .execution_options(synchronize_session=False)
@@ -197,10 +198,6 @@ class TrainingCompletionRepository:
                     (TrainingCompletionExportRecord.worker_id.is_(None))
                     | (TrainingCompletionExportRecord.heartbeat_at.is_(None))
                     | (TrainingCompletionExportRecord.heartbeat_at < cutoff)
-                    | (
-                        TrainingCompletionExportRecord.status
-                        == TrainingCompletionStatus.STALE.value
-                    )
                 ),
             )
             .values(
@@ -217,7 +214,58 @@ class TrainingCompletionRepository:
                 updated_at=current_time,
             )
         )
-        del owner_available, owner_stale
+        del record, heartbeat
+        return bool(result.rowcount == 1)
+
+    def mark_stale_if_unchanged(
+        self,
+        export_id: UUID,
+        *,
+        expected_status: str,
+        expected_worker_id: str | None,
+        expected_claim_token: str | None,
+        expected_worker_generation: int,
+        heartbeat_cutoff: datetime,
+        now: datetime | None = None,
+    ) -> bool:
+        """Transition a stale worker only when its complete claim is unchanged."""
+        current_time = now or utc_now()
+        worker_condition = (
+            TrainingCompletionExportRecord.worker_id.is_(None)
+            if expected_worker_id is None
+            else TrainingCompletionExportRecord.worker_id == expected_worker_id
+        )
+        claim_condition = (
+            TrainingCompletionExportRecord.claim_token.is_(None)
+            if expected_claim_token is None
+            else TrainingCompletionExportRecord.claim_token == expected_claim_token
+        )
+        result = self.session.execute(
+            update(TrainingCompletionExportRecord)
+            .execution_options(synchronize_session=False)
+            .where(
+                TrainingCompletionExportRecord.id == str(export_id),
+                TrainingCompletionExportRecord.status == expected_status,
+                worker_condition,
+                claim_condition,
+                TrainingCompletionExportRecord.worker_generation
+                == expected_worker_generation,
+                (
+                    TrainingCompletionExportRecord.heartbeat_at.is_(None)
+                    | (TrainingCompletionExportRecord.heartbeat_at < heartbeat_cutoff)
+                ),
+            )
+            .values(
+                status=TrainingCompletionStatus.STALE.value,
+                current_stage=TrainingCompletionStatus.STALE.value,
+                worker_id=None,
+                claim_token=None,
+                heartbeat_at=current_time,
+                error_code="STALE_WORKER",
+                error_summary="completion workerのheartbeatを確認できません",
+                updated_at=current_time,
+            )
+        )
         return bool(result.rowcount == 1)
 
     def update_claimed(
@@ -304,6 +352,8 @@ class TrainingCompletionRepository:
                 error_code=None,
                 error_summary=None,
                 completed_at=None,
+                remote_completion_manifest_relative_path=None,
+                completion_manifest_sha256=None,
                 updated_at=utc_now(),
             )
         )

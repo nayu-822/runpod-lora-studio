@@ -4,9 +4,9 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from runpod_lora_studio.config.settings import AppSettings
@@ -54,6 +54,11 @@ from runpod_lora_studio.persistence.training_completion_repository import (
     export_from_record,
     utc_now,
 )
+from runpod_lora_studio.services.completion_filesystem import (
+    CompletionFilesystemError,
+    SafeExportDirectory,
+    stable_file_hash,
+)
 from runpod_lora_studio.services.project_service import UserFacingError
 from runpod_lora_studio.services.storage_service import StorageService
 from runpod_lora_studio.services.training_artifact import TrainingArtifactScanner
@@ -65,6 +70,52 @@ EXPORT_SCHEMA_VERSION = "phase9a-training-export-v1"
 COMPLETION_MANIFEST_SCHEMA_VERSION = "phase9a-training-completion-v1"
 COMPLETION_MANIFEST_NAME = "completion-manifest.json"
 EXPORT_MANIFEST_NAME = "export-manifest.json"
+MAX_COMPLETION_MANIFEST_BYTES = 1024 * 1024
+
+_COMPLETION_MANIFEST_REQUIRED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "project_id",
+        "training_job_id",
+        "training_config_id",
+        "parent_training_job_id",
+        "resume_artifact_id",
+        "training_status",
+        "exit_code",
+        "started_at",
+        "finished_at",
+        "dataset_snapshot_id",
+        "dataset_content_hash",
+        "dataset_remote_provenance",
+        "managed_model_id",
+        "managed_model_sha256",
+        "safe_config_fingerprint",
+        "final_lora_relative_path",
+        "final_lora_size",
+        "final_lora_sha256",
+        "export_files",
+        "logs",
+        "samples",
+        "environment_provenance",
+        "performance_provenance",
+        "storage_transfer_job_id",
+        "source_fingerprint",
+        "export_fingerprint",
+        "export_manifest_sha256",
+        "remote_relative_path",
+        "created_at",
+    }
+)
+_DATASET_REMOTE_PROVENANCE_FIELDS = frozenset(
+    {
+        "snapshot_id",
+        "remote_relative_path",
+        "storage_transfer_job_id",
+        "remote_manifest_sha256",
+        "content_sha256",
+        "verification_level",
+    }
+)
 
 
 class CompletionFailure(Exception):
@@ -101,6 +152,7 @@ class TrainingCompletionService:
         *,
         storage_service: StorageService | None = None,
         training_service: TrainingService | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = create_session_factory(settings)
@@ -112,10 +164,11 @@ class TrainingCompletionService:
         self._futures: dict[UUID, Future[Any]] = {}
         self._cancel_tokens: dict[UUID, CancelToken] = {}
         self._lock = threading.Lock()
+        self._clock = clock or time.monotonic
 
     @property
     def export_root(self) -> Path:
-        return self.settings.projects_dir
+        return Path(self.settings.projects_dir)
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
@@ -261,7 +314,20 @@ class TrainingCompletionService:
         self._cleanup_temporary_exports()
         try:
             with self.session_factory() as session:
-                records = TrainingCompletionRepository(session).list_recovery_records()
+                records = [
+                    record
+                    for record in TrainingCompletionRepository(
+                        session
+                    ).list_recovery_records(limit=256)
+                    if record.status
+                    in {
+                        TrainingCompletionStatus.PREPARING.value,
+                        TrainingCompletionStatus.READY.value,
+                        TrainingCompletionStatus.UPLOADING.value,
+                        TrainingCompletionStatus.VERIFYING.value,
+                    }
+                ]
+                repository = TrainingCompletionRepository(session)
                 for record in records:
                     heartbeat = _utc(record.heartbeat_at)
                     if heartbeat is not None and heartbeat >= cutoff:
@@ -269,26 +335,17 @@ class TrainingCompletionService:
                     future = self._futures.get(UUID(record.id))
                     if future is not None and not future.done():
                         continue
-                    result = session.execute(
-                        update(TrainingCompletionExportRecord)
-                        .where(
-                            TrainingCompletionExportRecord.id == record.id,
-                            TrainingCompletionExportRecord.status == record.status,
-                        )
-                        .values(
-                            status=TrainingCompletionStatus.STALE.value,
-                            current_stage=TrainingCompletionStatus.STALE.value,
-                            worker_id=None,
-                            claim_token=None,
-                            heartbeat_at=now,
-                            error_code="STALE_WORKER",
-                            error_summary=(
-                                "completion workerのheartbeatを確認できません"
-                            ),
-                            updated_at=now,
+                    recovered += int(
+                        repository.mark_stale_if_unchanged(
+                            UUID(record.id),
+                            expected_status=record.status,
+                            expected_worker_id=record.worker_id,
+                            expected_claim_token=record.claim_token,
+                            expected_worker_generation=record.worker_generation,
+                            heartbeat_cutoff=cutoff,
+                            now=now,
                         )
                     )
-                    recovered += int(result.rowcount == 1)
                 session.commit()
         except OperationalError:
             return 0
@@ -299,60 +356,119 @@ class TrainingCompletionService:
         if root.is_symlink() or not root.is_dir():
             return 0
         removed = 0
-        root_resolved = root.resolve()
         try:
-            candidates = root.glob("*/training/exports/.creating-*")
-            for candidate in candidates:
-                if removed >= max_items:
-                    break
-                if (
-                    candidate.is_symlink()
-                    or not candidate.is_dir()
-                    or not candidate.name.startswith(".creating-")
-                ):
-                    continue
-                try:
-                    if not _is_relative_to(candidate.resolve(), root_resolved):
-                        continue
-                    shutil.rmtree(candidate)
-                except (OSError, RuntimeError):
-                    logger.warning(
-                        "training_completion_temp_cleanup_failed path=%s",
-                        candidate,
-                        exc_info=True,
-                    )
-                    continue
-                removed += 1
+            project_paths = sorted(root.iterdir(), key=lambda value: value.name)
         except OSError:
-            return removed
+            return 0
+        cutoff = datetime.now(UTC) - timedelta(
+            seconds=self.settings.storage_job_stale_after_seconds
+        )
+        for project_path in project_paths:
+            if removed >= max_items:
+                break
+            if project_path.is_symlink() or not project_path.is_dir():
+                continue
+            try:
+                project_id = UUID(project_path.name)
+            except ValueError:
+                continue
+            try:
+                with self.session_factory() as session:
+                    records = list(
+                        session.scalars(
+                            select(TrainingCompletionExportRecord).where(
+                                TrainingCompletionExportRecord.project_id
+                                == str(project_id)
+                            )
+                        ).all()
+                    )
+            except OperationalError:
+                return removed
+            active_project = False
+            for record in records:
+                future = self._futures.get(UUID(record.id))
+                if future is not None and not future.done():
+                    # A live in-process worker owns its temporary directory,
+                    # even before it has persisted PREPARING.
+                    active_project = True
+                    break
+                if record.status not in {
+                    TrainingCompletionStatus.PREPARING.value,
+                    TrainingCompletionStatus.READY.value,
+                    TrainingCompletionStatus.UPLOADING.value,
+                    TrainingCompletionStatus.VERIFYING.value,
+                }:
+                    continue
+                heartbeat = _utc(record.heartbeat_at)
+                if heartbeat is not None and heartbeat >= cutoff:
+                    active_project = True
+                    break
+            if active_project:
+                continue
+            exports_path = project_path / "training" / "exports"
+            if (
+                exports_path.is_symlink()
+                or not exports_path.exists()
+                or not exports_path.is_dir()
+            ):
+                continue
+            try:
+                with SafeExportDirectory.open_root(
+                    root,
+                    (project_path.name, "training", "exports"),
+                    create_missing=False,
+                ) as exports_root:
+                    for candidate in sorted(
+                        exports_path.iterdir(), key=lambda value: value.name
+                    ):
+                        if removed >= max_items:
+                            break
+                        if not candidate.name.startswith(".creating-"):
+                            continue
+                        if exports_root.child_exists(candidate.name) != "directory":
+                            continue
+                        temporary = exports_root.open_child(candidate.name)
+                        try:
+                            exports_root.remove_child(temporary)
+                        except (CompletionFilesystemError, OSError):
+                            logger.warning(
+                                "training_completion_temp_cleanup_failed path=%s",
+                                candidate,
+                                exc_info=True,
+                            )
+                            continue
+                        finally:
+                            temporary.close()
+                        removed += 1
+            except (CompletionFilesystemError, OSError, RuntimeError):
+                logger.warning(
+                    "training_completion_temp_cleanup_failed project=%s",
+                    project_id,
+                    exc_info=True,
+                )
         return removed
 
     def reconcile_remote(self, *, time_budget_seconds: float = 5.0) -> int:
-        """Resume bounded marker reconciliation after a process restart."""
-        deadline = time.monotonic() + max(0.1, time_budget_seconds)
-        completed = 0
+        """Enqueue bounded post-restart recovery without doing export I/O inline."""
+        deadline = self._clock() + max(0.0, time_budget_seconds)
+        enqueued = 0
         try:
             with self.session_factory() as session:
                 ids = [
                     UUID(record.id)
                     for record in TrainingCompletionRepository(
                         session
-                    ).list_recovery_records()
+                    ).list_recovery_records(limit=256)
                     if record.status == TrainingCompletionStatus.STALE.value
                 ]
         except OperationalError:
             # The UI can be imported before the Phase 9A migration is applied.
             return 0
         for export_id in ids:
-            if time.monotonic() >= deadline:
+            if self._clock() >= deadline:
                 break
-            try:
-                self._run_export(export_id)
-            except (CompletionFailure, UserFacingError):
-                continue
-            current = self.get_export(export_id)
-            completed += int(current.status is TrainingCompletionStatus.COMPLETED)
-        return completed
+            enqueued += int(self._submit(export_id))
+        return enqueued
 
     def status_rows(self, project_id: UUID | None = None) -> list[list[str]]:
         try:
@@ -376,14 +492,15 @@ class TrainingCompletionService:
             for export in exports
         ]
 
-    def _submit(self, export_id: UUID) -> None:
+    def _submit(self, export_id: UUID) -> bool:
         with self._lock:
             future = self._futures.get(export_id)
             if future is not None and not future.done():
-                return
+                return False
             self._futures[export_id] = self._executor.submit(
                 self._run_export, export_id
             )
+            return True
 
     def _prepare_export(self, training_job_id: UUID, preview_token: str | None) -> UUID:
         preview = self.preview(training_job_id)
@@ -573,32 +690,40 @@ class TrainingCompletionService:
         )
         self._check_cancel(export_id, cancel_token)
         files = self._upload_files(final_root)
-        remote_marker = self._read_remote_completion_marker(context.target)
+        self._check_claim(export_id, worker_id, claim_token, worker_generation)
+        remote_marker, remote_marker_hash = self._read_remote_completion_with_hash(
+            context.target
+        )
         if remote_marker is not None:
-            if not self._marker_matches_context(
-                remote_marker, context, export_fingerprint
+            self._check_cancel(export_id, cancel_token)
+            if (
+                export.completion_manifest_sha256 is not None
+                and remote_marker_hash != export.completion_manifest_sha256
             ):
                 raise CompletionFailure(
                     TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
-                    "同一remote destinationに異なるcompletion manifestがあります",
+                    "remote completion manifestのhashが保存済み値と一致しません",
                 )
-            self._verify_existing_remote_completion(
-                context, files, remote_marker, export_id
+            existing_storage_job_id = self._verify_existing_remote_completion(
+                context,
+                files,
+                remote_marker,
+                export_id,
+                export_manifest_sha256=export_manifest_sha256,
+                expected_export_fingerprint=export_fingerprint,
             )
-            storage_job_id = self._existing_artifact_job_id(context.job.id, export_id)
-            if storage_job_id is None:
+            if remote_marker_hash is None:
                 raise CompletionFailure(
                     TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
-                    "既存completion manifestの転送履歴を確認できません",
+                    "remote completion manifestのhashがありません",
                 )
-            completion_hash = self._hash_remote_marker(context.target)
             self._complete_claimed(
                 export_id,
                 worker_id,
                 claim_token,
                 worker_generation,
-                storage_job_id,
-                completion_hash,
+                existing_storage_job_id,
+                remote_marker_hash,
                 context,
                 export_fingerprint,
             )
@@ -606,7 +731,11 @@ class TrainingCompletionService:
         settings = self.storage.get_project_storage_settings(
             UUID(context.job.project_id)
         )
-        storage_job_id = self._existing_artifact_job_id(context.job.id, export_id)
+        storage_job_id = self._find_matching_artifact_job_id(
+            context,
+            files,
+            preferred_job_id=export.storage_transfer_job_id,
+        )
         if storage_job_id is None:
             plan = self.storage.dry_run_artifact_upload(
                 files, context.target, overwrite_policy=settings.overwrite_policy
@@ -663,9 +792,11 @@ class TrainingCompletionService:
             current_stage="remote_artifact_verify",
             heartbeat_at=utc_now(),
         )
+        self._check_claim(export_id, worker_id, claim_token, worker_generation)
         self.storage.verify_remote_artifact_files(
             context.target, files, settings.verification_policy
         )
+        self._check_cancel(export_id, cancel_token)
         current_context = self._build_context(context.job.id)
         if current_context.source_fingerprint != context.source_fingerprint:
             raise CompletionFailure(
@@ -680,6 +811,7 @@ class TrainingCompletionService:
             export_fingerprint,
             export_manifest_path,
         )
+        self._check_cancel(export_id, cancel_token)
         self._claimed_update(
             export_id,
             worker_id,
@@ -691,6 +823,7 @@ class TrainingCompletionService:
             heartbeat_at=utc_now(),
         )
         self._check_cancel(export_id, cancel_token)
+        self._check_claim(export_id, worker_id, claim_token, worker_generation)
         result = self.storage.adapter.copy(
             marker_path,
             context.target.child(COMPLETION_MANIFEST_NAME),
@@ -701,28 +834,64 @@ class TrainingCompletionService:
             cancel_token=cancel_token,
         )
         if result.returncode != 0:
+            remote_marker, remote_marker_hash = self._read_remote_completion_with_hash(
+                context.target
+            )
+            if remote_marker is None:
+                raise CompletionFailure(
+                    TrainingCompletionErrorCode.REMOTE_VERIFICATION_FAILED,
+                    "completion manifestのremote uploadに失敗しました",
+                )
+        else:
+            remote_marker, remote_marker_hash = self._read_remote_completion_with_hash(
+                context.target
+            )
+        self._check_cancel(export_id, cancel_token)
+        if remote_marker_hash is None:
             raise CompletionFailure(
                 TrainingCompletionErrorCode.REMOTE_VERIFICATION_FAILED,
-                "completion manifestのremote uploadに失敗しました",
+                "remote completion manifestがありません",
             )
-        remote_marker = self._read_remote_completion_marker(context.target)
-        if remote_marker is None or not self._marker_matches_context(
-            remote_marker, current_context, export_fingerprint
-        ):
+        remote_hash = remote_marker_hash
+        if remote_hash != marker_hash:
             raise CompletionFailure(
                 TrainingCompletionErrorCode.REMOTE_VERIFICATION_FAILED,
-                "remote completion manifestの再検証に失敗しました",
+                "remote completion manifestのSHA-256が一致しません",
             )
-        self._verify_existing_remote_completion(
-            current_context, files, remote_marker, export_id
+        if remote_marker is None:
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.REMOTE_VERIFICATION_FAILED,
+                "remote completion manifestの形式が不正です",
+            )
+        self._validate_completion_marker(
+            remote_marker,
+            current_context,
+            export_fingerprint,
+            files=files,
+            export_manifest_sha256=export_manifest_sha256,
+            expected_storage_job_id=storage_job_id,
+            error_code=TrainingCompletionErrorCode.REMOTE_VERIFICATION_FAILED,
         )
+        verified_job_id = self._verify_existing_remote_completion(
+            current_context,
+            files,
+            remote_marker,
+            export_id,
+            export_manifest_sha256=export_manifest_sha256,
+            expected_export_fingerprint=export_fingerprint,
+        )
+        if verified_job_id != storage_job_id:
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.REMOTE_VERIFICATION_FAILED,
+                "completion manifestの転送jobが一致しません",
+            )
         self._complete_claimed(
             export_id,
             worker_id,
             claim_token,
             worker_generation,
             storage_job_id,
-            marker_hash,
+            remote_hash,
             current_context,
             export_fingerprint,
         )
@@ -1079,106 +1248,121 @@ class TrainingCompletionService:
         self, context: _CompletionContext, cancel_token: CancelToken
     ) -> Path:
         projects_root = self.settings.projects_dir
-        if projects_root.is_symlink():
-            raise CompletionFailure(
-                TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
-                "projects root must not be a symlink",
-            )
-        projects_root.mkdir(parents=True, exist_ok=True)
-        project_root = projects_root / str(context.job.project_id)
-        if project_root.is_symlink():
-            raise CompletionFailure(
-                TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
-                "project export root must not be a symlink",
-            )
-        training_root = project_root / "training"
-        exports_root = training_root / "exports"
-        if training_root.is_symlink() or exports_root.is_symlink():
-            raise CompletionFailure(
-                TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
-                "export parent must not be a symlink",
-            )
-        final_root = exports_root / str(context.job.id)
-        exports_root.mkdir(parents=True, exist_ok=True)
-        if exports_root.is_symlink():
-            raise CompletionFailure(
-                TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
-                "export root must not be a symlink",
-            )
-        if final_root.is_symlink():
-            raise CompletionFailure(
-                TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
-                "local export繝ｭ繝ｼ繝医′symlink縺ｧ縺吶・",
-            )
-        if final_root.exists():
-            for marker_path in (
-                final_root / EXPORT_MANIFEST_NAME,
-                final_root / "provenance" / "source-fingerprint.json",
-            ):
-                try:
-                    payload = _read_json(marker_path)
-                    if payload.get("source_fingerprint") == context.source_fingerprint:
-                        return final_root
-                except (OSError, ValueError, json.JSONDecodeError):
-                    continue
-            raise CompletionFailure(
-                TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
-                "同じ学習jobのlocal exportが異なる内容です",
-            )
-        temporary = exports_root / f".creating-{uuid4().hex}"
-        temporary.mkdir(parents=True, exist_ok=False)
+        final_name = str(context.job.id)
         try:
-            for item in context.files:
-                self._check_cancel_for_token(cancel_token)
-                destination = temporary / item.relative_path
-                source = item.source_path
-                _copy_stable(source, destination, cancel_token)
-            self._write_generated_files(temporary, context)
-            _fsync_tree(temporary)
-            temporary.replace(final_root)
-            _fsync_directory(exports_root)
+            with SafeExportDirectory.open_root(
+                projects_root,
+                (str(context.job.project_id), "training", "exports"),
+            ) as exports_root:
+                final_state = exports_root.child_exists(final_name)
+                if final_state != "missing":
+                    if final_state != "directory":
+                        raise CompletionFilesystemError(
+                            "final export is not a directory"
+                        )
+                    with exports_root.open_child(final_name) as final_directory:
+                        for marker_relative in (
+                            EXPORT_MANIFEST_NAME,
+                            "provenance/source-fingerprint.json",
+                        ):
+                            try:
+                                payload = json.loads(
+                                    final_directory.read_bytes(
+                                        marker_relative,
+                                        max_bytes=MAX_COMPLETION_MANIFEST_BYTES,
+                                    )
+                                )
+                                if (
+                                    isinstance(payload, dict)
+                                    and payload.get("source_fingerprint")
+                                    == context.source_fingerprint
+                                ):
+                                    final_directory.regular_files()
+                                    return final_directory.path
+                            except (
+                                CompletionFilesystemError,
+                                OSError,
+                                TypeError,
+                                ValueError,
+                                json.JSONDecodeError,
+                            ):
+                                continue
+                    raise CompletionFailure(
+                        TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
+                        "同じ学習jobのlocal exportが異なる内容です",
+                    )
+                temporary: SafeExportDirectory | None = None
+                renamed = False
+                try:
+                    temporary = exports_root.open_child(
+                        f".creating-{uuid4().hex}", create=True
+                    )
+                    for item in context.files:
+                        self._check_cancel_for_token(cancel_token)
+                        temporary.copy_file(
+                            item.source_path,
+                            item.relative_path,
+                            cancel=lambda: self._check_cancel_for_token(cancel_token),
+                        )
+                    self._write_generated_files(temporary, context)
+                    temporary.fsync_tree()
+                    final_directory = exports_root.rename_child(temporary, final_name)
+                    renamed = True
+                    try:
+                        final_directory.regular_files()
+                    finally:
+                        final_directory.close()
+                finally:
+                    if temporary is not None and not renamed:
+                        try:
+                            exports_root.remove_child(temporary)
+                        except (CompletionFilesystemError, OSError):
+                            logger.warning(
+                                "training_completion_temp_cleanup_failed path=%s",
+                                temporary.path,
+                                exc_info=True,
+                            )
+                        finally:
+                            temporary.close()
         except CompletionFailure:
-            shutil.rmtree(temporary, ignore_errors=True)
             raise
-        except (OSError, ValueError, RuntimeError) as exc:
-            shutil.rmtree(temporary, ignore_errors=True)
+        except (CompletionFilesystemError, OSError, ValueError, RuntimeError) as exc:
             raise CompletionFailure(
                 TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
                 "local exportの構築に失敗しました",
             ) from exc
-        return final_root
+        return (
+            Path(projects_root)
+            / str(context.job.project_id)
+            / "training"
+            / "exports"
+            / final_name
+        )
 
     @staticmethod
     def _check_cancel_for_token(cancel_token: CancelToken) -> None:
         if cancel_token.cancelled:
             raise CompletionFailure(
                 TrainingCompletionErrorCode.CANCELED,
-                "completion export縺ｮ繧ｭ繝｣繝ｳ繧ｻ繝ｫ縺ｧ縺吶・",
+                "completion exportをキャンセルしました",
             )
 
-    def _write_generated_files(self, root: Path, context: _CompletionContext) -> None:
-        _write_json_durable(
-            root / "provenance" / "dataset.json", self._dataset_provenance(context)
-        )
-        _write_json_durable(
-            root / "provenance" / "model.json", self._model_provenance(context)
-        )
-        _write_json_durable(
-            root / "provenance" / "runtime.json", self._runtime_provenance(context)
-        )
-        _write_json_durable(
-            root / "provenance" / "resume.json", self._resume_provenance(context)
-        )
+    def _write_generated_files(
+        self, root: SafeExportDirectory, context: _CompletionContext
+    ) -> None:
+        root.write_json("provenance/dataset.json", self._dataset_provenance(context))
+        root.write_json("provenance/model.json", self._model_provenance(context))
+        root.write_json("provenance/runtime.json", self._runtime_provenance(context))
+        root.write_json("provenance/resume.json", self._resume_provenance(context))
         performance = self._performance_provenance(context.job.id)
         if performance is not None:
-            _write_json_durable(root / "provenance" / "performance.json", performance)
-        _write_json_durable(
-            root / "config" / "safe-training-config.json",
-            self._safe_config(context.config),
+            root.write_json("provenance/performance.json", performance)
+        root.write_json(
+            "config/safe-training-config.json", self._safe_config(context.config)
         )
-        static_files = _list_export_files(root)
-        _write_json_durable(
-            root / "hashes" / "sha256.json",
+        static_files = root.regular_files()
+        root.write_json(
+            "hashes/sha256.json",
             {
                 "schema_version": EXPORT_SCHEMA_VERSION,
                 "files": [
@@ -1187,8 +1371,8 @@ class TrainingCompletionService:
                 ],
             },
         )
-        _write_json_durable(
-            root / "provenance" / "source-fingerprint.json",
+        root.write_json(
+            "provenance/source-fingerprint.json",
             {
                 "schema_version": "phase9a-source-fingerprint-v1",
                 "source_fingerprint": context.source_fingerprint,
@@ -1199,94 +1383,154 @@ class TrainingCompletionService:
         self, root: Path, context: _CompletionContext
     ) -> tuple[Path, str, str]:
         path = root / EXPORT_MANIFEST_NAME
-        if path.is_file():
-            payload = _read_json(path)
-            if payload.get("source_fingerprint") != context.source_fingerprint:
-                raise CompletionFailure(
-                    TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
-                    "local export manifestの入力fingerprintが一致しません",
-                )
-            try:
-                manifest_files = payload["files"]
-                actual_files = [
-                    {"relative_path": relative, "size": size, "sha256": digest}
-                    for relative, size, digest in _list_export_files(root)
-                    if relative not in {EXPORT_MANIFEST_NAME, COMPLETION_MANIFEST_NAME}
+        try:
+            with self._open_final_export_directory(context) as safe_root:
+                manifest_state = safe_root.child_exists(EXPORT_MANIFEST_NAME)
+                if manifest_state == "symlink" or manifest_state == "special":
+                    raise CompletionFilesystemError("export manifest is not regular")
+                if manifest_state == "file":
+                    payload = json.loads(
+                        safe_root.read_bytes(
+                            EXPORT_MANIFEST_NAME,
+                            max_bytes=MAX_COMPLETION_MANIFEST_BYTES,
+                        )
+                    )
+                    if not isinstance(payload, dict):
+                        raise ValueError("export manifest must be an object")
+                    if payload.get("source_fingerprint") != context.source_fingerprint:
+                        raise CompletionFailure(
+                            TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
+                            "local export manifestの入力fingerprintが一致しません",
+                        )
+                    manifest_files = payload["files"]
+                    actual_files = [
+                        {"relative_path": relative, "size": size, "sha256": digest}
+                        for relative, size, digest in safe_root.regular_files()
+                        if relative
+                        not in {EXPORT_MANIFEST_NAME, COMPLETION_MANIFEST_NAME}
+                    ]
+                    actual_by_path = {
+                        str(item["relative_path"]): item for item in actual_files
+                    }
+                    if any(
+                        actual_by_path.get(item.relative_path)
+                        != {
+                            "relative_path": item.relative_path,
+                            "size": item.size_bytes,
+                            "sha256": item.sha256,
+                        }
+                        for item in context.files
+                    ):
+                        raise ValueError("required export input is missing or changed")
+                    if (
+                        payload.get("schema_version") != EXPORT_SCHEMA_VERSION
+                        or payload.get("export_relative_path")
+                        != context.export_relative_path
+                        or manifest_files != actual_files
+                        or payload.get("export_fingerprint")
+                        != _fingerprint(actual_files)
+                    ):
+                        raise ValueError("local export manifest does not match files")
+                    size, digest = safe_root.hash_file(EXPORT_MANIFEST_NAME)
+                    del size
+                    return path, digest, str(payload.get("export_fingerprint", ""))
+                if manifest_state != "missing":
+                    raise CompletionFilesystemError("export manifest is not regular")
+                files = [
+                    item
+                    for item in safe_root.regular_files()
+                    if item[0] != COMPLETION_MANIFEST_NAME
                 ]
-                actual_by_path = {
-                    str(item["relative_path"]): item for item in actual_files
+                source_files_by_path: dict[str, tuple[int, str]] = {
+                    relative: (size, digest) for relative, size, digest in files
                 }
                 if any(
-                    actual_by_path.get(item.relative_path)
-                    != {
-                        "relative_path": item.relative_path,
-                        "size": item.size_bytes,
-                        "sha256": item.sha256,
-                    }
+                    source_files_by_path.get(item.relative_path)
+                    != (item.size_bytes, item.sha256)
                     for item in context.files
                 ):
-                    raise ValueError("required export input is missing or changed")
-                if (
-                    payload.get("schema_version") != EXPORT_SCHEMA_VERSION
-                    or payload.get("export_relative_path")
-                    != context.export_relative_path
-                    or manifest_files != actual_files
-                    or payload.get("export_fingerprint") != _fingerprint(actual_files)
-                ):
-                    raise ValueError("local export manifest does not match files")
-            except (KeyError, TypeError, ValueError, OSError):
-                raise CompletionFailure(
-                    TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
-                    "local export manifest is invalid",
-                ) from None
-            return (
-                path,
-                _stable_file_hash(path),
-                str(payload.get("export_fingerprint", "")),
-            )
-        files = [
-            item
-            for item in _list_export_files(root)
-            if item[0] != COMPLETION_MANIFEST_NAME
-        ]
-        source_files_by_path: dict[str, tuple[int, str]] = {
-            relative: (size, digest) for relative, size, digest in files
-        }
-        if any(
-            source_files_by_path.get(item.relative_path)
-            != (item.size_bytes, item.sha256)
-            for item in context.files
-        ):
+                    raise CompletionFailure(
+                        TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
+                        "required export input is missing or changed",
+                    )
+                export_fingerprint = _fingerprint(
+                    [
+                        {"relative_path": relative, "size": size, "sha256": digest}
+                        for relative, size, digest in files
+                    ]
+                )
+                payload = {
+                    "schema_version": EXPORT_SCHEMA_VERSION,
+                    "source_fingerprint": context.source_fingerprint,
+                    "export_relative_path": context.export_relative_path,
+                    "export_fingerprint": export_fingerprint,
+                    "files": [
+                        {"relative_path": relative, "size": size, "sha256": digest}
+                        for relative, size, digest in files
+                    ],
+                    "created_at": utc_now().isoformat(),
+                }
+                safe_root.write_json(EXPORT_MANIFEST_NAME, payload)
+                _size, digest = safe_root.hash_file(EXPORT_MANIFEST_NAME)
+                return path, digest, export_fingerprint
+        except CompletionFailure:
+            raise
+        except (
+            CompletionFilesystemError,
+            OSError,
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
             raise CompletionFailure(
                 TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
-                "required export input is missing or changed",
-            )
-        export_fingerprint = _fingerprint(
-            [
-                {"relative_path": relative, "size": size, "sha256": digest}
-                for relative, size, digest in files
-            ]
+                "local export manifest is invalid",
+            ) from exc
+
+    def _open_final_export_directory(
+        self, context: _CompletionContext
+    ) -> SafeExportDirectory:
+        return SafeExportDirectory.open_root(
+            self.settings.projects_dir,
+            (
+                str(context.job.project_id),
+                "training",
+                "exports",
+                str(context.job.id),
+            ),
+            create_missing=False,
         )
-        payload = {
-            "schema_version": EXPORT_SCHEMA_VERSION,
-            "source_fingerprint": context.source_fingerprint,
-            "export_relative_path": context.export_relative_path,
-            "export_fingerprint": export_fingerprint,
-            "files": [
-                {"relative_path": relative, "size": size, "sha256": digest}
-                for relative, size, digest in files
-            ],
-            "created_at": utc_now().isoformat(),
-        }
-        _write_json_durable(path, payload)
-        return path, _stable_file_hash(path), export_fingerprint
 
     def _upload_files(self, root: Path) -> tuple[StorageArtifactFile, ...]:
         files: list[StorageArtifactFile] = []
-        for relative, size, digest in _list_export_files(root):
-            if relative == COMPLETION_MANIFEST_NAME:
-                continue
-            files.append(StorageArtifactFile(relative, root / relative, size, digest))
+        try:
+            relative_root = root.absolute().relative_to(
+                self.settings.projects_dir.absolute()
+            )
+            components = tuple(relative_root.parts)
+            if len(components) != 4 or components[1:] != (
+                "training",
+                "exports",
+                components[3],
+            ):
+                raise ValueError("local export path is outside projects root")
+            with SafeExportDirectory.open_root(
+                self.settings.projects_dir,
+                components,
+                create_missing=False,
+            ) as safe_root:
+                for relative, size, digest in safe_root.regular_files():
+                    if relative == COMPLETION_MANIFEST_NAME:
+                        continue
+                    files.append(
+                        StorageArtifactFile(relative, root / relative, size, digest)
+                    )
+        except (CompletionFilesystemError, OSError, ValueError) as exc:
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
+                "local exportを検証できません",
+            ) from exc
         if not files:
             raise CompletionFailure(
                 TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
@@ -1303,15 +1547,229 @@ class TrainingCompletionService:
         export_fingerprint: str,
         export_manifest_path: Path,
     ) -> tuple[Path, str]:
-        files = [
-            item
-            for item in _list_export_files(root)
-            if item[0] != COMPLETION_MANIFEST_NAME
-        ]
-        logs = [item for item in files if item[0].startswith("logs/")]
-        samples = [item for item in files if item[0].startswith("samples/")]
-        payload = {
-            "schema_version": COMPLETION_MANIFEST_SCHEMA_VERSION,
+        try:
+            with self._open_final_export_directory(context) as safe_root:
+                files = [
+                    item
+                    for item in safe_root.regular_files()
+                    if item[0] != COMPLETION_MANIFEST_NAME
+                ]
+                logs = [item for item in files if item[0].startswith("logs/")]
+                samples = [item for item in files if item[0].startswith("samples/")]
+                payload = {
+                    "schema_version": COMPLETION_MANIFEST_SCHEMA_VERSION,
+                    "project_id": context.job.project_id,
+                    "training_job_id": context.job.id,
+                    "training_config_id": context.config.id,
+                    "parent_training_job_id": context.job.parent_job_id,
+                    "resume_artifact_id": context.job.resume_artifact_id,
+                    "training_status": context.job.status,
+                    "exit_code": context.job.exit_code,
+                    "started_at": _iso(context.job.started_at),
+                    "finished_at": _iso(context.job.finished_at),
+                    "dataset_snapshot_id": context.snapshot.id,
+                    "dataset_content_hash": context.snapshot.content_sha256,
+                    "dataset_remote_provenance": {
+                        "snapshot_id": str(context.snapshot_remote.snapshot_id),
+                        "remote_relative_path": (
+                            context.snapshot_remote.remote_relative_path
+                        ),
+                        "storage_transfer_job_id": str(
+                            context.snapshot_remote.storage_transfer_job_id
+                        ),
+                        "remote_manifest_sha256": (
+                            context.snapshot_remote.remote_manifest_sha256
+                        ),
+                        "content_sha256": context.snapshot_remote.content_sha256,
+                        "verification_level": (
+                            context.snapshot_remote.verification_level
+                        ),
+                    },
+                    "managed_model_id": context.model.id,
+                    "managed_model_sha256": context.model.local_sha256,
+                    "safe_config_fingerprint": _config_fingerprint(context.config),
+                    "final_lora_relative_path": (
+                        f"artifacts/{context.final_lora.filename}"
+                    ),
+                    "final_lora_size": context.final_lora.file_size,
+                    "final_lora_sha256": context.final_lora.sha256,
+                    "export_files": [
+                        {"relative_path": relative, "size": size, "sha256": digest}
+                        for relative, size, digest in files
+                    ],
+                    "logs": [
+                        {"relative_path": relative, "size": size, "sha256": digest}
+                        for relative, size, digest in logs
+                    ],
+                    "samples": [
+                        {"relative_path": relative, "size": size, "sha256": digest}
+                        for relative, size, digest in samples
+                    ],
+                    "environment_provenance": self._runtime_provenance(context),
+                    "performance_provenance": self._performance_provenance(
+                        context.job.id
+                    ),
+                    "storage_transfer_job_id": str(storage_job_id),
+                    "source_fingerprint": context.source_fingerprint,
+                    "export_fingerprint": export_fingerprint,
+                    "export_manifest_sha256": self._hash_export_manifest(
+                        safe_root, export_manifest_path
+                    ),
+                    "remote_relative_path": context.remote_relative_path,
+                    "created_at": utc_now().isoformat(),
+                }
+                safe_root.write_json(COMPLETION_MANIFEST_NAME, payload)
+                path = root / COMPLETION_MANIFEST_NAME
+                _size, digest = safe_root.hash_file(COMPLETION_MANIFEST_NAME)
+                return path, digest
+        except (CompletionFilesystemError, OSError, ValueError, RuntimeError) as exc:
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.LOCAL_EXPORT_CONFLICT,
+                "completion manifestの作成に失敗しました",
+            ) from exc
+
+    @staticmethod
+    def _hash_export_manifest(
+        safe_root: SafeExportDirectory, export_manifest_path: Path
+    ) -> str:
+        del export_manifest_path
+        _size, digest = safe_root.hash_file(EXPORT_MANIFEST_NAME)
+        return digest
+
+    def _read_remote_completion_marker(
+        self, target: StorageRemotePath
+    ) -> dict[str, Any] | None:
+        marker, _marker_hash = self._read_remote_completion_with_hash(target)
+        return marker
+
+    def _read_remote_completion_with_hash(
+        self, target: StorageRemotePath
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        try:
+            raw = self._read_remote_completion_bytes(target)
+            if raw is None:
+                return None, None
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise ValueError("completion manifest must be an object")
+            return value, hashlib.sha256(raw).hexdigest()
+        except CompletionFailure:
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
+                "remote completion manifestを読み取れません",
+            ) from None
+
+    def _read_remote_completion_bytes(self, target: StorageRemotePath) -> bytes | None:
+        try:
+            entries = self.storage._remote_entries(target, allow_missing=True)
+            entry = entries.get(COMPLETION_MANIFEST_NAME)
+            if entry is None:
+                return None
+            if (
+                entry.is_directory
+                or entry.size_bytes < 0
+                or entry.size_bytes > MAX_COMPLETION_MANIFEST_BYTES
+            ):
+                raise CompletionFailure(
+                    TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
+                    "remote completion manifestが許容サイズを超えています",
+                )
+            try:
+                raw = self.storage.adapter.read_remote_file(
+                    target.child(COMPLETION_MANIFEST_NAME),
+                    max_bytes=MAX_COMPLETION_MANIFEST_BYTES,
+                )
+            except TypeError as exc:
+                # Keep compatibility with third-party test adapters while the
+                # size is already bounded by the remote directory entry.
+                if "max_bytes" not in str(exc):
+                    raise
+                raw = self.storage.adapter.read_remote_file(
+                    target.child(COMPLETION_MANIFEST_NAME)
+                )
+            if len(raw) > MAX_COMPLETION_MANIFEST_BYTES:
+                raise CompletionFailure(
+                    TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
+                    "remote completion manifestが許容サイズを超えています",
+                )
+            if len(raw) != entry.size_bytes:
+                raise CompletionFailure(
+                    TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
+                    "remote completion manifestのサイズが一致しません",
+                )
+            return bytes(raw)
+        except CompletionFailure:
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError, UserFacingError):
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
+                "remote completion manifestを読み取れません",
+            ) from None
+
+    def _hash_remote_marker(self, target: StorageRemotePath) -> str:
+        _marker, marker_hash = self._read_remote_completion_with_hash(target)
+        if marker_hash is None:
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.REMOTE_VERIFICATION_FAILED,
+                "remote completion manifestを検証できません",
+            )
+        return marker_hash
+
+    def _verify_existing_remote_completion(
+        self,
+        context: _CompletionContext,
+        files: tuple[StorageArtifactFile, ...],
+        marker: dict[str, Any],
+        export_id: UUID,
+        *,
+        export_manifest_sha256: str | None = None,
+        expected_export_fingerprint: str | None = None,
+    ) -> UUID:
+        storage_job_id = self._validate_completion_marker(
+            marker,
+            context,
+            expected_export_fingerprint or str(marker.get("export_fingerprint", "")),
+            files=files,
+            export_manifest_sha256=export_manifest_sha256,
+            error_code=TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
+        )
+        self._verify_artifact_transfer_job(
+            context,
+            files,
+            storage_job_id,
+            error_code=TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
+        )
+        self.storage.verify_remote_artifact_files(
+            context.target,
+            files,
+            self.storage.get_project_storage_settings(
+                UUID(context.job.project_id)
+            ).verification_policy,
+        )
+        del export_id
+        return storage_job_id
+
+    def _validate_completion_marker(
+        self,
+        marker: dict[str, Any],
+        context: _CompletionContext,
+        export_fingerprint: str,
+        *,
+        files: tuple[StorageArtifactFile, ...] | None = None,
+        export_manifest_sha256: str | None = None,
+        expected_storage_job_id: UUID | None = None,
+        error_code: TrainingCompletionErrorCode,
+    ) -> UUID:
+        def fail(summary: str) -> None:
+            raise CompletionFailure(error_code, summary)
+
+        if not _COMPLETION_MANIFEST_REQUIRED_FIELDS.issubset(marker):
+            fail("completion manifestの必須fieldが不足しています")
+        if marker.get("schema_version") != COMPLETION_MANIFEST_SCHEMA_VERSION:
+            fail("completion manifestのschema versionが一致しません")
+        expected_values: dict[str, Any] = {
             "project_id": context.job.project_id,
             "training_job_id": context.job.id,
             "training_config_id": context.config.id,
@@ -1323,154 +1781,258 @@ class TrainingCompletionService:
             "finished_at": _iso(context.job.finished_at),
             "dataset_snapshot_id": context.snapshot.id,
             "dataset_content_hash": context.snapshot.content_sha256,
-            "dataset_remote_provenance": {
-                "snapshot_id": str(context.snapshot_remote.snapshot_id),
-                "remote_relative_path": context.snapshot_remote.remote_relative_path,
-                "storage_transfer_job_id": str(
-                    context.snapshot_remote.storage_transfer_job_id
-                ),
-                "remote_manifest_sha256": (
-                    context.snapshot_remote.remote_manifest_sha256
-                ),
-                "content_sha256": context.snapshot_remote.content_sha256,
-                "verification_level": context.snapshot_remote.verification_level,
-            },
             "managed_model_id": context.model.id,
             "managed_model_sha256": context.model.local_sha256,
             "safe_config_fingerprint": _config_fingerprint(context.config),
             "final_lora_relative_path": f"artifacts/{context.final_lora.filename}",
             "final_lora_size": context.final_lora.file_size,
             "final_lora_sha256": context.final_lora.sha256,
-            "export_files": [
-                {"relative_path": relative, "size": size, "sha256": digest}
-                for relative, size, digest in files
-            ],
-            "logs": [
-                {"relative_path": relative, "size": size, "sha256": digest}
-                for relative, size, digest in logs
-            ],
-            "samples": [
-                {"relative_path": relative, "size": size, "sha256": digest}
-                for relative, size, digest in samples
-            ],
-            "environment_provenance": self._runtime_provenance(context),
-            "performance_provenance": self._performance_provenance(context.job.id),
-            "storage_transfer_job_id": str(storage_job_id),
             "source_fingerprint": context.source_fingerprint,
             "export_fingerprint": export_fingerprint,
-            "export_manifest_sha256": _stable_file_hash(export_manifest_path),
             "remote_relative_path": context.remote_relative_path,
-            "created_at": utc_now().isoformat(),
         }
-        path = root / COMPLETION_MANIFEST_NAME
-        _write_json_durable(path, payload)
-        return path, _stable_file_hash(path)
-
-    def _read_remote_completion_marker(
-        self, target: StorageRemotePath
-    ) -> dict[str, Any] | None:
-        try:
-            entries = self.storage._remote_entries(target, allow_missing=True)
-            if COMPLETION_MANIFEST_NAME not in entries:
-                return None
-            raw = self.storage.adapter.read_remote_file(
-                target.child(COMPLETION_MANIFEST_NAME)
-            )
-            value = json.loads(raw)
-            return value if isinstance(value, dict) else None
-        except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
-            raise CompletionFailure(
-                TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
-                "remote completion manifestを読み取れません",
-            ) from None
-
-    def _hash_remote_marker(self, target: StorageRemotePath) -> str:
-        try:
-            content = self.storage.adapter.read_remote_file(
-                target.child(COMPLETION_MANIFEST_NAME)
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise CompletionFailure(
-                TrainingCompletionErrorCode.REMOTE_VERIFICATION_FAILED,
-                "remote completion manifestを検証できません",
-            ) from exc
-        return hashlib.sha256(content).hexdigest()
-
-    def _verify_existing_remote_completion(
-        self,
-        context: _CompletionContext,
-        files: tuple[StorageArtifactFile, ...],
-        marker: dict[str, Any],
-        export_id: UUID,
-    ) -> None:
-        try:
-            marker_files = marker["export_files"]
-            expected_files = {
-                item.relative_path: (item.size_bytes, item.sha256) for item in files
-            }
-            actual_files = {
-                str(item["relative_path"]): (int(item["size"]), str(item["sha256"]))
-                for item in marker_files
-                if isinstance(item, dict)
-            }
-        except (KeyError, TypeError, ValueError):
-            raise CompletionFailure(
-                TrainingCompletionErrorCode.REMOTE_VERIFICATION_FAILED,
-                "completion manifestのfile一覧が不正です",
-            ) from None
-        if not expected_files.items() <= actual_files.items():
-            raise CompletionFailure(
-                TrainingCompletionErrorCode.REMOTE_VERIFICATION_FAILED,
-                "completion manifestの必須成果物が一致しません",
-            )
-        self.storage.verify_remote_artifact_files(
-            context.target,
-            files,
-            self.storage.get_project_storage_settings(
-                UUID(context.job.project_id)
-            ).verification_policy,
-        )
-        if (
-            marker.get("project_id") != context.job.project_id
-            or marker.get("training_job_id") != context.job.id
+        if any(marker.get(key) != value for key, value in expected_values.items()):
+            fail("completion manifestのprovenanceが一致しません")
+        if not isinstance(marker.get("exit_code"), int) or isinstance(
+            marker.get("exit_code"), bool
         ):
-            raise CompletionFailure(
-                TrainingCompletionErrorCode.REMOTE_VERIFICATION_FAILED,
-                "completion manifestのjob/projectが一致しません",
+            fail("completion manifestのexit codeが不正です")
+        expected_remote_provenance = {
+            "snapshot_id": str(context.snapshot_remote.snapshot_id),
+            "remote_relative_path": context.snapshot_remote.remote_relative_path,
+            "storage_transfer_job_id": str(
+                context.snapshot_remote.storage_transfer_job_id
+            ),
+            "remote_manifest_sha256": context.snapshot_remote.remote_manifest_sha256,
+            "content_sha256": context.snapshot_remote.content_sha256,
+            "verification_level": context.snapshot_remote.verification_level,
+        }
+        remote_provenance = marker.get("dataset_remote_provenance")
+        if (
+            not isinstance(remote_provenance, dict)
+            or set(remote_provenance) != set(_DATASET_REMOTE_PROVENANCE_FIELDS)
+            or remote_provenance != expected_remote_provenance
+        ):
+            fail("dataset remote provenanceが一致しません")
+        if marker.get("environment_provenance") != self._runtime_provenance(context):
+            fail("runtime provenanceが一致しません")
+        if marker.get("performance_provenance") != self._performance_provenance(
+            context.job.id
+        ):
+            fail("performance provenanceが一致しません")
+        if not isinstance(marker.get("created_at"), str) or not marker["created_at"]:
+            fail("completion manifestのcreated_atが不正です")
+        completion_job_value = marker.get("storage_transfer_job_id")
+        try:
+            storage_job_id = UUID(str(completion_job_value))
+        except (TypeError, ValueError):
+            fail("completion manifestの転送job IDが不正です")
+        if (
+            expected_storage_job_id is not None
+            and storage_job_id != expected_storage_job_id
+        ):
+            fail("completion manifestの転送job IDが一致しません")
+        marker_export_manifest = marker.get("export_manifest_sha256")
+        if not _is_sha256(marker_export_manifest):
+            fail("completion manifestのexport manifest hashが不正です")
+        if (
+            export_manifest_sha256 is not None
+            and marker_export_manifest != export_manifest_sha256
+        ):
+            fail("completion manifestのexport manifest hashが一致しません")
+        if files is not None:
+            expected_entries = _artifact_file_manifest_entries(files)
+            actual_entries = _canonical_manifest_file_entries(
+                marker.get("export_files"), fail
             )
-        del export_id
+            if actual_entries != expected_entries:
+                fail("completion manifestのexport file集合が一致しません")
+            expected_logs = tuple(
+                entry
+                for entry in expected_entries
+                if str(entry["relative_path"]).startswith("logs/")
+            )
+            expected_samples = tuple(
+                entry
+                for entry in expected_entries
+                if str(entry["relative_path"]).startswith("samples/")
+            )
+            if (
+                _canonical_manifest_file_entries(marker.get("logs"), fail)
+                != expected_logs
+            ):
+                fail("completion manifestのlogsが一致しません")
+            if (
+                _canonical_manifest_file_entries(marker.get("samples"), fail)
+                != expected_samples
+            ):
+                fail("completion manifestのsamplesが一致しません")
+        return storage_job_id
 
     def _marker_matches_context(
         self,
         marker: dict[str, Any],
         context: _CompletionContext,
         export_fingerprint: str,
+        *,
+        files: tuple[StorageArtifactFile, ...] | None = None,
+        export_manifest_sha256: str | None = None,
+        expected_storage_job_id: UUID | None = None,
     ) -> bool:
-        return bool(
-            marker.get("schema_version") == COMPLETION_MANIFEST_SCHEMA_VERSION
-            and marker.get("project_id") == context.job.project_id
-            and marker.get("training_job_id") == context.job.id
-            and marker.get("source_fingerprint") == context.source_fingerprint
-            and marker.get("export_fingerprint") == export_fingerprint
-            and marker.get("final_lora_sha256") == context.final_lora.sha256
-        )
+        try:
+            self._validate_completion_marker(
+                marker,
+                context,
+                export_fingerprint,
+                files=files,
+                export_manifest_sha256=export_manifest_sha256,
+                expected_storage_job_id=expected_storage_job_id,
+                error_code=TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
+            )
+        except CompletionFailure:
+            return False
+        return True
 
-    def _existing_artifact_job_id(
-        self, training_job_id: str, export_id: UUID
+    def _find_matching_artifact_job_id(
+        self,
+        context: _CompletionContext,
+        files: tuple[StorageArtifactFile, ...],
+        *,
+        preferred_job_id: UUID | None,
     ) -> UUID | None:
         with self.session_factory() as session:
-            record = session.scalar(
+            if preferred_job_id is not None:
+                self._verify_artifact_transfer_job(
+                    context,
+                    files,
+                    preferred_job_id,
+                    error_code=TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
+                    session=session,
+                )
+                return preferred_job_id
+            records = session.scalars(
                 select(StorageTransferJobRecord)
                 .where(
-                    StorageTransferJobRecord.training_run_id == training_job_id,
+                    StorageTransferJobRecord.project_id == context.job.project_id,
+                    StorageTransferJobRecord.training_run_id == context.job.id,
                     StorageTransferJobRecord.transfer_type
                     == StorageTransferType.ARTIFACT_UPLOAD.value,
                     StorageTransferJobRecord.status == TransferStatus.COMPLETED.value,
                 )
                 .order_by(StorageTransferJobRecord.completed_at.desc())
+            ).all()
+            for record in records:
+                job_id = UUID(record.id)
+                try:
+                    self._verify_artifact_transfer_job(
+                        context,
+                        files,
+                        job_id,
+                        error_code=TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
+                        session=session,
+                    )
+                except CompletionFailure:
+                    continue
+                return job_id
+        return None
+
+    def _verify_artifact_transfer_job(
+        self,
+        context: _CompletionContext,
+        files: tuple[StorageArtifactFile, ...],
+        storage_job_id: UUID,
+        *,
+        error_code: TrainingCompletionErrorCode,
+        session: Any | None = None,
+    ) -> None:
+        owns_session = session is None
+        db_session: Any = session
+        if owns_session:
+            session_context = self.session_factory()
+            db_session = session_context.__enter__()
+        try:
+            record = db_session.scalar(
+                select(StorageTransferJobRecord).where(
+                    StorageTransferJobRecord.id == str(storage_job_id)
+                )
             )
-            del export_id
-            return UUID(record.id) if record else None
+            if (
+                record is None
+                or record.project_id != context.job.project_id
+                or record.training_run_id != context.job.id
+                or record.transfer_type != StorageTransferType.ARTIFACT_UPLOAD.value
+                or record.status != TransferStatus.COMPLETED.value
+                or record.item_count != len(files)
+            ):
+                raise CompletionFailure(
+                    error_code,
+                    "completion manifestの転送jobが一致しません",
+                )
+            if not record.manifest_path:
+                raise CompletionFailure(
+                    error_code,
+                    "成果物転送manifestがありません",
+                )
+            manifest_path = Path(record.manifest_path)
+            transfer_root = (
+                self.settings.transfer_temp_dir or self.settings.temp_dir / "transfers"
+            )
+            if (
+                transfer_root.is_symlink()
+                or manifest_path.is_symlink()
+                or not manifest_path.is_file()
+                or not _is_relative_to(manifest_path.resolve(), transfer_root.resolve())
+                or manifest_path.stat().st_size > MAX_COMPLETION_MANIFEST_BYTES
+            ):
+                raise CompletionFailure(
+                    error_code,
+                    "成果物転送manifestの保存先が不正です",
+                )
+            try:
+                payload = json.loads(manifest_path.read_bytes())
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                raise CompletionFailure(
+                    error_code,
+                    "成果物転送manifestを読み取れません",
+                ) from None
+            if not isinstance(payload, dict):
+                raise CompletionFailure(error_code, "成果物転送manifestが不正です")
+            if any(
+                payload.get(key) != value
+                for key, value in {
+                    "schema_version": "phase9a-artifact-transfer-v1",
+                    "transfer_job_id": str(storage_job_id),
+                    "transfer_type": StorageTransferType.ARTIFACT_UPLOAD.value,
+                    "project_id": context.job.project_id,
+                    "training_run_id": context.job.id,
+                    "destination": context.target.rclone_value,
+                    "status": TransferStatus.COMPLETED.value,
+                    "item_count": len(files),
+                }.items()
+            ):
+                raise CompletionFailure(
+                    error_code,
+                    "成果物転送manifestのprovenanceが一致しません",
+                )
+            actual_items = _canonical_transfer_manifest_items(
+                payload.get("items"), error_code
+            )
+            expected_items = tuple(
+                {
+                    "relative_path": item.relative_path,
+                    "size": item.size_bytes,
+                    "local_sha256": item.sha256,
+                }
+                for item in files
+            )
+            if actual_items != expected_items:
+                raise CompletionFailure(
+                    error_code,
+                    "成果物転送manifestのfile集合が一致しません",
+                )
+        finally:
+            if owns_session:
+                session_context.__exit__(None, None, None)
 
     def _complete_claimed(
         self,
@@ -1587,6 +2149,28 @@ class TrainingCompletionService:
                     TrainingCompletionErrorCode.CANCELED,
                     "成果物同期をキャンセルしました",
                 )
+
+    def _check_claim(
+        self,
+        export_id: UUID,
+        worker_id: str,
+        claim_token: str,
+        worker_generation: int,
+    ) -> None:
+        with self.session_factory() as session:
+            if not TrainingCompletionRepository(session).update_claimed(
+                export_id,
+                worker_id=worker_id,
+                claim_token=claim_token,
+                worker_generation=worker_generation,
+                values={"heartbeat_at": utc_now()},
+            ):
+                session.rollback()
+                raise CompletionFailure(
+                    TrainingCompletionErrorCode.WORKER_CLAIM_LOST,
+                    "completion workerのclaimが失われました",
+                )
+            session.commit()
 
     def _is_cancel_requested(self, export_id: UUID) -> bool:
         with self.session_factory() as session:
@@ -1756,135 +2340,12 @@ def _config_fingerprint(config: TrainingConfigRecord) -> str:
 
 
 def _stable_file_hash(path: Path) -> str:
-    before = path.stat()
-    if not path.is_file() or path.is_symlink():
-        raise OSError("not a regular file")
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    after = path.stat()
-    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-    ):
-        raise OSError("file changed while hashing")
-    return digest.hexdigest()
+    _size, digest = stable_file_hash(path)
+    return digest
 
 
 def _stable_file_copy_fingerprint(path: Path) -> tuple[int, str]:
-    before = path.stat()
-    digest = _stable_file_hash(path)
-    after = path.stat()
-    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-        raise OSError("file changed while hashing")
-    return before.st_size, digest
-
-
-def _copy_stable(
-    source: Path,
-    destination: Path,
-    cancel_token: CancelToken | None = None,
-) -> tuple[int, str]:
-    if source.is_symlink() or not source.is_file():
-        raise OSError("source is not a regular file")
-    before = source.stat()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    digest = hashlib.sha256()
-    try:
-        source_handle = source.open("rb")
-        target_handle = destination.open("xb")
-    except BaseException:
-        destination.unlink(missing_ok=True)
-        raise
-    with source_handle, target_handle:
-        for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
-            if cancel_token is not None and cancel_token.cancelled:
-                destination.unlink(missing_ok=True)
-                raise CompletionFailure(
-                    TrainingCompletionErrorCode.CANCELED,
-                    "completion export縺ｮ繧ｭ繝｣繝ｳ繧ｻ繝ｫ縺ｧ縺吶・",
-                )
-            target_handle.write(chunk)
-            digest.update(chunk)
-        target_handle.flush()
-        os.fsync(target_handle.fileno())
-    after = source.stat()
-    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-    ):
-        destination.unlink(missing_ok=True)
-        raise OSError("source changed while copying")
-    return before.st_size, digest.hexdigest()
-
-
-def _write_json_durable(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.parent / f".{uuid4().hex[:8]}.tmp"
-    try:
-        encoded = (
-            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            + "\n"
-        ).encode("utf-8")
-        with temporary.open("xb") as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(path)
-        _fsync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _fsync_directory(path: Path) -> None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except (AttributeError, OSError):
-        return
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _fsync_tree(root: Path) -> None:
-    for path in sorted(
-        root.rglob("*"), key=lambda value: len(value.parts), reverse=True
-    ):
-        if path.is_file() and not path.is_symlink():
-            with path.open("r+b") as handle:
-                os.fsync(handle.fileno())
-        elif path.is_dir() and not path.is_symlink():
-            _fsync_directory(path)
-
-
-def _list_export_files(root: Path) -> list[tuple[str, int, str]]:
-    if root.is_symlink() or not root.is_dir():
-        raise OSError("export root is not a directory")
-    result: list[tuple[str, int, str]] = []
-    for path in sorted(root.rglob("*"), key=lambda value: value.as_posix()):
-        if path.is_symlink():
-            raise OSError("export contains a symlink")
-        if not path.is_file():
-            continue
-        relative = path.relative_to(root).as_posix()
-        if any(part in {"", ".", ".."} for part in relative.split("/")):
-            raise OSError("export path is invalid")
-        size, digest = _stable_file_copy_fingerprint(path)
-        result.append((relative, size, digest))
-    return result
-
-
-def _read_json(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError("JSON object required")
-    return value
+    return stable_file_hash(path)
 
 
 def _safe_json_value(value: object) -> object:
@@ -1916,6 +2377,130 @@ def _safe_manifest_text(value: str) -> str:
     ):
         return "<redacted>"
     return "".join(char for char in value if ord(char) >= 32 or char in "\r\n\t")
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdefABCDEF" for char in value)
+    )
+
+
+def _valid_manifest_relative_path(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.replace("\\", "/")
+    return bool(
+        normalized
+        and not normalized.startswith("/")
+        and not Path(normalized).is_absolute()
+        and not any(part in {"", ".", ".."} for part in normalized.split("/"))
+        and not any(ord(char) < 32 for char in normalized)
+    )
+
+
+def _artifact_file_manifest_entries(
+    files: tuple[StorageArtifactFile, ...],
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "relative_path": item.relative_path,
+            "size": item.size_bytes,
+            "sha256": item.sha256,
+        }
+        for item in sorted(files, key=lambda value: value.relative_path)
+    )
+
+
+def _canonical_manifest_file_entries(
+    value: object,
+    fail: Callable[[str], None],
+) -> tuple[dict[str, object], ...]:
+    if not isinstance(value, list):
+        fail("completion manifestのfile一覧が不正です")
+        return ()
+    result: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {
+            "relative_path",
+            "size",
+            "sha256",
+        }:
+            fail("completion manifestのfile一覧が不正です")
+        relative = item.get("relative_path")
+        size = item.get("size")
+        digest = item.get("sha256")
+        if (
+            not _valid_manifest_relative_path(relative)
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not _is_sha256(digest)
+        ):
+            fail("completion manifestのfile一覧が不正です")
+        relative_value = str(relative)
+        if relative_value in seen:
+            fail("completion manifestのfile一覧に重複があります")
+        seen.add(relative_value)
+        result.append(
+            {
+                "relative_path": relative_value,
+                "size": size,
+                "sha256": str(digest),
+            }
+        )
+    return tuple(sorted(result, key=lambda item: str(item["relative_path"])))
+
+
+def _canonical_transfer_manifest_items(
+    value: object,
+    error_code: TrainingCompletionErrorCode,
+) -> tuple[dict[str, object], ...]:
+    if not isinstance(value, list):
+        raise CompletionFailure(error_code, "成果物転送manifestのitemsが不正です")
+    result: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise CompletionFailure(error_code, "成果物転送manifestのitemsが不正です")
+        relative = item.get("relative_path")
+        size = item.get("size")
+        digest = item.get("local_sha256")
+        transfer_status = item.get("transfer_status")
+        verification_status = item.get("verification_status")
+        if (
+            not _valid_manifest_relative_path(relative)
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not _is_sha256(digest)
+            or transfer_status not in {"completed", "skipped"}
+            or not isinstance(verification_status, str)
+            or verification_status
+            not in {
+                "full_checksum",
+                "remote_hash_and_size",
+                "manifest_metadata_and_size",
+                "existence_only",
+            }
+        ):
+            raise CompletionFailure(error_code, "成果物転送manifestのitemsが不正です")
+        relative_value = str(relative)
+        if relative_value in seen:
+            raise CompletionFailure(
+                error_code, "成果物転送manifestのitemsに重複があります"
+            )
+        seen.add(relative_value)
+        result.append(
+            {
+                "relative_path": relative_value,
+                "size": size,
+                "local_sha256": str(digest),
+            }
+        )
+    return tuple(sorted(result, key=lambda item: str(item["relative_path"])))
 
 
 def _json_list(value: str | None) -> list[str]:
