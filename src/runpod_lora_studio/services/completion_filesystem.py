@@ -177,12 +177,26 @@ class SafeExportDirectory:
         )
 
     def child_exists(self, name: str) -> str:
-        _check_component(name)
-        if self.fd >= 0:
-            try:
-                value = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
-            except FileNotFoundError:
-                return "missing"
+        parts = _relative_parts(name)
+        try:
+            parent_fd, parent_path = self._open_relative_parent(
+                parts[:-1], create=False
+            )
+        except FileNotFoundError:
+            return "missing"
+        try:
+            if self.fd >= 0:
+                try:
+                    value = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return "missing"
+            else:
+                try:
+                    value = os.lstat(parent_path / parts[-1])
+                except FileNotFoundError:
+                    return "missing"
+            if not self.identity_matches():
+                raise CompletionFilesystemError("export identity changed")
             if stat.S_ISLNK(value.st_mode):
                 return "symlink"
             if stat.S_ISDIR(value.st_mode):
@@ -190,18 +204,9 @@ class SafeExportDirectory:
             if stat.S_ISREG(value.st_mode):
                 return "file"
             return "special"
-        path = self.path / name
-        try:
-            value = os.lstat(path)
-        except FileNotFoundError:
-            return "missing"
-        if stat.S_ISLNK(value.st_mode):
-            return "symlink"
-        if stat.S_ISDIR(value.st_mode):
-            return "directory"
-        if stat.S_ISREG(value.st_mode):
-            return "file"
-        return "special"
+        finally:
+            if parent_fd >= 0 and parent_fd != self.fd:
+                os.close(parent_fd)
 
     def open_child(self, name: str, *, create: bool = False) -> SafeExportDirectory:
         _check_component(name)
