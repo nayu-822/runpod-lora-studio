@@ -191,6 +191,8 @@ class FakeStorageTransferAdapter:
                 content = self.files.get(remote_key)
                 if content is None:
                     return CommandResult(1, "", "missing")
+                if options.max_bytes is not None and len(content) > options.max_bytes:
+                    return CommandResult(1, "", "remote file exceeds maximum size")
                 target = Path(destination_value)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(content)

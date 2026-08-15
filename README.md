@@ -383,14 +383,14 @@ Phase 7Bは、完了した学習jobから速度、VRAM使用量、終了理由�
 
 ## Phase 9A: 学習成果物のGoogle Drive確定同期
 
-学習jobがexit code 0で終了した後、dataset snapshot、remote snapshot provenance、base model、最終LoRAを再検証し、`projects/{project_id}/training/exports/{training_job_id}`へローカルexportを作成します。成果物は`rclone copy`で転送し、artifact本体、転送manifest、remote検証、`completion-manifest.json`の順に確定します。completion manifestをremoteで再検証してから、SQLiteのcompletion exportを`completed`へ更新します。
+学習jobがexit code 0で終了した後、dataset snapshot、remote snapshot provenance、base model、最終LoRAを再検証し、`projects/{project_id}/training/exports/{training_job_id}`へローカルexportを作成します。学習時に`TrainingJobRecord.config_snapshot`へ保存したimmutable execution configを実行provenanceの正本とし、completion時の可変`TrainingConfigRecord`は関連IDの検証だけに使用します。成果物は`rclone copy`で転送し、artifact本体、remote artifact検証、transfer manifestのupload・再読・完全検証、`completion-manifest.json`の順に確定します。completion manifestをremoteで再検証してから、SQLiteのcompletion exportを`completed`へ更新します。
 
-最終LoRAは`output/{output_name}.safetensors`だけを対象とし、checkpoint代用、symlink、変化中ファイル、safetensors検証失敗を拒否します。worker claim、generation fencing、heartbeat、cancel intent、stale復旧、再起動後のremote reconcile、同一markerの冪等再開、remote衝突のfail-closedを実装しています。manifestにはdataset remote provenance、model hash、config fingerprint、resume情報、artifact hashes、transfer job IDを含め、秘密情報や絶対パスは含めません。
+最終LoRAはimmutable snapshotの`output_name`から解決した`output/{output_name}.safetensors`だけを対象とし、checkpoint代用、symlink、変化中ファイル、safetensors検証失敗を拒否します。runtimeの`config/training-config.json`はjob snapshotと一致する場合だけ受け入れ、Driveへは絶対パス・local model/dataset path・Python実行ファイル・rclone設定・秘密情報を除いたsafe configを生成します。worker claim、generation fencing、heartbeat、cancel intent、stale復旧、再起動後のremote reconcile、同一markerの冪等再開、remote衝突のfail-closedを実装しています。manifestにはdataset remote provenance、model hash、config fingerprint、resume情報、artifact hashes、transfer job IDを含め、秘密情報や絶対パスは含めません。
 
 起動時のrecoveryはDB状態のboundedな列挙とworker enqueueだけを行い、`create_app`の同期経路からhash、ファイルコピー、rclone、remote marker読み取りを実行しません。`reconcile_remote(time_budget_seconds=...)`は最大256件のrecovery候補を時間予算内でexecutorへ渡し、blockingなremote処理はworkerが担当します。stale化はstatus、worker ID、claim token、generation、heartbeat cutoffを含む条件付き更新で行い、heartbeatが生きたworkerを回収しません。
 
 ローカルexportはRunPod Linuxでは`O_DIRECTORY|O_NOFOLLOW`付きのheld directory fd、device／inode identity、`O_EXCL`一時ファイル、sourceの前後安定性確認、親identity確認、file／directory fsync、atomic rename後の再トラバースを使用します。Windowsではsymlink・regular file・identityを検証するfallbackを使用し、cleanupは所有権を確認できる`.creating-*`だけに限定します。
 
-completion manifestは1 MiBを上限とし、artifact本体と転送manifestの検証後に最後にコピーします。コピー後は同じremote bytesを再読してSHA-256を計算し、DBに保存したhashと比較したうえで、dataset／model／config／resume provenance、transfer job、完全な`export_files`集合、remote artifact実体を検証してから`completed`へ遷移します。Fake storageにはoverwrite、cancel、block、失敗、例外、remote hash改変の注入点があります。
+completion manifestとremote transfer manifestは1 MiBを上限とし、artifact本体と転送manifestの検証後にcompletion manifestを最後にコピーします。transfer manifestはverification policyに関係なくschema、job／project／run、destination、status、item数、重複のない完全なpath集合、size、local SHA-256、transfer／verification statusを再検証します。remote readはlisting size、rcloneの`--max-size`による転送時上限、download後sizeの三段階で制限します。コピー後は同じremote bytesを再読してSHA-256を計算し、DBに保存したhashと比較したうえで、dataset／model／config／resume provenance、transfer job、完全な`export_files`集合、remote artifact実体を検証してから`completed`へ遷移します。Fake storageにはoverwrite、cancel、block、失敗、例外、remote hash改変の注入点があります。
 
 学習タブからpreview、確定同期開始、一覧更新、cancel、retryを操作できます。同期失敗時はPodを稼働したまま保持し、RunPodのStop／Terminate制御（Phase 9B）は実装していません。

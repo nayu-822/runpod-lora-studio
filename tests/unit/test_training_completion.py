@@ -6,6 +6,7 @@ import struct
 import threading
 import time
 from concurrent.futures import Future
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -31,11 +32,13 @@ from runpod_lora_studio.persistence.models import (
     ManagedModelRecord,
     ModelTransferRecord,
     TrainingCompletionExportRecord,
+    TrainingConfigRecord,
     TrainingJobRecord,
 )
 from runpod_lora_studio.persistence.training_completion_repository import (
     TrainingCompletionRepository,
 )
+from runpod_lora_studio.persistence.training_repository import TrainingRepository
 from runpod_lora_studio.services.project_service import ProjectInput, ProjectService
 from runpod_lora_studio.services.storage_service import StorageService
 from runpod_lora_studio.services.training_completion_service import (
@@ -261,9 +264,6 @@ def _completion_fixture(
     output.mkdir(parents=True)
     _write_valid_checkpoint(output / "test-lora.safetensors")
     (runtime / "config").mkdir()
-    (runtime / "config" / "training-config.json").write_text(
-        '{"schema_version":"test"}\n', encoding="utf-8"
-    )
     stdout = runtime / "stdout.log"
     stderr = runtime / "stderr.log"
     stdout.write_text("training complete\n", encoding="utf-8")
@@ -274,6 +274,20 @@ def _completion_fixture(
             select(TrainingJobRecord).where(TrainingJobRecord.id == str(job_id))
         )
         assert record is not None
+        config_record = session.scalar(
+            select(TrainingConfigRecord).where(
+                TrainingConfigRecord.id == record.training_config_id
+            )
+        )
+        assert config_record is not None
+        config = TrainingRepository(session).get_config(UUID(config_record.id))
+        assert config is not None
+        execution_snapshot = replace(
+            config, output_directory=runtime
+        ).execution_snapshot_json()
+        (runtime / "config" / "training-config.json").write_text(
+            execution_snapshot, encoding="utf-8"
+        )
         record.status = "succeeded"
         record.exit_code = 0
         record.pid = None
@@ -282,6 +296,7 @@ def _completion_fixture(
         record.stderr_log_path = str(stderr)
         record.started_at = now - timedelta(minutes=1)
         record.finished_at = now
+        record.config_snapshot = execution_snapshot
         record.updated_at = now
         session.commit()
     service = TrainingCompletionService(
@@ -334,6 +349,163 @@ def test_completion_uploads_artifacts_verifies_and_writes_marker_last(
         assert (
             service.get_export(export_id).status is TrainingCompletionStatus.COMPLETED
         )
+    finally:
+        service.close()
+        training.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "malformed",
+        "wrong_job",
+        "status",
+        "extra",
+        "missing_item",
+        "hash",
+        "oversized",
+    ],
+)
+def test_restart_requires_remote_artifact_transfer_manifest(
+    test_workspace: Path, mutation: str
+) -> None:
+    service, storage, training, project_id, job_id = _completion_fixture(test_workspace)
+    try:
+        export_id = service.synchronize_sync(
+            job_id, preview_token=service.preview(job_id).token
+        )
+        target = storage.training_remote_path(project_id, job_id)
+        key = f"{target.relative_path}/transfer-manifest.json"
+        if mutation == "missing":
+            storage.adapter.set_remote_bytes(key, None)
+        elif mutation == "malformed":
+            storage.adapter.set_remote_bytes(key, b"{")
+        elif mutation == "oversized":
+            storage.adapter.set_remote_bytes(key, b"x" * (1024 * 1024 + 1))
+        else:
+            payload = json.loads(storage.adapter.files[key])
+            if mutation == "wrong_job":
+                payload["transfer_job_id"] = str(uuid4())
+            elif mutation == "status":
+                payload["status"] = "failed"
+            elif mutation == "extra":
+                payload["items"].append(
+                    {
+                        "relative_path": "unexpected.bin",
+                        "size": 0,
+                        "local_sha256": "0" * 64,
+                        "transfer_status": "completed",
+                        "verification_status": "remote_hash_and_size",
+                    }
+                )
+                payload["item_count"] += 1
+            elif mutation == "missing_item":
+                payload["items"].pop()
+                payload["item_count"] -= 1
+            else:
+                payload["items"][0]["local_sha256"] = "0" * 64
+            storage.adapter.set_remote_bytes(
+                key,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(),
+            )
+        _mark_stale_for_restart(service.settings, export_id)
+        service._run_export(export_id)
+        export = service.get_export(export_id)
+        assert export.status is TrainingCompletionStatus.FAILED
+        assert export.error_code in {
+            TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT.value,
+            TrainingCompletionErrorCode.REMOTE_VERIFICATION_FAILED.value,
+        }
+    finally:
+        service.close()
+        training.close()
+
+
+def test_completion_uses_immutable_execution_snapshot_after_config_edit(
+    test_workspace: Path,
+) -> None:
+    service, storage, training, project_id, job_id = _completion_fixture(test_workspace)
+    try:
+        before = service.preview(job_id)
+        with Session(create_engine_for_settings(service.settings)) as session:
+            config = session.scalar(
+                select(TrainingConfigRecord).where(
+                    TrainingConfigRecord.id == str(before.training_config_id)
+                )
+            )
+            assert config is not None
+            config.batch_size = 8
+            config.network_dim = 64
+            config.learning_rate = 0.002
+            config.output_name = "changed-after-run"
+            session.commit()
+
+        after = service.preview(job_id)
+        assert after.source_fingerprint == before.source_fingerprint
+        assert after.final_lora_filename == "test-lora.safetensors"
+        export_id = service.synchronize_sync(job_id, preview_token=after.token)
+        assert (
+            service.get_export(export_id).status is TrainingCompletionStatus.COMPLETED
+        )
+
+        target = storage.training_remote_path(project_id, job_id)
+        safe_config_key = f"{target.relative_path}/config/training-config.json"
+        safe_config = json.loads(storage.adapter.files[safe_config_key])
+        marker_key = f"{target.relative_path}/completion-manifest.json"
+        marker = json.loads(storage.adapter.files[marker_key])
+        assert marker["training_config_id"] == str(before.training_config_id)
+        assert marker["source_fingerprint"] == before.source_fingerprint
+        assert safe_config["output_name"] == "test-lora"
+        assert safe_config["batch_size"] == 1
+        assert safe_config["network_dim"] == 16
+        assert safe_config["learning_rate"] == 0.0001
+        assert "output_directory" not in safe_config
+        assert "sd_scripts_root" not in safe_config
+        for key, value in storage.adapter.files.items():
+            if key.startswith(f"{target.relative_path}/config/") or key.startswith(
+                f"{target.relative_path}/provenance/"
+            ):
+                encoded = value.decode("utf-8")
+                assert str(service.settings.training_jobs_dir) not in encoded
+                assert str(service.settings.training_sd_scripts_root) not in encoded
+                assert str(service.settings.outputs_dir) not in encoded
+                assert "/workspace/" not in encoded.replace("\\", "/")
+                assert "api_key" not in encoded.casefold()
+                assert "authorization" not in encoded.casefold()
+                assert "token" not in encoded.casefold()
+    finally:
+        service.close()
+        training.close()
+
+
+def test_runtime_training_config_tamper_is_rejected_before_export(
+    test_workspace: Path,
+) -> None:
+    service, storage, training, _project_id, job_id = _completion_fixture(
+        test_workspace
+    )
+    try:
+        with Session(create_engine_for_settings(service.settings)) as session:
+            job = session.scalar(
+                select(TrainingJobRecord).where(TrainingJobRecord.id == str(job_id))
+            )
+            assert job is not None and job.runtime_directory is not None
+            runtime_config = (
+                Path(job.runtime_directory) / "config" / "training-config.json"
+            )
+        payload = json.loads(runtime_config.read_text(encoding="utf-8"))
+        payload["batch_size"] = 99
+        runtime_config.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+        )
+        with pytest.raises(CompletionFailure) as raised:
+            service.preview(job_id)
+        assert (
+            raised.value.code
+            == TrainingCompletionErrorCode.TRAINING_CONFIG_SNAPSHOT_MISMATCH.value
+        )
+        assert not storage.adapter.files
     finally:
         service.close()
         training.close()

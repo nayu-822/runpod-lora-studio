@@ -175,6 +175,30 @@ def test_fake_storage_enforces_overwrite_and_failure_injections(
     assert "fake/file.bin" not in canceled.files
 
 
+def test_fake_remote_copy_rechecks_size_at_transfer_boundary(
+    test_workspace: Path,
+) -> None:
+    limit = 1024 * 1024
+    key = "bounded/transfer-manifest.json"
+    adapter = FakeStorageTransferAdapter(entries={key: b"x" * limit})
+    target = StorageRemotePath("gdrive", key)
+    listed = adapter.list_entries(
+        StorageRemotePath("gdrive", "bounded"), ListOptions(recursive=True)
+    )
+    assert listed[0].size_bytes == limit
+
+    adapter.files[key] = b"x" * (limit + 1)
+    destination = test_workspace / "bounded" / "transfer-manifest.json"
+    result = adapter.copy(
+        target,
+        destination,
+        CopyOptions(checksum=False, max_bytes=limit),
+    )
+
+    assert result.returncode != 0
+    assert not destination.exists()
+
+
 def _settings(test_workspace: Path) -> AppSettings:
     runtime = test_workspace / "runtime"
     settings = AppSettings(

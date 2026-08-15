@@ -5,7 +5,12 @@ from types import SimpleNamespace
 
 from runpod_lora_studio.config.settings import AppSettings
 from runpod_lora_studio.domain.storage_models import StorageRemotePath
-from runpod_lora_studio.external.rclone import CopyOptions, RcloneAdapter, RcloneRunner
+from runpod_lora_studio.external.rclone import (
+    CommandResult,
+    CopyOptions,
+    RcloneAdapter,
+    RcloneRunner,
+)
 
 
 def test_rclone_runner_uses_argument_array_and_config_without_shell(
@@ -56,3 +61,33 @@ def test_rclone_dry_run_uses_copyto_for_a_local_file(
     )
 
     assert "copyto" in calls[0]
+
+
+def test_rclone_remote_read_applies_transfer_level_max_size(
+    monkeypatch, test_workspace: Path
+) -> None:
+    settings = AppSettings(workspace_root=test_workspace)
+    adapter = RcloneAdapter(settings)
+    commands: list[list[str]] = []
+
+    def fake_streaming(
+        command: list[str],
+        timeout: float | None,
+        progress_callback,
+        cancel_token,
+        process_callback,
+    ) -> CommandResult:
+        del timeout, progress_callback, cancel_token, process_callback
+        commands.append(command)
+        return CommandResult(0, "", "")
+
+    monkeypatch.setattr(adapter, "_run_streaming", fake_streaming)
+    adapter.copy(
+        StorageRemotePath("gdrive", "bounded/manifest.json"),
+        test_workspace / "manifest.json",
+        CopyOptions(checksum=False, max_bytes=1024),
+    )
+
+    assert "--max-size" in commands[0]
+    max_size_index = commands[0].index("--max-size")
+    assert commands[0][max_size_index + 1] == "1025"

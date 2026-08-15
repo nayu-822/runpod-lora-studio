@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+TRAINING_EXECUTION_SNAPSHOT_SCHEMA_VERSION = "phase9a-training-execution-v1"
+
 
 class TrainingJobStatus(StrEnum):
     QUEUED = "queued"
@@ -170,6 +172,15 @@ class TrainingConfig:
 
     def snapshot_json(self) -> str:
         return json.dumps(self.snapshot(), ensure_ascii=False, sort_keys=True)
+
+    def execution_snapshot(self) -> dict[str, Any]:
+        return {
+            "schema_version": TRAINING_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
+            **self.snapshot(),
+        }
+
+    def execution_snapshot_json(self) -> str:
+        return json.dumps(self.execution_snapshot(), ensure_ascii=False, sort_keys=True)
 
 
 @dataclass(frozen=True, slots=True)

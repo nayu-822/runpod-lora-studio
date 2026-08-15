@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -11,7 +12,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
@@ -33,6 +34,9 @@ from runpod_lora_studio.domain.training_completion_models import (
     TrainingCompletionFile,
     TrainingCompletionPreview,
     TrainingCompletionStatus,
+)
+from runpod_lora_studio.domain.training_models import (
+    TRAINING_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
 )
 from runpod_lora_studio.domain.training_progress_models import (
     TrainingArtifactValidationStatus,
@@ -62,6 +66,7 @@ from runpod_lora_studio.services.completion_filesystem import (
 from runpod_lora_studio.services.project_service import UserFacingError
 from runpod_lora_studio.services.storage_service import StorageService
 from runpod_lora_studio.services.training_artifact import TrainingArtifactScanner
+from runpod_lora_studio.services.training_command import TrainingCommandValidationError
 from runpod_lora_studio.services.training_service import TrainingService
 
 logger = logging.getLogger("runpod_lora_studio.training_completion")
@@ -116,6 +121,38 @@ _DATASET_REMOTE_PROVENANCE_FIELDS = frozenset(
         "verification_level",
     }
 )
+_EXECUTION_CONFIG_FIELDS = frozenset(
+    {
+        "schema_version",
+        "id",
+        "project_id",
+        "dataset_snapshot_id",
+        "managed_model_id",
+        "name",
+        "output_name",
+        "output_directory",
+        "sd_scripts_root",
+        "trainer_script",
+        "resolution",
+        "batch_size",
+        "epochs",
+        "learning_rate",
+        "optimizer",
+        "scheduler",
+        "network_module",
+        "network_dim",
+        "network_alpha",
+        "mixed_precision",
+        "save_every_n_epochs",
+        "cache_latents",
+        "gradient_checkpointing",
+        "seed",
+        "extra_options",
+        "recommendation_id",
+        "recommendation_engine_version",
+        "recommendation_change_diff",
+    }
+)
 
 
 class CompletionFailure(Exception):
@@ -128,9 +165,34 @@ class CompletionFailure(Exception):
 
 
 @dataclass(frozen=True, slots=True)
+class _ExecutionConfig:
+    payload: dict[str, Any]
+
+    @property
+    def id(self) -> str:
+        return str(self.payload["id"])
+
+    @property
+    def project_id(self) -> str:
+        return str(self.payload["project_id"])
+
+    @property
+    def dataset_snapshot_id(self) -> str:
+        return str(self.payload["dataset_snapshot_id"])
+
+    @property
+    def managed_model_id(self) -> str:
+        return str(self.payload["managed_model_id"])
+
+    @property
+    def output_name(self) -> str:
+        return str(self.payload["output_name"])
+
+
+@dataclass(frozen=True, slots=True)
 class _CompletionContext:
     job: TrainingJobRecord
-    config: TrainingConfigRecord
+    execution_config: _ExecutionConfig
     snapshot: DatasetSnapshotRecord
     model: ManagedModelRecord
     final_lora: TrainingArtifactRecord
@@ -203,7 +265,7 @@ class TrainingCompletionService:
             source_fingerprint=context.source_fingerprint,
             training_job_id=training_job_id,
             project_id=UUID(context.job.project_id),
-            training_config_id=UUID(context.config.id),
+            training_config_id=UUID(context.execution_config.id),
             dataset_snapshot_id=UUID(context.snapshot.id),
             managed_model_id=UUID(context.model.id),
             final_lora_filename=context.final_lora.filename,
@@ -794,7 +856,12 @@ class TrainingCompletionService:
         )
         self._check_claim(export_id, worker_id, claim_token, worker_generation)
         self.storage.verify_remote_artifact_files(
-            context.target, files, settings.verification_policy
+            context.target,
+            files,
+            settings.verification_policy,
+            expected_transfer_job_id=storage_job_id,
+            expected_project_id=UUID(context.job.project_id),
+            expected_training_run_id=UUID(context.job.id),
         )
         self._check_cancel(export_id, cancel_token)
         current_context = self._build_context(context.job.id)
@@ -940,6 +1007,18 @@ class TrainingCompletionService:
                     TrainingCompletionErrorCode.ELIGIBILITY_FAILED,
                     "学習設定、dataset snapshot、modelを取得できません",
                 )
+            if (
+                config.id != job.training_config_id
+                or config.project_id != job.project_id
+                or config.dataset_snapshot_id != job.dataset_snapshot_id
+                or config.managed_model_id != job.managed_model_id
+            ):
+                raise CompletionFailure(
+                    TrainingCompletionErrorCode.TRAINING_CONFIG_SNAPSHOT_MISMATCH,
+                    "学習設定の関連先が学習jobと一致しません",
+                )
+        execution_config = self._parse_execution_config(job, config)
+        self._validate_runtime_config_snapshot(job, config, execution_config)
         if snapshot.status != DatasetSnapshotStatus.COMPLETED.value:
             raise CompletionFailure(
                 TrainingCompletionErrorCode.DATASET_NOT_COMPLETED,
@@ -971,12 +1050,12 @@ class TrainingCompletionService:
                 "remote dataset snapshot provenance is incomplete",
             )
         self._validate_model(model)
-        final_lora = self._find_final_lora(job, config)
+        final_lora = self._find_final_lora(job, execution_config)
         target = self.storage.training_remote_path(
             UUID(job.project_id), training_job_id
         )
         export_relative = f"projects/{job.project_id}/training/exports/{job.id}"
-        files = self._preview_files(job, config, final_lora)
+        files = self._preview_files(job, final_lora)
         storage_settings = self.storage.get_project_storage_settings(
             UUID(job.project_id)
         )
@@ -986,8 +1065,10 @@ class TrainingCompletionService:
                 "schema_version": COMPLETION_MANIFEST_SCHEMA_VERSION,
                 "project_id": job.project_id,
                 "training_job_id": job.id,
-                "training_config_id": config.id,
-                "config_snapshot_sha256": _config_fingerprint(config),
+                "training_config_id": execution_config.id,
+                "config_snapshot_sha256": _execution_config_fingerprint(
+                    execution_config
+                ),
                 "training_status": job.status,
                 "exit_code": job.exit_code,
                 "final_lora_filename": final_lora.filename,
@@ -1020,7 +1101,7 @@ class TrainingCompletionService:
         )
         return _CompletionContext(
             job=job,
-            config=config,
+            execution_config=execution_config,
             snapshot=snapshot,
             model=model,
             final_lora=final_lora,
@@ -1033,8 +1114,213 @@ class TrainingCompletionService:
             remote_relative_path=target.relative_path,
         )
 
+    def _parse_execution_config(
+        self,
+        job: TrainingJobRecord,
+        config: TrainingConfigRecord,
+        *,
+        raw_json: str | None = None,
+    ) -> _ExecutionConfig:
+        raw = job.config_snapshot if raw_json is None else raw_json
+        try:
+            raw_size = len(raw.encode("utf-8")) if isinstance(raw, str) else -1
+        except UnicodeError:
+            raw_size = -1
+        if raw_size < 0 or raw_size > MAX_COMPLETION_MANIFEST_BYTES:
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.TRAINING_CONFIG_SNAPSHOT_MISMATCH,
+                "immutable execution config snapshotがありません",
+            )
+        try:
+            decoded = json.loads(
+                raw,
+                object_pairs_hook=_strict_json_object,
+                parse_constant=_reject_json_constant,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.TRAINING_CONFIG_SNAPSHOT_MISMATCH,
+                "immutable execution config snapshotのJSONが不正です",
+            ) from None
+        if not isinstance(decoded, dict) or set(decoded) != _EXECUTION_CONFIG_FIELDS:
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.TRAINING_CONFIG_SNAPSHOT_MISMATCH,
+                "immutable execution config snapshotのfieldが不正です",
+            )
+        payload = cast(dict[str, Any], decoded)
+
+        def fail() -> NoReturn:
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.TRAINING_CONFIG_SNAPSHOT_MISMATCH,
+                "immutable execution config snapshotの値が不正です",
+            )
+
+        if payload["schema_version"] != TRAINING_EXECUTION_SNAPSHOT_SCHEMA_VERSION:
+            fail()
+        for key, expected in (
+            ("id", config.id),
+            ("project_id", job.project_id),
+            ("dataset_snapshot_id", job.dataset_snapshot_id),
+            ("managed_model_id", job.managed_model_id),
+        ):
+            if not isinstance(payload[key], str) or payload[key] != expected:
+                fail()
+            try:
+                UUID(payload[key])
+            except (TypeError, ValueError):
+                fail()
+        string_fields = (
+            "name",
+            "output_name",
+            "output_directory",
+            "sd_scripts_root",
+            "trainer_script",
+            "optimizer",
+            "scheduler",
+            "network_module",
+            "mixed_precision",
+        )
+        if any(
+            not isinstance(payload[key], str) or not payload[key].strip()
+            for key in string_fields
+        ):
+            fail()
+        if (
+            not Path(payload["output_directory"]).is_absolute()
+            or not Path(payload["sd_scripts_root"]).is_absolute()
+        ):
+            fail()
+        if (
+            Path(payload["output_name"]).name != payload["output_name"]
+            or "/" in payload["output_name"]
+            or "\\" in payload["output_name"]
+        ):
+            fail()
+        integer_fields = (
+            "resolution",
+            "batch_size",
+            "epochs",
+            "network_dim",
+            "network_alpha",
+            "save_every_n_epochs",
+            "seed",
+        )
+        if any(
+            not isinstance(payload[key], int) or isinstance(payload[key], bool)
+            for key in integer_fields
+        ):
+            fail()
+        if (
+            not isinstance(payload["learning_rate"], (int, float))
+            or isinstance(payload["learning_rate"], bool)
+            or not math.isfinite(float(payload["learning_rate"]))
+        ):
+            fail()
+        if any(
+            not isinstance(payload[key], bool)
+            for key in ("cache_latents", "gradient_checkpointing")
+        ):
+            fail()
+        if not isinstance(payload["extra_options"], dict) or any(
+            not isinstance(key, str) for key in payload["extra_options"]
+        ):
+            fail()
+        if not isinstance(payload["recommendation_change_diff"], dict):
+            fail()
+        if payload["recommendation_id"] is not None and not isinstance(
+            payload["recommendation_id"], str
+        ):
+            fail()
+        if payload["recommendation_id"] is not None:
+            try:
+                UUID(payload["recommendation_id"])
+            except (TypeError, ValueError):
+                fail()
+        if payload["recommendation_engine_version"] is not None and not isinstance(
+            payload["recommendation_engine_version"], str
+        ):
+            fail()
+        if payload["recommendation_engine_version"] == "":
+            fail()
+        if not (
+            64 <= payload["resolution"] <= 8192
+            and payload["resolution"] % 8 == 0
+            and 1 <= payload["batch_size"] <= 64
+            and 1 <= payload["epochs"] <= 100000
+            and 0 < payload["learning_rate"] <= 10
+            and payload["network_dim"] > 0
+            and payload["network_alpha"] > 0
+            and payload["save_every_n_epochs"] > 0
+        ):
+            fail()
+        command_builder = getattr(self.training, "command_builder", None)
+        if command_builder is None:
+            fail()
+        try:
+            if payload["trainer_script"] not in command_builder.allowed_trainer_scripts:
+                fail()
+            if payload["optimizer"] not in command_builder.allowed_optimizers:
+                fail()
+            if payload["scheduler"] not in command_builder.allowed_schedulers:
+                fail()
+            if payload["network_module"] not in command_builder.allowed_network_modules:
+                fail()
+            if (
+                payload["mixed_precision"]
+                not in command_builder.allowed_mixed_precision
+            ):
+                fail()
+            if any(
+                isinstance(value, float) and not math.isfinite(value)
+                for value in payload["extra_options"].values()
+            ):
+                fail()
+            command_builder._extra_arguments(payload["extra_options"])
+        except (AttributeError, TrainingCommandValidationError, TypeError, ValueError):
+            fail()
+        return _ExecutionConfig(payload)
+
+    def _validate_runtime_config_snapshot(
+        self,
+        job: TrainingJobRecord,
+        config: TrainingConfigRecord,
+        execution: _ExecutionConfig,
+    ) -> None:
+        if not job.runtime_directory:
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.TRAINING_CONFIG_SNAPSHOT_MISMATCH,
+                "training runtime directoryがありません",
+            )
+        path = Path(job.runtime_directory) / "config" / "training-config.json"
+        if path.is_symlink() or not path.is_file():
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.TRAINING_CONFIG_SNAPSHOT_MISMATCH,
+                "runtime training config snapshotがありません",
+            )
+        try:
+            if path.stat().st_size > MAX_COMPLETION_MANIFEST_BYTES:
+                raise ValueError("runtime training config is too large")
+            runtime_execution = self._parse_execution_config(
+                job,
+                config,
+                raw_json=path.read_text(encoding="utf-8"),
+            )
+        except CompletionFailure:
+            raise
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.TRAINING_CONFIG_SNAPSHOT_MISMATCH,
+                "runtime training config snapshotを読み取れません",
+            ) from exc
+        if runtime_execution.payload != execution.payload:
+            raise CompletionFailure(
+                TrainingCompletionErrorCode.TRAINING_CONFIG_SNAPSHOT_MISMATCH,
+                "runtime training config snapshotがimmutable job snapshotと"
+                "一致しません",
+            )
+
     def _find_final_lora(
-        self, job: TrainingJobRecord, config: TrainingConfigRecord
+        self, job: TrainingJobRecord, config: _ExecutionConfig
     ) -> TrainingArtifactRecord:
         if not job.runtime_directory:
             raise CompletionFailure(
@@ -1185,7 +1471,6 @@ class TrainingCompletionService:
     def _preview_files(
         self,
         job: TrainingJobRecord,
-        config: TrainingConfigRecord,
         final_lora: TrainingArtifactRecord,
     ) -> tuple[TrainingCompletionFile, ...]:
         if not job.runtime_directory:
@@ -1232,16 +1517,6 @@ class TrainingCompletionService:
                     "学習stdout/stderr logがありません",
                 )
             result.append(self._file_descriptor(source, relative, "log"))
-        config_path = runtime / "config" / "training-config.json"
-        if config_path.is_symlink() or not config_path.is_file():
-            raise CompletionFailure(
-                TrainingCompletionErrorCode.ELIGIBILITY_FAILED,
-                "training config snapshot is missing",
-            )
-        result.append(
-            self._file_descriptor(config_path, "config/training-config.json", "config")
-        )
-        del config
         return tuple(result)
 
     def _build_local_export(
@@ -1358,7 +1633,8 @@ class TrainingCompletionService:
         if performance is not None:
             root.write_json("provenance/performance.json", performance)
         root.write_json(
-            "config/safe-training-config.json", self._safe_config(context.config)
+            "config/training-config.json",
+            self._safe_config(context.execution_config),
         )
         static_files = root.regular_files()
         root.write_json(
@@ -1560,7 +1836,7 @@ class TrainingCompletionService:
                     "schema_version": COMPLETION_MANIFEST_SCHEMA_VERSION,
                     "project_id": context.job.project_id,
                     "training_job_id": context.job.id,
-                    "training_config_id": context.config.id,
+                    "training_config_id": context.execution_config.id,
                     "parent_training_job_id": context.job.parent_job_id,
                     "resume_artifact_id": context.job.resume_artifact_id,
                     "training_status": context.job.status,
@@ -1587,7 +1863,9 @@ class TrainingCompletionService:
                     },
                     "managed_model_id": context.model.id,
                     "managed_model_sha256": context.model.local_sha256,
-                    "safe_config_fingerprint": _config_fingerprint(context.config),
+                    "safe_config_fingerprint": _execution_config_fingerprint(
+                        context.execution_config
+                    ),
                     "final_lora_relative_path": (
                         f"artifacts/{context.final_lora.filename}"
                     ),
@@ -1676,19 +1954,10 @@ class TrainingCompletionService:
                     TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
                     "remote completion manifestが許容サイズを超えています",
                 )
-            try:
-                raw = self.storage.adapter.read_remote_file(
-                    target.child(COMPLETION_MANIFEST_NAME),
-                    max_bytes=MAX_COMPLETION_MANIFEST_BYTES,
-                )
-            except TypeError as exc:
-                # Keep compatibility with third-party test adapters while the
-                # size is already bounded by the remote directory entry.
-                if "max_bytes" not in str(exc):
-                    raise
-                raw = self.storage.adapter.read_remote_file(
-                    target.child(COMPLETION_MANIFEST_NAME)
-                )
+            raw = self.storage.adapter.read_remote_file(
+                target.child(COMPLETION_MANIFEST_NAME),
+                max_bytes=MAX_COMPLETION_MANIFEST_BYTES,
+            )
             if len(raw) > MAX_COMPLETION_MANIFEST_BYTES:
                 raise CompletionFailure(
                     TrainingCompletionErrorCode.REMOTE_COMPLETION_CONFLICT,
@@ -1747,6 +2016,9 @@ class TrainingCompletionService:
             self.storage.get_project_storage_settings(
                 UUID(context.job.project_id)
             ).verification_policy,
+            expected_transfer_job_id=storage_job_id,
+            expected_project_id=UUID(context.job.project_id),
+            expected_training_run_id=UUID(context.job.id),
         )
         del export_id
         return storage_job_id
@@ -1772,7 +2044,7 @@ class TrainingCompletionService:
         expected_values: dict[str, Any] = {
             "project_id": context.job.project_id,
             "training_job_id": context.job.id,
-            "training_config_id": context.config.id,
+            "training_config_id": context.execution_config.id,
             "parent_training_job_id": context.job.parent_job_id,
             "resume_artifact_id": context.job.resume_artifact_id,
             "training_status": context.job.status,
@@ -1783,7 +2055,9 @@ class TrainingCompletionService:
             "dataset_content_hash": context.snapshot.content_sha256,
             "managed_model_id": context.model.id,
             "managed_model_sha256": context.model.local_sha256,
-            "safe_config_fingerprint": _config_fingerprint(context.config),
+            "safe_config_fingerprint": _execution_config_fingerprint(
+                context.execution_config
+            ),
             "final_lora_relative_path": f"artifacts/{context.final_lora.filename}",
             "final_lora_size": context.final_lora.file_size,
             "final_lora_sha256": context.final_lora.sha256,
@@ -2215,7 +2489,9 @@ class TrainingCompletionService:
             "snapshot_id": context.snapshot.id,
             "content_sha256": context.snapshot.content_sha256,
             "manifest_sha256": context.snapshot.manifest_sha256,
-            "remote_relative_path": context.snapshot_remote.remote_relative_path,
+            "remote_relative_path": _safe_manifest_text(
+                context.snapshot_remote.remote_relative_path
+            ),
             "storage_transfer_job_id": str(
                 context.snapshot_remote.storage_transfer_job_id
             ),
@@ -2227,8 +2503,8 @@ class TrainingCompletionService:
     def _model_provenance(context: _CompletionContext) -> dict[str, Any]:
         return {
             "managed_model_id": context.model.id,
-            "display_name": context.model.display_name,
-            "remote_file_name": context.model.remote_file_name,
+            "display_name": _safe_manifest_text(context.model.display_name),
+            "remote_file_name": _safe_manifest_text(context.model.remote_file_name),
             "size_bytes": context.model.local_size_bytes,
             "sha256": context.model.local_sha256,
         }
@@ -2239,7 +2515,9 @@ class TrainingCompletionService:
             "schema_version": "phase9a-runtime-provenance-v1",
             "application_version": "0.1.0",
             "training_job_id": context.job.id,
-            "trainer_script": _safe_manifest_text(context.config.trainer_script),
+            "trainer_script": _safe_manifest_text(
+                str(context.execution_config.payload["trainer_script"])
+            ),
             "resume_parent_job_id": context.job.parent_job_id,
             "resume_artifact_id": context.job.resume_artifact_id,
         }
@@ -2282,37 +2560,39 @@ class TrainingCompletionService:
             }
 
     @staticmethod
-    def _safe_config(config: TrainingConfigRecord) -> dict[str, Any]:
-        try:
-            extra = json.loads(config.extra_options or "{}")
-        except json.JSONDecodeError:
-            extra = {}
+    def _safe_config(config: _ExecutionConfig) -> dict[str, Any]:
+        payload = config.payload
         return {
             "schema_version": "phase9a-safe-training-config-v1",
             "id": config.id,
             "project_id": config.project_id,
             "dataset_snapshot_id": config.dataset_snapshot_id,
             "managed_model_id": config.managed_model_id,
-            "name": config.name,
-            "output_name": config.output_name,
-            "trainer_script": _safe_manifest_text(config.trainer_script),
-            "resolution": config.resolution,
-            "batch_size": config.batch_size,
-            "epochs": config.epochs,
-            "learning_rate": config.learning_rate,
-            "optimizer": config.optimizer,
-            "scheduler": config.scheduler,
-            "network_module": config.network_module,
-            "network_dim": config.network_dim,
-            "network_alpha": config.network_alpha,
-            "mixed_precision": config.mixed_precision,
-            "save_every_n_epochs": config.save_every_n_epochs,
-            "cache_latents": bool(config.cache_latents),
-            "gradient_checkpointing": bool(config.gradient_checkpointing),
-            "seed": config.seed,
-            "extra_options": _safe_json_value(extra),
-            "recommendation_id": config.recommendation_id,
-            "recommendation_engine_version": config.recommendation_engine_version,
+            "name": _safe_manifest_text(str(payload["name"])),
+            "output_name": _safe_manifest_text(config.output_name),
+            "output_role": "training-job-output",
+            "trainer_script": _safe_manifest_text(str(payload["trainer_script"])),
+            "trainer_root_role": "configured-sd-scripts",
+            "resolution": payload["resolution"],
+            "batch_size": payload["batch_size"],
+            "epochs": payload["epochs"],
+            "learning_rate": payload["learning_rate"],
+            "optimizer": payload["optimizer"],
+            "scheduler": payload["scheduler"],
+            "network_module": payload["network_module"],
+            "network_dim": payload["network_dim"],
+            "network_alpha": payload["network_alpha"],
+            "mixed_precision": payload["mixed_precision"],
+            "save_every_n_epochs": payload["save_every_n_epochs"],
+            "cache_latents": payload["cache_latents"],
+            "gradient_checkpointing": payload["gradient_checkpointing"],
+            "seed": payload["seed"],
+            "extra_options": _safe_json_value(payload["extra_options"]),
+            "recommendation_id": payload["recommendation_id"],
+            "recommendation_engine_version": payload["recommendation_engine_version"],
+            "recommendation_change_diff": _safe_json_value(
+                payload["recommendation_change_diff"]
+            ),
         }
 
 
@@ -2334,7 +2614,7 @@ def _fingerprint(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _config_fingerprint(config: TrainingConfigRecord) -> str:
+def _execution_config_fingerprint(config: _ExecutionConfig) -> str:
     safe = TrainingCompletionService._safe_config(config)
     return _fingerprint(safe)
 
@@ -2350,21 +2630,78 @@ def _stable_file_copy_fingerprint(path: Path) -> tuple[int, str]:
 
 def _safe_json_value(value: object) -> object:
     if isinstance(value, dict):
-        return {
-            str(key): _safe_json_value(item)
-            for key, item in value.items()
-            if not any(
-                token in str(key).casefold()
-                for token in ("token", "secret", "password", "api_key", "authorization")
-            )
-        }
+        sanitized: dict[str, object] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            normalized_key = key_text.casefold()
+            if any(token in normalized_key for token in _SENSITIVE_JSON_KEY_TOKENS):
+                continue
+            if any(token in normalized_key for token in _LOCAL_PATH_KEY_TOKENS):
+                sanitized[key_text] = "<local-path-redacted>"
+                continue
+            sanitized[key_text] = _safe_json_value(item)
+        return sanitized
     if isinstance(value, list):
         return [_safe_json_value(item) for item in value]
     if isinstance(value, str):
-        if os.path.isabs(value):
+        if _looks_like_local_path(value):
             return "<local-path-redacted>"
         return "".join(char for char in value if ord(char) >= 32 or char in "\r\n\t")
     return value
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+_SENSITIVE_JSON_KEY_TOKENS = (
+    "token",
+    "secret",
+    "password",
+    "api_key",
+    "apikey",
+    "authorization",
+    "cookie",
+    "credential",
+    "raw_env",
+    "environment",
+    "rclone_config",
+)
+_LOCAL_PATH_KEY_TOKENS = (
+    "path",
+    "directory",
+    "_dir",
+    "root",
+    "executable",
+    "model",
+    "dataset",
+    "output",
+    "python",
+)
+
+
+def _looks_like_local_path(value: str) -> bool:
+    normalized = value.replace("\\", "/")
+    return (
+        os.path.isabs(value)
+        or normalized.startswith("/")
+        or normalized.startswith("//")
+        or (
+            len(normalized) >= 3
+            and normalized[0].isalpha()
+            and normalized[1] == ":"
+            and normalized[2] == "/"
+        )
+    )
 
 
 def _safe_manifest_text(value: str) -> str:

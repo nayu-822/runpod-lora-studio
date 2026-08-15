@@ -66,6 +66,7 @@ from runpod_lora_studio.services.dataset_snapshot_service import DatasetSnapshot
 from runpod_lora_studio.services.project_service import UserFacingError
 
 logger = logging.getLogger("runpod_lora_studio.storage")
+MAX_TRANSFER_MANIFEST_BYTES = 1024 * 1024
 
 
 class RemoteModelChangedError(UserFacingError):
@@ -811,14 +812,21 @@ class StorageService:
                 raise UserFacingError("remote dataset snapshotの転送履歴がありません")
             entries = self._remote_entries(target)
             manifest_entry = entries.get("transfer-manifest.json")
-            if manifest_entry is None:
+            if (
+                manifest_entry is None
+                or manifest_entry.is_directory
+                or manifest_entry.size_bytes < 0
+                or manifest_entry.size_bytes > MAX_TRANSFER_MANIFEST_BYTES
+            ):
                 raise UserFacingError("remote dataset snapshot manifestがありません")
             try:
-                manifest_sha256 = hashlib.sha256(
-                    self.adapter.read_remote_file(
-                        target.child("transfer-manifest.json")
-                    )
-                ).hexdigest()
+                raw_manifest = self.adapter.read_remote_file(
+                    target.child("transfer-manifest.json"),
+                    max_bytes=MAX_TRANSFER_MANIFEST_BYTES,
+                )
+                if len(raw_manifest) != manifest_entry.size_bytes:
+                    raise ValueError("remote dataset snapshot manifest size mismatch")
+                manifest_sha256 = hashlib.sha256(raw_manifest).hexdigest()
             except (OSError, RuntimeError, ValueError) as exc:
                 raise UserFacingError(
                     "remote dataset snapshot manifestを読めません"
@@ -1086,11 +1094,13 @@ class StorageService:
             )
             if manifest_result.returncode != 0:
                 raise UserFacingError("成果物転送マニフェストの保存に失敗しました")
-            if verify_policy is VerificationPolicy.SIZE_AND_MANIFEST or (
-                verify_policy is VerificationPolicy.REMOTE_HASH_AND_SIZE
-                and self.settings.storage_remote_hash_fallback == "size_and_manifest"
-            ):
-                self._verify_remote_artifact_manifest(target, files)
+            self._verify_remote_artifact_manifest(
+                target,
+                files,
+                expected_transfer_job_id=job_id,
+                expected_project_id=project_id,
+                expected_training_run_id=training_run_id,
+            )
             self._finish_job(job_id, TransferStatus.COMPLETED, manifest)
             return job_id
         except Exception as exc:
@@ -1114,11 +1124,18 @@ class StorageService:
         target: StorageRemotePath,
         files: tuple[StorageArtifactFile, ...],
         verification_policy: VerificationPolicy | None = None,
+        *,
+        expected_transfer_job_id: UUID | None = None,
+        expected_project_id: UUID | None = None,
+        expected_training_run_id: UUID | None = None,
     ) -> None:
         self._verify_remote_artifact_files(
             target,
             files,
             verification_policy or self.settings.storage_verification_policy,
+            expected_transfer_job_id=expected_transfer_job_id,
+            expected_project_id=expected_project_id,
+            expected_training_run_id=expected_training_run_id,
         )
 
     def _copy_artifact_with_retry(
@@ -1516,12 +1533,21 @@ class StorageService:
         self, target: StorageRemotePath, entries: dict[str, StorageEntry]
     ) -> tuple[str | None, bool, dict[str, dict[str, Any]]]:
         manifest_entry = entries.get("transfer-manifest.json")
-        if manifest_entry is None:
+        if (
+            manifest_entry is None
+            or manifest_entry.is_directory
+            or manifest_entry.size_bytes < 0
+            or manifest_entry.size_bytes > MAX_TRANSFER_MANIFEST_BYTES
+        ):
             return None, False, {}
         try:
-            payload = json.loads(
-                self.adapter.read_remote_file(target.child("transfer-manifest.json"))
+            raw_manifest = self.adapter.read_remote_file(
+                target.child("transfer-manifest.json"),
+                max_bytes=MAX_TRANSFER_MANIFEST_BYTES,
             )
+            if len(raw_manifest) != manifest_entry.size_bytes:
+                return None, True, {}
+            payload = json.loads(raw_manifest)
             settings = payload.get("settings", {})
             value = settings.get("snapshot_content_sha256")
             manifest_items = {
@@ -1598,11 +1624,20 @@ class StorageService:
 
             entries = self._remote_entries(target)
             remote_entry = entries.get("transfer-manifest.json")
-            if remote_entry is None:
+            if (
+                remote_entry is None
+                or remote_entry.is_directory
+                or remote_entry.size_bytes < 0
+                or remote_entry.size_bytes > MAX_TRANSFER_MANIFEST_BYTES
+            ):
                 raise ValueError("remote final manifest is missing")
-            remote_payload = json.loads(
-                self.adapter.read_remote_file(target.child("transfer-manifest.json"))
+            raw_remote_manifest = self.adapter.read_remote_file(
+                target.child("transfer-manifest.json"),
+                max_bytes=MAX_TRANSFER_MANIFEST_BYTES,
             )
+            if len(raw_remote_manifest) != remote_entry.size_bytes:
+                raise ValueError("remote final manifest size mismatch")
+            remote_payload = json.loads(raw_remote_manifest)
             if not isinstance(remote_payload, dict):
                 raise ValueError("remote manifest is not an object")
 
@@ -2374,6 +2409,9 @@ class StorageService:
         verification_policy: VerificationPolicy,
         *,
         require_manifest: bool = True,
+        expected_transfer_job_id: UUID | None = None,
+        expected_project_id: UUID | None = None,
+        expected_training_run_id: UUID | None = None,
     ) -> None:
         entries = self._remote_entries(target)
         for file in files:
@@ -2400,14 +2438,14 @@ class StorageService:
             if self.settings.storage_remote_hash_fallback == "existence_only":
                 continue
             raise UserFacingError("remote成果物のハッシュを取得できません")
-        if require_manifest and (
-            verification_policy is VerificationPolicy.SIZE_AND_MANIFEST
-            or (
-                verification_policy is VerificationPolicy.REMOTE_HASH_AND_SIZE
-                and self.settings.storage_remote_hash_fallback == "size_and_manifest"
+        if require_manifest:
+            self._verify_remote_artifact_manifest(
+                target,
+                files,
+                expected_transfer_job_id=expected_transfer_job_id,
+                expected_project_id=expected_project_id,
+                expected_training_run_id=expected_training_run_id,
             )
-        ):
-            self._verify_remote_artifact_manifest(target, files)
 
     @staticmethod
     def _artifact_verification_status(
@@ -2427,18 +2465,72 @@ class StorageService:
         self,
         target: StorageRemotePath,
         files: tuple[StorageArtifactFile, ...],
+        *,
+        expected_transfer_job_id: UUID | None = None,
+        expected_project_id: UUID | None = None,
+        expected_training_run_id: UUID | None = None,
     ) -> None:
         try:
             entries = self._remote_entries(target)
             manifest_entry = entries.get("transfer-manifest.json")
-            if manifest_entry is None:
+            if (
+                manifest_entry is None
+                or manifest_entry.is_directory
+                or manifest_entry.size_bytes < 0
+                or manifest_entry.size_bytes > MAX_TRANSFER_MANIFEST_BYTES
+            ):
                 raise ValueError("artifact transfer manifest is missing")
-            raw = self.adapter.read_remote_file(target.child("transfer-manifest.json"))
+            raw = self.adapter.read_remote_file(
+                target.child("transfer-manifest.json"),
+                max_bytes=MAX_TRANSFER_MANIFEST_BYTES,
+            )
+            if len(raw) != manifest_entry.size_bytes:
+                raise ValueError("artifact transfer manifest size is invalid")
             payload = json.loads(raw)
             if not isinstance(payload, dict):
                 raise ValueError("artifact transfer manifest is invalid")
-            if payload.get("schema_version") != "phase9a-artifact-transfer-v1":
+            required_fields = {
+                "schema_version",
+                "transfer_job_id",
+                "transfer_type",
+                "project_id",
+                "training_run_id",
+                "destination",
+                "status",
+                "item_count",
+                "items",
+            }
+            if (
+                set(payload) < required_fields
+                or payload.get("schema_version") != "phase9a-artifact-transfer-v1"
+                or payload.get("transfer_type")
+                != StorageTransferType.ARTIFACT_UPLOAD.value
+                or payload.get("destination") != target.rclone_value
+                or payload.get("status") != TransferStatus.COMPLETED.value
+                or payload.get("item_count") != len(files)
+                or not isinstance(payload.get("transfer_job_id"), str)
+                or not isinstance(payload.get("project_id"), str)
+                or not isinstance(payload.get("training_run_id"), str)
+                or not isinstance(payload.get("items"), list)
+            ):
                 raise ValueError("artifact transfer manifest schema is invalid")
+            try:
+                manifest_job_id = UUID(str(payload["transfer_job_id"]))
+            except (TypeError, ValueError):
+                raise ValueError("artifact transfer manifest job is invalid") from None
+            if (
+                expected_transfer_job_id is not None
+                and manifest_job_id != expected_transfer_job_id
+            ):
+                raise ValueError("artifact transfer manifest job does not match")
+            if expected_project_id is not None and payload["project_id"] != str(
+                expected_project_id
+            ):
+                raise ValueError("artifact transfer manifest project does not match")
+            if expected_training_run_id is not None and payload[
+                "training_run_id"
+            ] != str(expected_training_run_id):
+                raise ValueError("artifact transfer manifest run does not match")
             expected = {
                 file.relative_path: {
                     "size": file.size_bytes,
@@ -2446,11 +2538,14 @@ class StorageService:
                 }
                 for file in files
             }
-            actual = {
-                str(item["relative_path"]): item
-                for item in payload.get("items", [])
-                if isinstance(item, dict) and item.get("relative_path")
-            }
+            actual: dict[str, dict[str, Any]] = {}
+            for item in payload["items"]:
+                if not isinstance(item, dict):
+                    raise ValueError("artifact transfer manifest item is invalid")
+                relative = item.get("relative_path")
+                if not isinstance(relative, str) or relative in actual:
+                    raise ValueError("artifact transfer manifest item path is invalid")
+                actual[relative] = item
             if set(actual) != set(expected):
                 raise ValueError("artifact transfer manifest item set is invalid")
             for relative, expected_item in expected.items():
@@ -2459,11 +2554,23 @@ class StorageService:
                     item.get("size") != expected_item["size"]
                     or item.get("local_sha256") != expected_item["local_sha256"]
                     or item.get("transfer_status") not in {"completed", "skipped"}
-                    or item.get("verification_status") != "manifest_metadata_and_size"
+                    or item.get("verification_status")
+                    not in {
+                        "full_checksum",
+                        "remote_hash_and_size",
+                        "manifest_metadata_and_size",
+                        "existence_only",
+                    }
+                    or not isinstance(item.get("size"), int)
+                    or isinstance(item.get("size"), bool)
+                    or not isinstance(item.get("local_sha256"), str)
+                    or len(item["local_sha256"]) != 64
+                    or any(
+                        char not in "0123456789abcdefABCDEF"
+                        for char in item["local_sha256"]
+                    )
                 ):
                     raise ValueError("artifact transfer manifest item is invalid")
-            if manifest_entry.size_bytes != len(raw):
-                raise ValueError("artifact transfer manifest size is invalid")
         except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
             raise UserFacingError("成果物転送マニフェストを検証できません") from None
 

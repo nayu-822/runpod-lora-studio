@@ -511,8 +511,9 @@ class TrainingService:
             resume_path=resume_path,
             allowed_resume_roots=(runtime / "runtime" / "resume",),
         )
+        execution_snapshot_json = job_config.execution_snapshot_json()
         (runtime / "config" / "training-config.json").write_text(
-            job_config.snapshot_json(), encoding="utf-8"
+            execution_snapshot_json, encoding="utf-8"
         )
         (runtime / "runtime" / "metadata.json").write_text(
             json.dumps(
@@ -551,7 +552,7 @@ class TrainingService:
             record.stdout_log_path = str(runtime / "logs" / "stdout.log")
             record.stderr_log_path = str(runtime / "logs" / "stderr.log")
             record.command_summary = command.summary
-            record.config_snapshot = job_config.snapshot_json()
+            record.config_snapshot = execution_snapshot_json
             record.updated_at = utc_now()
             session.commit()
         return config, model_path, copied_toml, command, runtime

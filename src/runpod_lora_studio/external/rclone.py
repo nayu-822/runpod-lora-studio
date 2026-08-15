@@ -54,6 +54,7 @@ class CopyOptions:
     dry_run: bool = False
     checksum: bool = True
     timeout: float | None = None
+    max_bytes: int | None = None
 
 
 class CancelToken:
@@ -444,6 +445,12 @@ class RcloneAdapter:
             command.append("--dry-run")
         if options.checksum and self.settings.storage_use_checksum:
             command.append("--checksum")
+        if options.max_bytes is not None:
+            if options.max_bytes < 0:
+                raise ValueError("max_bytes must be non-negative")
+            # rclone's max-size is an inclusive filter in the completion
+            # boundary. Adding one also keeps an object exactly at the limit.
+            command.extend(["--max-size", str(options.max_bytes + 1)])
         if options.overwrite_policy is OverwritePolicy.FAIL_IF_EXISTS:
             command.append("--immutable")
         return self._run_streaming(
@@ -602,7 +609,7 @@ class RcloneAdapter:
             result = self.copy(
                 remote_path,
                 path,
-                CopyOptions(checksum=False),
+                CopyOptions(checksum=False, max_bytes=max_bytes),
             )
             if result.returncode != 0:
                 raise RuntimeError("remoteファイルを読み取れません")
